@@ -1,0 +1,331 @@
+{
+  "backend_used": "tenax",
+  "dmrg": {
+    "energy_per_site": -0.3423924061560375,
+    "entanglement": {
+      "context": {
+        "backend": "tenax",
+        "n_sites": 18
+      },
+      "cuts": [
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0,
+        6.0,
+        7.0,
+        8.0,
+        9.0,
+        10.0,
+        11.0,
+        12.0,
+        13.0,
+        14.0,
+        15.0,
+        16.0,
+        17.0
+      ],
+      "cuts_normalized": [
+        0.05555555555555555,
+        0.1111111111111111,
+        0.16666666666666666,
+        0.2222222222222222,
+        0.2777777777777778,
+        0.3333333333333333,
+        0.3888888888888889,
+        0.4444444444444444,
+        0.5,
+        0.5555555555555556,
+        0.6111111111111112,
+        0.6666666666666666,
+        0.7222222222222222,
+        0.7777777777777778,
+        0.8333333333333334,
+        0.8888888888888888,
+        0.9444444444444444
+      ],
+      "entropies": {
+        "S1": [
+          1.3862943611198904,
+          2.1791471182725575,
+          3.3348953390507217,
+          2.8490325185562364,
+          3.154525964528562,
+          1.808867787833208,
+          3.194590778519017,
+          3.754495504386872,
+          3.768213114477363,
+          2.9483067213114995,
+          3.3050099257251873,
+          2.0848244737352184,
+          3.426556780542446,
+          3.149662602466241,
+          3.6284664011134344,
+          2.373401250173763,
+          1.3862943611198906
+        ],
+        "S2": [
+          1.3862943611198904,
+          1.8063194653426442,
+          2.816372854386182,
+          2.4087656713886507,
+          2.649643091609597,
+          1.2667378806014884,
+          2.652935148769087,
+          3.17421017832938,
+          3.0241656642495407,
+          2.102863091109936,
+          2.7458570725206197,
+          1.4477483941573854,
+          2.82852321222297,
+          2.6053402927985982,
+          3.326622890245996,
+          2.1529525637050613,
+          1.3862943611198904
+        ],
+        "S3": [
+          1.3862943611198904,
+          1.622848232017598,
+          2.57860389573827,
+          2.2477858773968986,
+          2.5214407169656594,
+          1.1362427215961384,
+          2.5225051573510373,
+          2.9698358402980616,
+          2.8158454035947273,
+          1.827748732425375,
+          2.5995823937198477,
+          1.2794299966991711,
+          2.6641512467108366,
+          2.38869427273257,
+          3.152218391950412,
+          2.0340944626469653,
+          1.3862943611198904
+        ],
+        "S4": [
+          1.3862943611198906,
+          1.5315411711181994,
+          2.4632335749992733,
+          2.167709503877249,
+          2.4728962810111716,
+          1.0874889120086442,
+          2.4737603545773195,
+          2.870895464644151,
+          2.732327512254452,
+          1.7067284127559021,
+          2.5399418753338585,
+          1.2121349084095285,
+          2.5973423797213386,
+          2.2853424578818604,
+          3.0495121461031824,
+          1.967154978959453,
+          1.3862943611198901
+        ]
+      },
+      "method": "DMRG",
+      "summary": {
+        "S1_max": 3.768213114477363,
+        "S1_mean": 2.8077991178195356,
+        "S1_min": 1.3862943611198904,
+        "S2_max": 3.326622890245996,
+        "S2_mean": 2.3400968349221714,
+        "S2_min": 1.2667378806014884,
+        "S3_max": 3.152218391950412,
+        "S3_mean": 2.184330356710785,
+        "S3_min": 1.1362427215961384,
+        "S4_max": 3.0495121461031824,
+        "S4_mean": 2.1135646268173747,
+        "S4_min": 1.0874889120086442
+      }
+    },
+    "ground_state_energy": -6.163063310808675,
+    "info": {
+      "E": -6.163063310808675,
+      "converged": false,
+      "energies_per_sweep": [
+        -6.138098856618243,
+        -6.160819647103903,
+        -6.161482265818483,
+        -6.161782273425883,
+        -6.16240494641962,
+        -6.162896048728685,
+        -6.163025829189366,
+        -6.16305101075457,
+        -6.163058323290102,
+        -6.163061469987153,
+        -6.163064177315626,
+        -6.163066589722028,
+        -6.1630671736017675,
+        -6.163066893044322,
+        -6.163065768022298,
+        -6.163064771218508,
+        -6.163064152409505,
+        -6.163063745847485,
+        -6.163063484592332,
+        -6.163063310808675
+      ],
+      "sweeps_done": 20
+    },
+    "structure_factors": [
+      {
+        "Q_label": "Gamma",
+        "Qx": 0.0,
+        "Qy": 0.0,
+        "S(Q)": -0.3503449667276259,
+        "ST(Q)": 0.10089875901012117,
+        "T(Q)": -0.3503059826511579
+      },
+      {
+        "Q_label": "M1",
+        "Qx": 1.8137993642342178,
+        "Qy": -1.0471975511965976,
+        "S(Q)": -0.10264591652865254,
+        "ST(Q)": 0.05236906722018694,
+        "T(Q)": -0.10261272006410412
+      },
+      {
+        "Q_label": "M2",
+        "Qx": 0.0,
+        "Qy": 2.0943951023931953,
+        "S(Q)": 0.05599371261944938,
+        "ST(Q)": -0.01710949728092552,
+        "T(Q)": 0.055893710619370096
+      },
+      {
+        "Q_label": "M3",
+        "Qx": 1.8137993642342178,
+        "Qy": 1.0471975511965976,
+        "S(Q)": 0.011245088290537284,
+        "ST(Q)": 0.010270394265124005,
+        "T(Q)": 0.011306484088105095
+      },
+      {
+        "Q_label": "K1",
+        "Qx": 2.4183991523122903,
+        "Qy": 0.0,
+        "S(Q)": 0.007878553817129834,
+        "ST(Q)": 0.008864408649235066,
+        "T(Q)": 0.007976803129530396
+      },
+      {
+        "Q_label": "K2",
+        "Qx": 1.2091995761561452,
+        "Qy": 2.0943951023931953,
+        "S(Q)": -0.04304937029475997,
+        "ST(Q)": -0.004012386774267695,
+        "T(Q)": -0.04302017672533604
+      }
+    ]
+  },
+  "geometry": {
+    "lattice": "honeycomb",
+    "mps_path": {
+      "bond_count": 24,
+      "by_gamma": {
+        "x": {
+          "bond_count": 6,
+          "max_index_span": 11,
+          "mean_index_span": 7.0
+        },
+        "y": {
+          "bond_count": 9,
+          "max_index_span": 5,
+          "mean_index_span": 2.7777777777777777
+        },
+        "z": {
+          "bond_count": 9,
+          "max_index_span": 1,
+          "mean_index_span": 1.0
+        }
+      },
+      "max_index_span": 11,
+      "mean_index_span": 3.1666666666666665,
+      "median_index_span": 3.0,
+      "ordering": "snake_x_alternating_y",
+      "p90_index_span": 7.0
+    },
+    "number_of_bonds": 24,
+    "number_of_sites": 18
+  },
+  "idmrg": {
+    "error": "INTERNAL: Buffer Definition Event: Error dispatching computation: Error dispatching computation: Error dispatching computation: Error dispatching computation: Error dispatching computation: Error dispatching computation: Error dispatching computation: Out of memory allocating 13421772800 bytes.",
+    "status": "failed"
+  },
+  "model_name": "Honeycomb spin-orbital model (yao_lee, spin=1/2, orbital=1/2, axis=z)",
+  "model_spec": {
+    "effective_interaction": "yao_lee",
+    "ising_axis": "z",
+    "model_family": "yao_lee",
+    "orbital_is_trivial": false,
+    "orbital_rep": "1/2",
+    "orbital_value": 0.5,
+    "physical_dim": 4,
+    "spin_rep": "1/2",
+    "spin_value": 0.5
+  },
+  "output_status": {
+    "dmrg_bond_energy_diagram_png": {
+      "status": "saved"
+    },
+    "dmrg_scalar_correlation_heatmaps_png": {
+      "status": "saved"
+    },
+    "dmrg_structure_factors_png": {
+      "status": "saved"
+    },
+    "entanglement_entropy_method_means_png": {
+      "status": "saved"
+    },
+    "entanglement_entropy_profiles_png": {
+      "status": "saved"
+    },
+    "geometry_diagram_png": {
+      "status": "saved"
+    }
+  },
+  "outputs": {
+    "dmrg_bond_energy_diagram_png": "dmrg_bond_energy_diagram.png",
+    "dmrg_scalar_correlation_heatmaps_png": "dmrg_scalar_correlation_heatmaps.png",
+    "dmrg_structure_factors_png": "dmrg_structure_factors.png",
+    "entanglement_entropy_method_means_png": "entanglement_entropy_method_means.png",
+    "entanglement_entropy_profiles_png": "entanglement_entropy_profiles.png",
+    "geometry_diagram_png": "geometry_diagram.png",
+    "run_summary_json": "run_summary.json"
+  },
+  "parameters": {
+    "alpha": 1.0,
+    "backend": "auto",
+    "beta": 0.0,
+    "circumference_y": 3,
+    "coupling_j": 1.0,
+    "idmrg_bulk_kind": "auto",
+    "idmrg_max_iterations": 20,
+    "idmrg_max_local_dim": 256,
+    "initial_state": "random",
+    "ising_axis": "z",
+    "lattice": "honeycomb",
+    "length_x": 3,
+    "max_bond_dimension": 400,
+    "max_sweeps": 20,
+    "model_family": "yao_lee",
+    "open_around_cylinder": false,
+    "orbital_rep": "1/2",
+    "output_folder": "DMRG/outputs",
+    "overwrite_plots": false,
+    "progress": true,
+    "run_ed": false,
+    "run_idmrg": true,
+    "seed": 42,
+    "spin_rep": "1/2",
+    "strict_plot_errors": false,
+    "truncation_cutoff": 1e-10
+  },
+  "run_status": "completed_with_warnings",
+  "stages": {
+    "dmrg": "completed",
+    "dmrg_plots": "completed",
+    "ed": "not_requested",
+    "idmrg": "failed"
+  }
+}
