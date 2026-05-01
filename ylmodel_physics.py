@@ -271,7 +271,14 @@ def _validate_symmetry_conserving_terms(
             op_name = str(args[idx])
             if op_name not in site_ops:
                 raise KeyError(f"Unknown operator '{op_name}' in term {term}.")
-            net_charge += _operator_charge_transfer(site_ops[op_name], phys_charges, mode)
+            try:
+                net_charge += _operator_charge_transfer(site_ops[op_name], phys_charges, mode)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Operator '{op_name}' in term {term} is not compatible with strict "
+                    f"{mode.upper()} symmetry. Use a symmetry-adapted operator pair, "
+                    f"switch to symmetry_mode=z2/none, or choose a U1-conserving model."
+                ) from exc
         if mode == "z2":
             net_charge = int(net_charge % 2)
         if int(net_charge) != 0:
@@ -396,6 +403,81 @@ def model_terms_for_bond(
         (coupling_j * (1.0 - beta), f"T{axis_gamma}"),
         (coupling_j * alpha, f"ST{axis_gamma}"),
     ]
+
+
+def _is_zero_coefficient(value: complex, tol: float = 1e-12) -> bool:
+    return abs(complex(value)) <= tol
+
+
+def _u1_pair_terms_for_bond_terms(
+    bond_terms: List[Tuple[float, str]],
+    i: int,
+    j: int,
+) -> List[Tuple[complex, str, int, str, int]]:
+    """Convert U1-conserving x/y pairs into raising/lowering AutoMPO terms."""
+    combined: Dict[str, complex] = {}
+    order: List[str] = []
+    for coefficient, op_name in bond_terms:
+        op_text = str(op_name)
+        coeff = complex(coefficient)
+        if _is_zero_coefficient(coeff):
+            continue
+        if op_text not in combined:
+            order.append(op_text)
+            combined[op_text] = 0.0j
+        combined[op_text] += coeff
+
+    terms: List[Tuple[complex, str, int, str, int]] = []
+
+    for x_op, y_op, plus_op, minus_op in (
+        ("Sx", "Sy", "Sp", "Sm"),
+        ("Tx", "Ty", "Tp", "Tm"),
+    ):
+        coeff_x = combined.pop(x_op, 0.0j)
+        coeff_y = combined.pop(y_op, 0.0j)
+        if _is_zero_coefficient(coeff_x) and _is_zero_coefficient(coeff_y):
+            continue
+        if _is_zero_coefficient(coeff_x - coeff_y):
+            coeff = 0.5 * coeff_x
+            terms.append((coeff, plus_op, i, minus_op, j))
+            terms.append((coeff, minus_op, i, plus_op, j))
+            continue
+        raise ValueError(
+            "A U1 symmetric MPO requires transverse pair terms to appear as "
+            f"{x_op}_{i}{x_op}_{j} + {y_op}_{i}{y_op}_{j} with equal coefficients. "
+            f"Got {x_op} coefficient {coeff_x:g} and {y_op} coefficient {coeff_y:g}. "
+            "Use symmetry_mode=z2/none for single-axis x/y flip terms."
+        )
+
+    for op_name in ("STx", "STy"):
+        coeff = combined.get(op_name, 0.0j)
+        if not _is_zero_coefficient(coeff):
+            raise ValueError(
+                f"U1 symmetry cannot preserve the current {op_name}_{i}{op_name}_{j} "
+                "term without changing the Hamiltonian. Use symmetry_mode=z2 or none for "
+                "Yao-Lee x/y spin-orbital channels."
+            )
+
+    for op_name in order:
+        coeff = combined.get(op_name, 0.0j)
+        if _is_zero_coefficient(coeff):
+            continue
+        terms.append((coeff, op_name, i, op_name, j))
+    return terms
+
+
+def auto_mpo_pair_terms_for_bond_terms(
+    bond_terms: List[Tuple[float, str]],
+    i: int,
+    j: int,
+    *,
+    symmetry_mode: str,
+    strict_charge_conservation: bool,
+) -> List[Tuple[Any, str, int, str, int]]:
+    mode = _normalize_symmetry_mode(symmetry_mode)
+    if mode == "u1":
+        return list(_u1_pair_terms_for_bond_terms(bond_terms, i, j))
+    return [(coefficient, op_name, i, op_name, j) for coefficient, op_name in bond_terms]
 
 
 # ----------------------------------------------------------------------

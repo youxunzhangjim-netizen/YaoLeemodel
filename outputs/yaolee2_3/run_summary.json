@@ -1,0 +1,468 @@
+{
+  "backend_used": "tenax",
+  "dmrg": {
+    "energy_per_site": -0.3335663889686718,
+    "entanglement": {
+      "context": {
+        "backend": "tenax",
+        "n_sites": 12
+      },
+      "cuts": [
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0,
+        6.0,
+        7.0,
+        8.0,
+        9.0,
+        10.0,
+        11.0
+      ],
+      "cuts_normalized": [
+        0.08333333333333333,
+        0.16666666666666666,
+        0.25,
+        0.3333333333333333,
+        0.4166666666666667,
+        0.5,
+        0.5833333333333334,
+        0.6666666666666666,
+        0.75,
+        0.8333333333333334,
+        0.9166666666666666
+      ],
+      "entropies": {
+        "S1": [
+          1.3862943611198908,
+          2.3693682852467686,
+          3.6825058156081365,
+          3.4168582000869945,
+          3.8120367031667604,
+          2.4901120738330023,
+          3.8120286000613217,
+          3.4168426131261693,
+          3.2616579970586765,
+          2.3693048891745416,
+          1.3862943611198906
+        ],
+        "S2": [
+          1.3862943611198906,
+          2.153548616581571,
+          3.366679930610555,
+          3.0497495171543068,
+          3.3375387839120805,
+          1.9599830754924066,
+          3.3375389060917335,
+          3.049739299290536,
+          3.0417409184857926,
+          2.153472575787857,
+          1.3862943611198906
+        ],
+        "S3": [
+          1.3862943611198906,
+          2.0414404949552547,
+          3.1867290412443947,
+          2.9029675657551306,
+          3.2134212556990387,
+          1.8303954850483548,
+          3.2134212168990923,
+          2.9029586219151877,
+          2.9822963855951174,
+          2.041365826535273,
+          1.3862943611198906
+        ],
+        "S4": [
+          1.3862943611198906,
+          1.9811833329920818,
+          3.0878133511565067,
+          2.827698040904498,
+          3.1653568132182563,
+          1.7815982169184565,
+          3.1653567315077247,
+          2.8276897189088293,
+          2.959353749746709,
+          1.9811125225319115,
+          1.3862943611198906
+        ]
+      },
+      "method": "DMRG",
+      "summary": {
+        "S1_max": 3.8120367031667604,
+        "S1_mean": 2.854845809054741,
+        "S1_min": 1.3862943611198906,
+        "S2_max": 3.366679930610555,
+        "S2_mean": 2.565689122331511,
+        "S2_min": 1.3862943611198906,
+        "S3_max": 3.2134212556990387,
+        "S3_mean": 2.4625076923533293,
+        "S3_min": 1.3862943611198906,
+        "S4_max": 3.1653568132182563,
+        "S4_mean": 2.413613745465887,
+        "S4_min": 1.3862943611198906
+      }
+    },
+    "ground_state_energy": -4.002796667624062,
+    "info": {
+      "E": -4.002796667624062,
+      "converged": true,
+      "energies_per_sweep": [
+        -3.991292156631596,
+        -4.0017940409428086,
+        -4.0027024537492375,
+        -4.002796658733378,
+        -4.002796667498279,
+        -4.00279666762287,
+        -4.002796667624062
+      ],
+      "sweeps_done": 7,
+      "symmetry_enabled": false,
+      "symmetry_mode": "none",
+      "u1_symmetry_enabled": false,
+      "z2_symmetry_enabled": false
+    },
+    "structure_factors": [
+      {
+        "Q_label": "Gamma",
+        "Qx": 0.0,
+        "Qy": 0.0,
+        "S(Q)": -0.3563909336248308,
+        "ST(Q)": 0.04459376517888325,
+        "T(Q)": -0.35583327107408363
+      },
+      {
+        "Q_label": "M1",
+        "Qx": 1.8137993642342178,
+        "Qy": -1.0471975511965976,
+        "S(Q)": -0.12974755561216947,
+        "ST(Q)": 0.01936189157903034,
+        "T(Q)": -0.12508782214340455
+      },
+      {
+        "Q_label": "M2",
+        "Qx": 0.0,
+        "Qy": 2.0943951023931953,
+        "S(Q)": 0.07554712593095966,
+        "ST(Q)": -0.00906038501691664,
+        "T(Q)": 0.07691041305787014
+      },
+      {
+        "Q_label": "M3",
+        "Qx": 1.8137993642342178,
+        "Qy": 1.0471975511965976,
+        "S(Q)": -0.02709921472556323,
+        "ST(Q)": 0.004785044690269568,
+        "T(Q)": -0.02408159971860789
+      },
+      {
+        "Q_label": "K1",
+        "Qx": 2.4183991523122903,
+        "Qy": 0.0,
+        "S(Q)": -0.052762274893890106,
+        "ST(Q)": 0.00870412695605271,
+        "T(Q)": -0.049334467313283094
+      },
+      {
+        "Q_label": "K2",
+        "Qx": 1.2091995761561452,
+        "Qy": 2.0943951023931953,
+        "S(Q)": -0.05276132510449427,
+        "ST(Q)": 0.009065502920917722,
+        "T(Q)": -0.04933894814204859
+      }
+    ]
+  },
+  "ed": {
+    "absolute_energy_difference_dmrg_minus_ed": 0.00012506627757513655,
+    "energy_per_site": -0.33357681115846977,
+    "entanglement": {
+      "context": {
+        "local_dim": 4,
+        "n_sites": 12
+      },
+      "cuts": [
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0,
+        6.0,
+        7.0,
+        8.0,
+        9.0,
+        10.0,
+        11.0
+      ],
+      "cuts_normalized": [
+        0.08333333333333333,
+        0.16666666666666666,
+        0.25,
+        0.3333333333333333,
+        0.4166666666666667,
+        0.5,
+        0.5833333333333334,
+        0.6666666666666666,
+        0.75,
+        0.8333333333333334,
+        0.9166666666666666
+      ],
+      "entropies": {
+        "S1": [
+          1.3862943611198906,
+          2.369742534007044,
+          3.7334054999295905,
+          4.05375647217893,
+          4.614717254291336,
+          3.5070142378284834,
+          4.596383460245253,
+          4.033464685763896,
+          3.2627471429461394,
+          2.36974253400703,
+          1.3862943611198906
+        ],
+        "S2": [
+          1.3862943611198906,
+          2.154008551522544,
+          3.4906996682957083,
+          3.636688052314058,
+          4.118843602457368,
+          2.855060112872009,
+          4.104385155349603,
+          3.62022556381366,
+          3.042531252798111,
+          2.1540085515225216,
+          1.3862943611198906
+        ],
+        "S3": [
+          1.3862943611198906,
+          2.0418957599602736,
+          3.3545753667881795,
+          3.4502624617566493,
+          3.9686869613537183,
+          2.6707135944553215,
+          3.9569365308639357,
+          3.446734058454864,
+          2.98293668661535,
+          2.0418957599602505,
+          1.3862943611198906
+        ],
+        "S4": [
+          1.3862943611198906,
+          1.9816161317338519,
+          3.2742523170406534,
+          3.344311863529945,
+          3.8994626236659933,
+          2.589701274328013,
+          3.888744714501225,
+          3.354710326675989,
+          2.9599263061334145,
+          1.981616131733829,
+          1.3862943611198906
+        ]
+      },
+      "method": "ED",
+      "summary": {
+        "S1_max": 4.614717254291336,
+        "S1_mean": 3.2103238675852253,
+        "S1_min": 1.3862943611198906,
+        "S2_max": 4.118843602457368,
+        "S2_mean": 2.90445811210776,
+        "S2_min": 1.3862943611198906,
+        "S3_max": 3.9686869613537183,
+        "S3_mean": 2.789747809313484,
+        "S3_min": 1.3862943611198906,
+        "S4_max": 3.8994626236659933,
+        "S4_mean": 2.7315391283256996,
+        "S4_min": 1.3862943611198906
+      }
+    },
+    "ground_state_energy": -4.002921733901637,
+    "status": "completed",
+    "structure_factors": [
+      {
+        "Q_label": "Gamma",
+        "Qx": 0.0,
+        "Qy": 0.0,
+        "S(Q)": -0.35242446306089065,
+        "ST(Q)": 0.04516620138132377,
+        "T(Q)": -0.3546860316136015
+      },
+      {
+        "Q_label": "M1",
+        "Qx": 1.8137993642342178,
+        "Qy": -1.0471975511965976,
+        "S(Q)": -0.1316922348422088,
+        "ST(Q)": 0.018727432259962682,
+        "T(Q)": -0.1254820626432631
+      },
+      {
+        "Q_label": "M2",
+        "Qx": 0.0,
+        "Qy": 2.0943951023931953,
+        "S(Q)": 0.07608933227270122,
+        "ST(Q)": -0.00912527051856245,
+        "T(Q)": 0.07225743936142631
+      },
+      {
+        "Q_label": "M3",
+        "Qx": 1.8137993642342178,
+        "Qy": 1.0471975511965976,
+        "S(Q)": -0.026545489851518153,
+        "ST(Q)": 0.004710183636773995,
+        "T(Q)": -0.02868425345530021
+      },
+      {
+        "Q_label": "K1",
+        "Qx": 2.4183991523122903,
+        "Qy": 0.0,
+        "S(Q)": -0.052676932777675274,
+        "ST(Q)": 0.008478693055567404,
+        "T(Q)": -0.04797495191796101
+      },
+      {
+        "Q_label": "K2",
+        "Qx": 1.2091995761561452,
+        "Qy": 2.0943951023931953,
+        "S(Q)": -0.05472974507512981,
+        "ST(Q)": 0.008508681013232102,
+        "T(Q)": -0.052525123632660965
+      }
+    ]
+  },
+  "geometry": {
+    "lattice": "honeycomb",
+    "mps_path": {
+      "bond_count": 15,
+      "by_gamma": {
+        "x": {
+          "bond_count": 3,
+          "max_index_span": 11,
+          "mean_index_span": 7.0
+        },
+        "y": {
+          "bond_count": 6,
+          "max_index_span": 5,
+          "mean_index_span": 2.6666666666666665
+        },
+        "z": {
+          "bond_count": 6,
+          "max_index_span": 1,
+          "mean_index_span": 1.0
+        }
+      },
+      "max_index_span": 11,
+      "mean_index_span": 2.8666666666666667,
+      "median_index_span": 1.0,
+      "ordering": "snake_x_alternating_y",
+      "p90_index_span": 6.199999999999999
+    },
+    "number_of_bonds": 15,
+    "number_of_sites": 12
+  },
+  "idmrg": {
+    "error": "INTERNAL: Buffer Definition Event: Error dispatching computation: Error dispatching computation: Error dispatching computation: Error dispatching computation: Error dispatching computation: Error dispatching computation: Error dispatching computation: Out of memory allocating 13421772800 bytes.",
+    "status": "failed"
+  },
+  "model_name": "Honeycomb spin-orbital model (yao_lee, spin=1/2, orbital=1/2, axis=z)",
+  "model_spec": {
+    "effective_interaction": "yao_lee",
+    "ising_axis": "z",
+    "model_family": "yao_lee",
+    "orbital_is_trivial": false,
+    "orbital_rep": "1/2",
+    "orbital_value": 0.5,
+    "physical_dim": 4,
+    "spin_rep": "1/2",
+    "spin_value": 0.5
+  },
+  "output_status": {
+    "dmrg_bond_energy_diagram_png": {
+      "status": "saved"
+    },
+    "dmrg_scalar_correlation_heatmaps_png": {
+      "status": "saved"
+    },
+    "dmrg_structure_factors_png": {
+      "status": "saved"
+    },
+    "dmrg_vs_ed_energy_png": {
+      "status": "saved"
+    },
+    "dmrg_vs_ed_structure_factors_png": {
+      "status": "saved"
+    },
+    "ed_bond_energy_diagram_png": {
+      "status": "saved"
+    },
+    "ed_scalar_correlation_heatmaps_png": {
+      "status": "saved"
+    },
+    "ed_structure_factors_png": {
+      "status": "saved"
+    },
+    "entanglement_entropy_method_means_png": {
+      "status": "saved"
+    },
+    "entanglement_entropy_profiles_png": {
+      "status": "saved"
+    },
+    "geometry_diagram_png": {
+      "status": "skipped_exists"
+    }
+  },
+  "outputs": {
+    "dmrg_bond_energy_diagram_png": "dmrg_bond_energy_diagram.png",
+    "dmrg_scalar_correlation_heatmaps_png": "dmrg_scalar_correlation_heatmaps.png",
+    "dmrg_structure_factors_png": "dmrg_structure_factors.png",
+    "dmrg_vs_ed_energy_png": "dmrg_vs_ed_energy.png",
+    "dmrg_vs_ed_structure_factors_png": "dmrg_vs_ed_structure_factors.png",
+    "ed_bond_energy_diagram_png": "ed_bond_energy_diagram.png",
+    "ed_scalar_correlation_heatmaps_png": "ed_scalar_correlation_heatmaps.png",
+    "ed_structure_factors_png": "ed_structure_factors.png",
+    "entanglement_entropy_method_means_png": "entanglement_entropy_method_means.png",
+    "entanglement_entropy_profiles_png": "entanglement_entropy_profiles.png",
+    "geometry_diagram_png": "geometry_diagram.png",
+    "run_summary_json": "run_summary.json"
+  },
+  "parameters": {
+    "alpha": 1.0,
+    "backend": "auto",
+    "beta": 0.5,
+    "circumference_y": 3,
+    "coupling_j": 1.0,
+    "idmrg_bulk_kind": "auto",
+    "idmrg_max_iterations": 20,
+    "idmrg_max_local_dim": 256,
+    "initial_state": "random",
+    "ising_axis": "z",
+    "lattice": "honeycomb",
+    "length_x": 2,
+    "max_bond_dimension": 400,
+    "max_sweeps": 20,
+    "model_family": "yao_lee",
+    "open_around_cylinder": false,
+    "orbital_rep": "1/2",
+    "output_folder": "DMRG/outputs",
+    "overwrite_plots": false,
+    "progress": true,
+    "run_ed": true,
+    "run_idmrg": true,
+    "seed": 42,
+    "spin_rep": "1/2",
+    "strict_plot_errors": false,
+    "strict_symmetry_selection_rules": true,
+    "symmetry_mode": "none",
+    "truncation_cutoff": 1e-08,
+    "u1_target_sz2": 0,
+    "u1_target_tz2": 0,
+    "z2_target_parity": 0
+  },
+  "run_status": "completed_with_warnings",
+  "stages": {
+    "dmrg": "completed",
+    "dmrg_plots": "completed",
+    "ed": "completed",
+    "idmrg": "failed"
+  }
+}

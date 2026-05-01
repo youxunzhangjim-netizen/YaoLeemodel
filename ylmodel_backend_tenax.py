@@ -30,6 +30,7 @@ from ylmodel_physics import (
     _validate_symmetry_conserving_terms,
     _z2_basis_charge_table_for_model,
     _z2_phys_charges_for_model,
+    auto_mpo_pair_terms_for_bond_terms,
     build_site_ops,
     model_terms_for_bond,
 )
@@ -153,7 +154,7 @@ def build_tenax_model_mpo(
     )
     for bond in geometry.bond_list:
         i, j, gamma = bond.i, bond.j, bond.gamma.lower()
-        for coefficient, op_name in model_terms_for_bond(
+        bond_terms = model_terms_for_bond(
             gamma,
             model_spec,
             alpha,
@@ -162,8 +163,16 @@ def build_tenax_model_mpo(
             jx=jx,
             jy=jy,
             jz=jz,
-        ):
-            terms.append((coefficient, op_name, i, op_name, j))
+        )
+        terms.extend(
+            auto_mpo_pair_terms_for_bond_terms(
+                bond_terms,
+                i,
+                j,
+                symmetry_mode=symmetry_mode,
+                strict_charge_conservation=bool(strict_charge_conservation),
+            )
+        )
         if progress_bar is not None:
             progress_bar.update(1)
 

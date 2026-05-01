@@ -9,7 +9,6 @@ This version is designed to:
 """
 
 from __future__ import annotations
-
 import argparse
 import contextlib
 import importlib
@@ -36,7 +35,7 @@ import scipy.sparse.linalg as sparse_linalg
 LATTICE_OPTIONS = ("honeycomb", "square", "triangular")
 MODEL_FAMILY_OPTIONS = ("yao_lee", "ising_like")
 SPIN_REP_OPTIONS = ("1/2", "3/2")
-ORBITAL_REP_OPTIONS = ("0", "1/2", "3/2")
+ORBITAL_REP_OPTIONS = ("0", "1/2")
 AXIS_OPTIONS = ("x", "y", "z")
 INITIAL_STATE_OPTIONS = ("alternating", "random")
 SYMMETRY_MODE_OPTIONS = ("none", "u1", "z2")
@@ -47,7 +46,7 @@ ENTROPY_ORDERS = (1, 2, 3, 4)
 
 # Geometry.
 LENGTH_X = 2
-CIRCUMFERENCE_Y = 3
+CIRCUMFERENCE_Y = 2
 PERIODIC_AROUND_CYLINDER = True
 LATTICE_TYPE = "honeycomb"  # honeycomb | square | triangular
 
@@ -57,14 +56,16 @@ SPIN_REP = "1/2"            # 1/2 | 3/2
 ORBITAL_REP = "1/2"         # 0 | 1/2 ; CLI also accepts legacy alias 1 -> 0
 ISING_AXIS = "z"            # x | y | z
 ALPHA = 1.0
-BETA = 0.5
-COUPLING_J = 1.0
+BETA = 0
+COUPLING_J = 0.0
 
 # Symmetry simplification/block-sparse controls.
 # none: dense tensors, no symmetry constraints.
 # u1:   encoded U(1)xU(1) charges using target (2*Sz, 2*Tz).
-# z2:   parity charges using target even/odd sector.
-SYMMETRY_MODE = "none"      # none | u1 | z2
+#       This is only valid when the Hamiltonian conserves total Sz/Tz.
+#       Bond-dependent x/y Yao-Lee terms should use z2 or none instead.
+# z2:   parity charges using target even/odd sector. This supports x/y flip pairs.
+SYMMETRY_MODE = "u1"      # none | u1 | z2
 U1_TARGET_TOTAL_SZ2 = 0     # equals 2 * total S^z
 U1_TARGET_TOTAL_TZ2 = 0     # equals 2 * total T^z
 Z2_TARGET_PARITY = 0        # 0=even, 1=odd
@@ -402,7 +403,7 @@ def compute_tenax_infinite_mps_entropy_profile(
 AXES = AXIS_OPTIONS
 SPIN_REP_VALUES = {"1/2": 0.5, "3/2": 1.5}
 # "1" is kept as a legacy alias and normalized to "0".
-ORBITAL_REP_VALUES = {"0": 0.0, "1": 0.0, "1/2": 0.5, "3/2": 1.5}
+ORBITAL_REP_VALUES = {"0": 0.0, "1": 0.0, "1/2": 0.5}
 
 
 @dataclass(frozen=True)
@@ -430,7 +431,7 @@ def build_model_spec(
         raise ValueError(f"Unsupported spin_rep '{spin_rep}'. Choose from {sorted(SPIN_REP_VALUES.keys())}.")
     if orbital_text not in ORBITAL_REP_VALUES:
         raise ValueError(
-            f"Unsupported orbital_rep '{orbital_rep}'. Choose from ['0', '1/2', '3/2']."
+            f"Unsupported orbital_rep '{orbital_rep}'. Choose from ['0', '1/2']."
         )
     if orbital_text == "1":
         orbital_text = "0"
@@ -610,7 +611,14 @@ def _validate_symmetry_conserving_terms(
             op_name = str(args[idx])
             if op_name not in site_ops:
                 raise KeyError(f"Unknown operator '{op_name}' in term {term}.")
-            net_charge += _operator_charge_transfer(site_ops[op_name], phys_charges, mode)
+            try:
+                net_charge += _operator_charge_transfer(site_ops[op_name], phys_charges, mode)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Operator '{op_name}' in term {term} is not compatible with strict "
+                    f"{mode.upper()} symmetry. Use a symmetry-adapted operator pair, "
+                    f"switch to symmetry_mode=z2/none, or choose a U1-conserving model."
+                ) from exc
         if mode == "z2":
             net_charge = int(net_charge % 2)
         if int(net_charge) != 0:
@@ -722,6 +730,81 @@ def model_terms_for_bond(
         (coupling_j * (1.0 - beta), f"T{axis_gamma}"),
         (coupling_j * alpha, f"ST{axis_gamma}"),
     ]
+
+
+def _is_zero_coefficient(value: complex, tol: float = 1e-12) -> bool:
+    return abs(complex(value)) <= tol
+
+
+def _u1_pair_terms_for_bond_terms(
+    bond_terms: List[Tuple[float, str]],
+    i: int,
+    j: int,
+) -> List[Tuple[complex, str, int, str, int]]:
+    """Convert U1-conserving x/y pairs into raising/lowering AutoMPO terms."""
+    combined: Dict[str, complex] = {}
+    order: List[str] = []
+    for coefficient, op_name in bond_terms:
+        op_text = str(op_name)
+        coeff = complex(coefficient)
+        if _is_zero_coefficient(coeff):
+            continue
+        if op_text not in combined:
+            order.append(op_text)
+            combined[op_text] = 0.0j
+        combined[op_text] += coeff
+
+    terms: List[Tuple[complex, str, int, str, int]] = []
+
+    for x_op, y_op, plus_op, minus_op in (
+        ("Sx", "Sy", "Sp", "Sm"),
+        ("Tx", "Ty", "Tp", "Tm"),
+    ):
+        coeff_x = combined.pop(x_op, 0.0j)
+        coeff_y = combined.pop(y_op, 0.0j)
+        if _is_zero_coefficient(coeff_x) and _is_zero_coefficient(coeff_y):
+            continue
+        if _is_zero_coefficient(coeff_x - coeff_y):
+            coeff = 0.5 * coeff_x
+            terms.append((coeff, plus_op, i, minus_op, j))
+            terms.append((coeff, minus_op, i, plus_op, j))
+            continue
+        raise ValueError(
+            "A U1 symmetric MPO requires transverse pair terms to appear as "
+            f"{x_op}_{i}{x_op}_{j} + {y_op}_{i}{y_op}_{j} with equal coefficients. "
+            f"Got {x_op} coefficient {coeff_x:g} and {y_op} coefficient {coeff_y:g}. "
+            "Use symmetry_mode=z2/none for single-axis x/y flip terms."
+        )
+
+    for op_name in ("STx", "STy"):
+        coeff = combined.get(op_name, 0.0j)
+        if not _is_zero_coefficient(coeff):
+            raise ValueError(
+                f"U1 symmetry cannot preserve the current {op_name}_{i}{op_name}_{j} "
+                "term without changing the Hamiltonian. Use symmetry_mode=z2 or none for "
+                "Yao-Lee x/y spin-orbital channels."
+            )
+
+    for op_name in order:
+        coeff = combined.get(op_name, 0.0j)
+        if _is_zero_coefficient(coeff):
+            continue
+        terms.append((coeff, op_name, i, op_name, j))
+    return terms
+
+
+def auto_mpo_pair_terms_for_bond_terms(
+    bond_terms: List[Tuple[float, str]],
+    i: int,
+    j: int,
+    *,
+    symmetry_mode: str,
+    strict_charge_conservation: bool,
+) -> List[Tuple[Any, str, int, str, int]]:
+    mode = _normalize_symmetry_mode(symmetry_mode)
+    if mode == "u1":
+        return list(_u1_pair_terms_for_bond_terms(bond_terms, i, j))
+    return [(coefficient, op_name, i, op_name, j) for coefficient, op_name in bond_terms]
 
 
 # ----------------------------------------------------------------------
@@ -1041,8 +1124,16 @@ def build_tenax_yao_lee_mpo(
     )
     for bond in geometry.bond_list:
         i, j, gamma = bond.i, bond.j, bond.gamma.lower()
-        for coefficient, op_name in model_terms_for_bond(gamma, model_spec, alpha, beta, coupling_j):
-            terms.append((coefficient, op_name, i, op_name, j))
+        bond_terms = model_terms_for_bond(gamma, model_spec, alpha, beta, coupling_j)
+        terms.extend(
+            auto_mpo_pair_terms_for_bond_terms(
+                bond_terms,
+                i,
+                j,
+                symmetry_mode=symmetry_mode,
+                strict_charge_conservation=bool(strict_charge_conservation),
+            )
+        )
         if progress_bar is not None:
             progress_bar.update(1)
 
@@ -2067,6 +2158,119 @@ def lattice_display_name(lattice: str) -> str:
     return mapping.get(lattice.lower(), lattice.title())
 
 
+def _safe_filename_token(text: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(text).strip())
+    token = re.sub(r"_+", "_", token).strip("_.-")
+    return token or "run"
+
+
+def _rep_filename_token(rep: str) -> str:
+    return str(rep).replace("/", "").replace(".", "p")
+
+
+def model_simplified_name(model_spec: ModelSpec) -> str:
+    family_map = {
+        "yao_lee": "YL",
+        "ising_like": "IsingLike",
+        "heisenberg": "Heisenberg",
+        "xy": "XY",
+        "xxz": "XXZ",
+        "xyz": "XYZ",
+    }
+    family = family_map.get(model_spec.model_family, model_spec.model_family)
+    parts = [
+        family,
+        f"S{_rep_filename_token(model_spec.spin_rep)}",
+        f"T{_rep_filename_token(model_spec.orbital_rep)}",
+    ]
+    if model_spec.model_family == "ising_like" or is_trivial_orbital(model_spec):
+        parts.append(f"{model_spec.ising_axis.upper()}axis")
+    return _safe_filename_token("_".join(parts))
+
+
+def model_display_short_name(model_spec: ModelSpec) -> str:
+    family_map = {
+        "yao_lee": "YL",
+        "ising_like": "Ising-like",
+        "heisenberg": "Heisenberg",
+        "xy": "XY",
+        "xxz": "XXZ",
+        "xyz": "XYZ",
+    }
+    family = family_map.get(model_spec.model_family, model_spec.model_family)
+    return f"{family} S={model_spec.spin_rep}, T={model_spec.orbital_rep}, axis={model_spec.ising_axis}"
+
+
+def geometry_size_filename_label(
+    geometry: GeometryData,
+    lattice: str,
+    length_x: int,
+    circumference_y: int,
+    periodic_y: bool,
+) -> str:
+    lattice_short = {
+        "honeycomb": "hc",
+        "square": "sq",
+        "triangular": "tri",
+    }.get(lattice.lower(), lattice.lower())
+    boundary = "pbcY" if periodic_y else "obcY"
+    return _safe_filename_token(
+        f"{lattice_short}_Lx{int(length_x)}_Cy{int(circumference_y)}_N{int(geometry.number_of_sites)}_{boundary}"
+    )
+
+
+def geometry_size_display_label(
+    geometry: GeometryData,
+    lattice: str,
+    length_x: int,
+    circumference_y: int,
+    periodic_y: bool,
+) -> str:
+    boundary = "PBC-y" if periodic_y else "OBC-y"
+    return (
+        f"{lattice_display_name(lattice)} Lx={int(length_x)}, "
+        f"Cy={int(circumference_y)}, N={int(geometry.number_of_sites)}, {boundary}"
+    )
+
+
+def run_output_prefix(
+    model_spec: ModelSpec,
+    geometry: GeometryData,
+    lattice: str,
+    length_x: int,
+    circumference_y: int,
+    periodic_y: bool,
+) -> str:
+    return _safe_filename_token(
+        f"{model_simplified_name(model_spec)}_{geometry_size_filename_label(geometry, lattice, length_x, circumference_y, periodic_y)}"
+    )
+
+
+def run_title_label(
+    model_spec: ModelSpec,
+    geometry: GeometryData,
+    lattice: str,
+    length_x: int,
+    circumference_y: int,
+    periodic_y: bool,
+) -> str:
+    return (
+        f"{model_display_short_name(model_spec)} | "
+        f"{geometry_size_display_label(geometry, lattice, length_x, circumference_y, periodic_y)}"
+    )
+
+
+def labeled_output_filename(run_prefix: str, base_filename: str) -> str:
+    stem, extension = os.path.splitext(base_filename)
+    return f"{_safe_filename_token(run_prefix)}_{_safe_filename_token(stem)}{extension}"
+
+
+def titled_for_run(base_title: str, title_label: str | None) -> str:
+    if title_label:
+        return f"{base_title}\n{title_label}"
+    return base_title
+
+
 def reciprocal_lattice_vectors(lattice: str) -> Tuple[np.ndarray, np.ndarray]:
     lattice_name = lattice.lower()
     if lattice_name == "square":
@@ -2183,7 +2387,12 @@ def _load_tenpy_backend_module() -> Any:
     return importlib.import_module("yaoleemodel")
 
 
-def save_geometry_diagram(geometry: GeometryData, filepath: str, lattice: str) -> None:
+def save_geometry_diagram(
+    geometry: GeometryData,
+    filepath: str,
+    lattice: str,
+    title_label: str | None = None,
+) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -2208,7 +2417,7 @@ def save_geometry_diagram(geometry: GeometryData, filepath: str, lattice: str) -
             ax.scatter(positions[:, 0], positions[:, 1], s=16, c="#111111", label="sites")
     else:
         ax.scatter(positions[:, 0], positions[:, 1], s=16, c="#111111", label="sites")
-    ax.set_title(f"{lattice_display_name(lattice)} Cylinder Geometry")
+    ax.set_title(titled_for_run(f"{lattice_display_name(lattice)} Cylinder Geometry", title_label))
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.legend(loc="upper right")
@@ -2310,6 +2519,7 @@ def save_multi_method_energy_comparison(
     method_to_energy: Dict[str, float],
     filepath: str,
     title: str = "Ground-State Energy Per Site Comparison",
+    title_label: str | None = None,
 ) -> None:
     import matplotlib
     matplotlib.use("Agg")
@@ -2328,7 +2538,7 @@ def save_multi_method_energy_comparison(
     }
     colors = [color_map.get(label, "#666666") for label in labels]
     ax.bar(labels, values, color=colors)
-    ax.set_title(title)
+    ax.set_title(titled_for_run(title, title_label))
     ax.set_ylabel("Energy per site")
     ax.grid(axis="y", alpha=0.25)
     fig.tight_layout()
@@ -2340,6 +2550,7 @@ def save_entropy_profiles_comparison(
     entropy_profiles: Dict[str, Dict[str, Any]],
     filepath: str,
     orders: Tuple[int, ...] = ENTROPY_ORDERS,
+    title_label: str | None = None,
 ) -> None:
     import matplotlib
     matplotlib.use("Agg")
@@ -2352,6 +2563,16 @@ def save_entropy_profiles_comparison(
         "DMRG": "#1f77b4",
         "ED": "#ff7f0e",
         "iDMRG-x": "#2ca02c",
+    }
+    markers = {
+        "DMRG": "o",
+        "ED": "s",
+        "iDMRG-x": "^",
+    }
+    linestyles = {
+        "DMRG": "-",
+        "ED": "--",
+        "iDMRG-x": ":",
     }
 
     for axis, order_n in zip(axes_flat, orders):
@@ -2368,9 +2589,10 @@ def save_entropy_profiles_comparison(
             axis.plot(
                 x_values,
                 values,
-                marker="o",
+                linestyle=linestyles.get(method, "-"),
                 linewidth=1.8,
                 markersize=3.5,
+                marker=markers.get(method, "o"),
                 color=colors.get(method, None),
                 label=method,
             )
@@ -2385,7 +2607,7 @@ def save_entropy_profiles_comparison(
     handles, labels = axes_flat[0].get_legend_handles_labels()
     if len(handles) > 0:
         axes_flat[0].legend(loc="best")
-    fig.suptitle("Entanglement Entropy Profiles by Method")
+    fig.suptitle(titled_for_run("Entanglement Entropy Profiles by Method", title_label))
     fig.tight_layout()
     fig.savefig(filepath)
     plt.close(fig)
@@ -2395,6 +2617,7 @@ def save_entropy_method_means_comparison(
     entropy_profiles: Dict[str, Dict[str, Any]],
     filepath: str,
     orders: Tuple[int, ...] = ENTROPY_ORDERS,
+    title_label: str | None = None,
 ) -> None:
     import matplotlib
     matplotlib.use("Agg")
@@ -2429,7 +2652,7 @@ def save_entropy_method_means_comparison(
     ax.set_xticklabels([f"n={order_n}" for order_n in orders])
     ax.set_xlabel("Renyi order")
     ax.set_ylabel("Mean entropy across cuts")
-    ax.set_title("Method Comparison: Mean Entanglement Entropies")
+    ax.set_title(titled_for_run("Method Comparison: Mean Entanglement Entropies", title_label))
     ax.grid(axis="y", alpha=0.25)
     ax.legend(loc="best")
     fig.tight_layout()
@@ -2437,11 +2660,17 @@ def save_entropy_method_means_comparison(
     plt.close(fig)
 
 
-def save_dmrg_ed_energy_comparison(dmrg_energy: float, ed_energy: float, filepath: str) -> None:
+def save_dmrg_ed_energy_comparison(
+    dmrg_energy: float,
+    ed_energy: float,
+    filepath: str,
+    title_label: str | None = None,
+) -> None:
     save_multi_method_energy_comparison(
         method_to_energy={"DMRG": float(dmrg_energy), "ED": float(ed_energy)},
         filepath=filepath,
         title="Ground-State Energy Comparison",
+        title_label=title_label,
     )
 
 
@@ -2449,6 +2678,7 @@ def save_dmrg_ed_structure_comparison(
     dmrg_rows: List[Dict[str, Any]],
     ed_rows: List[Dict[str, Any]],
     filepath: str,
+    title_label: str | None = None,
 ) -> None:
     import matplotlib
     matplotlib.use("Agg")
@@ -2464,15 +2694,15 @@ def save_dmrg_ed_structure_comparison(
     for ax, channel in zip(axes, channels):
         dmrg_values = [dmrg_map[label][channel] for label in labels]
         ed_values = [ed_map[label][channel] for label in labels]
-        ax.plot(x, dmrg_values, marker="o", linewidth=1.8, label="DMRG")
-        ax.plot(x, ed_values, marker="s", linewidth=1.8, label="ED")
+        ax.plot(x, dmrg_values, marker="o", linestyle="-", linewidth=1.8, label="DMRG")
+        ax.plot(x, ed_values, marker="s", linestyle="--", linewidth=1.8, label="ED")
         ax.set_title(channel)
         ax.set_xticks(x)
         ax.set_xticklabels(labels, rotation=0)
         ax.grid(alpha=0.25)
     axes[0].set_ylabel("Value")
     axes[0].legend(loc="best")
-    fig.suptitle("DMRG vs ED Structure Factors")
+    fig.suptitle(titled_for_run("DMRG vs ED Structure Factors", title_label))
     fig.tight_layout()
     fig.savefig(filepath)
     plt.close(fig)
@@ -2500,7 +2730,7 @@ def parse_command_line() -> argparse.Namespace:
         type=str,
         choices=list(ORBITAL_REP_OPTIONS) + ["1"],
         default=ORBITAL_REP,
-        help="Orbital representation: 0 (trivial), 1/2, or 3/2. (Legacy alias: 1 -> 0)",
+        help="Orbital representation: 0 (trivial) or 1/2. (Legacy alias: 1 -> 0)",
     )
     parser.add_argument(
         "--model-family",
@@ -2527,7 +2757,10 @@ def parse_command_line() -> argparse.Namespace:
         type=str,
         choices=list(SYMMETRY_MODE_OPTIONS),
         default=SYMMETRY_MODE,
-        help="Tensor symmetry mode: none (dense), u1 (encoded Sz/Tz), or z2 (parity).",
+        help=(
+            "Tensor symmetry mode: none (dense), u1 (strict total Sz/Tz conservation), "
+            "or z2 (parity; use this for x/y Yao-Lee flip terms)."
+        ),
     )
     parser.add_argument(
         "--u1-target-sz2",
@@ -2714,21 +2947,39 @@ def write_json(filepath: str, data_dict: Dict[str, Any]) -> None:
 
 
 def _save_summary_checkpoint(output_folder: str, summary: Dict[str, Any]) -> None:
-    run_summary_path = os.path.join(output_folder, "run_summary.json")
+    outputs = summary.get("outputs", {})
+    summary_filename = "run_summary.json"
+    if isinstance(outputs, dict):
+        summary_filename = str(outputs.get("run_summary_json", summary_filename))
+
+    run_summary_path = os.path.join(output_folder, summary_filename)
     write_json(run_summary_path, summary)
 
 
 def _load_previous_summary(output_folder: str) -> Dict[str, Any] | None:
-    run_summary_path = os.path.join(output_folder, "run_summary.json")
-    if not os.path.exists(run_summary_path):
-        return None
+    candidate_paths = [os.path.join(output_folder, "run_summary.json")]
     try:
-        with open(run_summary_path, "r", encoding="utf-8") as file:
-            data = json.load(file)
-        if isinstance(data, dict):
-            return data
+        if os.path.isdir(output_folder):
+            labeled_summaries = [
+                os.path.join(output_folder, filename)
+                for filename in os.listdir(output_folder)
+                if filename.endswith("_run_summary.json")
+            ]
+            labeled_summaries.sort(key=lambda path: os.path.getmtime(path), reverse=True)
+            candidate_paths.extend(labeled_summaries)
     except Exception:
-        return None
+        pass
+
+    for run_summary_path in candidate_paths:
+        if not os.path.exists(run_summary_path):
+            continue
+        try:
+            with open(run_summary_path, "r", encoding="utf-8") as file:
+                data = json.load(file)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            continue
     return None
 
 
@@ -2879,22 +3130,57 @@ def main() -> None:
     entropy_profiles: Dict[str, Dict[str, Any]] = {}
     geometry_plot_status = "not_attempted"
     geometry_plot_error: str | None = None
+    run_file_prefix: str | None = None
+    run_plot_title_label: str | None = None
+    run_summary_filename = "run_summary.json"
+
+    def configure_run_output_names(geometry_obj: Any) -> None:
+        nonlocal run_file_prefix, run_plot_title_label, run_summary_filename
+        if run_file_prefix is not None and run_plot_title_label is not None:
+            return
+        run_file_prefix = run_output_prefix(
+            model_spec=model_spec,
+            geometry=geometry_obj,
+            lattice=lattice_name,
+            length_x=args.length_x,
+            circumference_y=args.circumference_y,
+            periodic_y=periodic_y,
+        )
+        run_plot_title_label = run_title_label(
+            model_spec=model_spec,
+            geometry=geometry_obj,
+            lattice=lattice_name,
+            length_x=args.length_x,
+            circumference_y=args.circumference_y,
+            periodic_y=periodic_y,
+        )
+        run_summary_filename = labeled_output_filename(run_file_prefix, "run_summary.json")
+
+    def output_filename(base_filename: str) -> str:
+        if run_file_prefix is None:
+            return base_filename
+        return labeled_output_filename(run_file_prefix, base_filename)
+
+    def plot_title(base_title: str) -> str:
+        return titled_for_run(base_title, run_plot_title_label)
 
     def save_geometry_before_sweep(geometry_obj: Any) -> None:
         nonlocal geometry_plot_status, geometry_plot_error
-        filepath = os.path.join(args.output_folder, "geometry_diagram.png")
+        configure_run_output_names(geometry_obj)
+        filename = output_filename("geometry_diagram.png")
+        filepath = os.path.join(args.output_folder, filename)
         if os.path.exists(filepath) and not overwrite_existing:
             geometry_plot_status = "skipped_exists"
-            print("[output] skip existing: geometry_diagram.png")
+            print(f"[output] skip existing: {filename}")
             return
         try:
-            save_geometry_diagram(geometry_obj, filepath, lattice_name)
+            save_geometry_diagram(geometry_obj, filepath, lattice_name, title_label=run_plot_title_label)
             geometry_plot_status = "saved"
-            print("[output] saved: geometry_diagram.png")
+            print(f"[output] saved: {filename}")
         except Exception as exc:
             geometry_plot_status = "failed"
             geometry_plot_error = str(exc)
-            print(f"[output] failed: geometry_diagram.png :: {exc}")
+            print(f"[output] failed: {filename} :: {exc}")
             if not continue_on_plot_error:
                 raise
 
@@ -2958,7 +3244,8 @@ def main() -> None:
             if args.symmetry_mode != "none":
                 raise RuntimeError(
                     "Tenax failed while symmetry_mode is enabled, and TeNPy fallback "
-                    "cannot preserve U1/Z2 block-sparse symmetry sectors in this script."
+                    "cannot preserve U1/Z2 block-sparse symmetry sectors in this script. "
+                    f"Original Tenax error: {tenax_exc}"
                 ) from tenax_exc
             if lattice_name != "honeycomb":
                 raise RuntimeError(
@@ -3038,13 +3325,34 @@ def main() -> None:
     except Exception as exc:
         entanglement_warning = f"Failed to compute DMRG entanglement profile: {exc}"
 
+    configure_run_output_names(geometry)
     lattice_label = lattice_display_name(lattice_name)
+    model_short_label = model_simplified_name(model_spec)
+    size_short_label = geometry_size_filename_label(
+        geometry,
+        lattice_name,
+        args.length_x,
+        args.circumference_y,
+        periodic_y,
+    )
+    size_display_label = geometry_size_display_label(
+        geometry,
+        lattice_name,
+        args.length_x,
+        args.circumference_y,
+        periodic_y,
+    )
     model_label = (
         f"{model_spec.model_family}, spin={model_spec.spin_rep}, orbital={model_spec.orbital_rep}, axis={model_spec.ising_axis}"
     )
 
     summary: Dict[str, Any] = {
         "model_name": f"{lattice_label} spin-orbital model ({model_label})",
+        "model_simplified_name": model_short_label,
+        "model_size_name": size_short_label,
+        "run_output_prefix": run_file_prefix,
+        "monitor_data_name": run_summary_filename,
+        "plot_title_label": run_plot_title_label,
         "run_status": "running",
         "parameters": vars(args),
         "model_spec": {
@@ -3067,6 +3375,7 @@ def main() -> None:
             "lattice": lattice_name,
             "number_of_sites": geometry.number_of_sites,
             "number_of_bonds": len(geometry.bond_list),
+            "size_label": size_display_label,
             "mps_path": mps_path_quality(geometry),
         },
         "dmrg": {
@@ -3083,7 +3392,8 @@ def main() -> None:
             "ed": "pending" if args.run_ed else "not_requested",
         },
         "outputs": {
-            "run_summary_json": "run_summary.json",
+            "run_summary_json": run_summary_filename,
+            "monitor_data_json": run_summary_filename,
         },
     }
     if backend_warning:
@@ -3096,7 +3406,7 @@ def main() -> None:
     _record_output_status(
         summary,
         "geometry_diagram_png",
-        "geometry_diagram.png",
+        output_filename("geometry_diagram.png"),
         geometry_plot_status,
         geometry_plot_error,
     )
@@ -3105,8 +3415,8 @@ def main() -> None:
         summary,
         args.output_folder,
         "dmrg_bond_energy_diagram_png",
-        "dmrg_bond_energy_diagram.png",
-        lambda path: save_bond_energy_diagram(geometry, dmrg_bond_rows, path, "DMRG Bond-Energy Diagram"),
+        output_filename("dmrg_bond_energy_diagram.png"),
+        lambda path: save_bond_energy_diagram(geometry, dmrg_bond_rows, path, plot_title("DMRG Bond-Energy Diagram")),
         overwrite_existing,
         continue_on_plot_error,
     )
@@ -3114,8 +3424,8 @@ def main() -> None:
         summary,
         args.output_folder,
         "dmrg_structure_factors_png",
-        "dmrg_structure_factors.png",
-        lambda path: save_structure_factor_plot(dmrg_structure_factor_rows, path, f"DMRG Structure Factors ({lattice_label})"),
+        output_filename("dmrg_structure_factors.png"),
+        lambda path: save_structure_factor_plot(dmrg_structure_factor_rows, path, plot_title("DMRG Structure Factors")),
         overwrite_existing,
         continue_on_plot_error,
     )
@@ -3123,8 +3433,8 @@ def main() -> None:
         summary,
         args.output_folder,
         "dmrg_scalar_correlation_heatmaps_png",
-        "dmrg_scalar_correlation_heatmaps.png",
-        lambda path: save_scalar_correlation_heatmaps(dmrg_scalar_correlations, path, "DMRG"),
+        output_filename("dmrg_scalar_correlation_heatmaps.png"),
+        lambda path: save_scalar_correlation_heatmaps(dmrg_scalar_correlations, path, f"DMRG | {run_plot_title_label}"),
         overwrite_existing,
         continue_on_plot_error,
     )
@@ -3169,7 +3479,7 @@ def main() -> None:
                     summary,
                     args.output_folder,
                     "dmrg_vs_idmrg_energy_png",
-                    "dmrg_vs_idmrg_energy.png",
+                    output_filename("dmrg_vs_idmrg_energy.png"),
                     lambda path: save_multi_method_energy_comparison(
                         method_to_energy={
                             "DMRG": float(summary["dmrg"]["energy_per_site"]),
@@ -3177,6 +3487,7 @@ def main() -> None:
                         },
                         filepath=path,
                         title="Finite DMRG vs iDMRG-x Energy Per Site",
+                        title_label=run_plot_title_label,
                     ),
                     overwrite_existing,
                     continue_on_plot_error,
@@ -3295,8 +3606,8 @@ def main() -> None:
                     summary,
                     args.output_folder,
                     "ed_bond_energy_diagram_png",
-                    "ed_bond_energy_diagram.png",
-                    lambda path: save_bond_energy_diagram(geometry, ed_bond_rows, path, "ED Bond-Energy Diagram"),
+                    output_filename("ed_bond_energy_diagram.png"),
+                    lambda path: save_bond_energy_diagram(geometry, ed_bond_rows, path, plot_title("ED Bond-Energy Diagram")),
                     overwrite_existing,
                     continue_on_plot_error,
                 )
@@ -3304,8 +3615,8 @@ def main() -> None:
                     summary,
                     args.output_folder,
                     "ed_structure_factors_png",
-                    "ed_structure_factors.png",
-                    lambda path: save_structure_factor_plot(ed_structure_factor_rows, path, f"ED Structure Factors ({lattice_label})"),
+                    output_filename("ed_structure_factors.png"),
+                    lambda path: save_structure_factor_plot(ed_structure_factor_rows, path, plot_title("ED Structure Factors")),
                     overwrite_existing,
                     continue_on_plot_error,
                 )
@@ -3313,8 +3624,8 @@ def main() -> None:
                     summary,
                     args.output_folder,
                     "ed_scalar_correlation_heatmaps_png",
-                    "ed_scalar_correlation_heatmaps.png",
-                    lambda path: save_scalar_correlation_heatmaps(ed_scalar_correlations, path, "ED"),
+                    output_filename("ed_scalar_correlation_heatmaps.png"),
+                    lambda path: save_scalar_correlation_heatmaps(ed_scalar_correlations, path, f"ED | {run_plot_title_label}"),
                     overwrite_existing,
                     continue_on_plot_error,
                 )
@@ -3322,7 +3633,7 @@ def main() -> None:
                     summary,
                     args.output_folder,
                     "dmrg_vs_ed_energy_png",
-                    "dmrg_vs_ed_energy.png",
+                    output_filename("dmrg_vs_ed_energy.png"),
                     lambda path: save_multi_method_energy_comparison(
                         method_to_energy={
                             "DMRG": float(summary["dmrg"]["energy_per_site"]),
@@ -3330,6 +3641,7 @@ def main() -> None:
                         },
                         filepath=path,
                         title="Finite DMRG vs ED Energy Per Site",
+                        title_label=run_plot_title_label,
                     ),
                     overwrite_existing,
                     continue_on_plot_error,
@@ -3343,7 +3655,7 @@ def main() -> None:
                         summary,
                         args.output_folder,
                         "dmrg_vs_ed_vs_idmrg_energy_png",
-                        "dmrg_vs_ed_vs_idmrg_energy.png",
+                        output_filename("dmrg_vs_ed_vs_idmrg_energy.png"),
                         lambda path: save_multi_method_energy_comparison(
                             method_to_energy={
                                 "DMRG": float(summary["dmrg"]["energy_per_site"]),
@@ -3352,6 +3664,7 @@ def main() -> None:
                             },
                             filepath=path,
                             title="Finite DMRG vs ED vs iDMRG-x Energy Per Site",
+                            title_label=run_plot_title_label,
                         ),
                         overwrite_existing,
                         continue_on_plot_error,
@@ -3360,8 +3673,13 @@ def main() -> None:
                     summary,
                     args.output_folder,
                     "dmrg_vs_ed_structure_factors_png",
-                    "dmrg_vs_ed_structure_factors.png",
-                    lambda path: save_dmrg_ed_structure_comparison(dmrg_structure_factor_rows, ed_structure_factor_rows, path),
+                    output_filename("dmrg_vs_ed_structure_factors.png"),
+                    lambda path: save_dmrg_ed_structure_comparison(
+                        dmrg_structure_factor_rows,
+                        ed_structure_factor_rows,
+                        path,
+                        title_label=run_plot_title_label,
+                    ),
                     overwrite_existing,
                     continue_on_plot_error,
                 )
@@ -3379,11 +3697,12 @@ def main() -> None:
             summary,
             args.output_folder,
             "entanglement_entropy_profiles_png",
-            "entanglement_entropy_profiles.png",
+            output_filename("entanglement_entropy_profiles.png"),
             lambda path: save_entropy_profiles_comparison(
                 entropy_profiles=entropy_profiles,
                 filepath=path,
                 orders=ENTROPY_ORDERS,
+                title_label=run_plot_title_label,
             ),
             overwrite_existing,
             continue_on_plot_error,
@@ -3392,11 +3711,12 @@ def main() -> None:
             summary,
             args.output_folder,
             "entanglement_entropy_method_means_png",
-            "entanglement_entropy_method_means.png",
+            output_filename("entanglement_entropy_method_means.png"),
             lambda path: save_entropy_method_means_comparison(
                 entropy_profiles=entropy_profiles,
                 filepath=path,
                 orders=ENTROPY_ORDERS,
+                title_label=run_plot_title_label,
             ),
             overwrite_existing,
             continue_on_plot_error,
