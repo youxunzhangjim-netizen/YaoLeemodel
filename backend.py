@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""Tenax backend for the Yao-Lee driver.
+
+This module owns Tenax AutoMPO construction, finite DMRG, iDMRG, and Tenax
+correlation collection. General model/geometry physics stays in ``models.py``
+and CLI orchestration stays in ``ylmodel_main.py``.
+"""
+
 from __future__ import annotations
 
 import contextlib
@@ -11,19 +18,22 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
-from ylmodel_core_runtime import (
+from analysis import (
     ENTROPY_ORDERS,
     _end_stage,
+    _get_tqdm,
     _make_progress_bar,
     _start_stage,
     compute_tenax_infinite_mps_entropy_profile,
+    find_dmrg_excited_state,
     get_tenax_api,
 )
-from ylmodel_physics import (
+from models import (
     GeometryData,
     ModelSpec,
     _get_z2_symmetry_object,
     _normalize_symmetry_mode,
+    _u1_charge_encoding_summary,
     _u1_basis_charge_table_for_model,
     _u1_encoded_phys_charges_for_model,
     _u1_encoded_target_charge,
@@ -33,6 +43,7 @@ from ylmodel_physics import (
     auto_mpo_pair_terms_for_bond_terms,
     build_site_ops,
     model_terms_for_bond,
+    nonzero_auto_mpo_terms,
 )
 
 SYMMETRY_MODE_DEFAULT = "none"
@@ -56,11 +67,43 @@ def _build_auto_mpo_from_terms(
     phys_charges: np.ndarray | None = None,
     strict_charge_conservation: bool = True,
 ) -> Any:
+    terms = nonzero_auto_mpo_terms(terms)
+    if len(terms) == 0:
+        raise ValueError(
+            "No non-zero AutoMPO terms were provided. Check coupling_j, external field "
+            "settings, and symmetry filtering before building the Tenax MPO."
+        )
+
+    mode = _normalize_symmetry_mode(symmetry_mode)
+    if mode == "z2":
+        raise RuntimeError(
+            "Tenax 0.2 AutoMPO cannot build a true Z2 block-sparse MPO: its "
+            "symmetric AutoMPO path checks raw integer U1 charge transfers. "
+            "Use symmetry_mode=none for full Yao-Lee x/y bonds, or use "
+            "symmetry_mode=u1 with a U1-conserving Hamiltonian."
+        )
     api = get_tenax_api()
     build_auto_mpo = api["build_auto_mpo"]
     auto_mpo_cls = api["AutoMPO"]
-    mode = _normalize_symmetry_mode(symmetry_mode)
     use_symmetric_tensors = (mode != "none")
+    mpo_dtype = np.float64 if mode == "u1" else np.complex128
+    site_ops_for_build = site_ops
+    if mode == "u1":
+        required_ops = {"Id"}
+        for term in terms:
+            args = term[1:]
+            for idx in range(0, len(args), 2):
+                required_ops.add(str(args[idx]))
+        site_ops_for_build = {}
+        for op_name in sorted(required_ops):
+            if op_name not in site_ops:
+                continue
+            op_array = np.asarray(site_ops[op_name])
+            if np.max(np.abs(np.imag(op_array))) > 1e-12:
+                raise ValueError(
+                    f"U1 symmetric real Tenax DMRG cannot use complex operator '{op_name}'."
+                )
+            site_ops_for_build[op_name] = np.asarray(np.real(op_array), dtype=np.float64)
 
     if use_symmetric_tensors:
         if phys_charges is None:
@@ -71,7 +114,7 @@ def _build_auto_mpo_from_terms(
     if build_auto_mpo is not None:
         signature = inspect.signature(build_auto_mpo)
         kwargs: Dict[str, Any] = {"L": length}
-        local_dim = int(next(iter(site_ops.values())).shape[0])
+        local_dim = int(next(iter(site_ops_for_build.values())).shape[0])
         build_fn_supports_symmetry = (
             (not use_symmetric_tensors)
             or (
@@ -83,11 +126,12 @@ def _build_auto_mpo_from_terms(
             if "d" in signature.parameters:
                 kwargs["d"] = local_dim
             if "site_ops" in signature.parameters:
-                kwargs["site_ops"] = site_ops
+                kwargs["site_ops"] = site_ops_for_build
             # Our local operators include Sy/Ty, so terms are complex.
-            # Force complex MPO dtype to avoid float-casting errors inside Tenax.
+            # Dense mode stays complex-safe; U1 mode uses real Sp/Sm and z terms
+            # because Tenax 0.2 symmetric DMRG casts Lanczos inner products to float.
             if "dtype" in signature.parameters:
-                kwargs["dtype"] = np.complex128
+                kwargs["dtype"] = mpo_dtype
             if use_symmetric_tensors:
                 kwargs["symmetric"] = True
                 kwargs["phys_charges"] = np.asarray(phys_charges, dtype=np.int32)
@@ -99,7 +143,7 @@ def _build_auto_mpo_from_terms(
             )
 
     if auto_mpo_cls is not None:
-        local_dim = int(next(iter(site_ops.values())).shape[0])
+        local_dim = int(next(iter(site_ops_for_build.values())).shape[0])
         try:
             auto = auto_mpo_cls(L=length, d=local_dim)
         except TypeError:
@@ -112,7 +156,7 @@ def _build_auto_mpo_from_terms(
                     compress=True,
                     symmetric=True,
                     phys_charges=np.asarray(phys_charges, dtype=np.int32),
-                    dtype=np.complex128,
+                    dtype=mpo_dtype,
                 )
             return auto.to_mpo(compress=True)
         except TypeError:
@@ -120,11 +164,31 @@ def _build_auto_mpo_from_terms(
                 return auto.to_mpo(
                     symmetric=True,
                     phys_charges=np.asarray(phys_charges, dtype=np.int32),
-                    dtype=np.complex128,
+                    dtype=mpo_dtype,
                 )
             return auto.to_mpo()
 
     raise RuntimeError("Tenax provides neither build_auto_mpo nor AutoMPO.")
+
+
+def _empty_tenax_hamiltonian_message(
+    geometry: GeometryData,
+    model_spec: ModelSpec,
+    alpha: float,
+    beta: float,
+    coupling_j: float,
+    field_terms: List[Tuple[float, str]],
+) -> str:
+    return (
+        "No non-zero Hamiltonian terms were generated for the Tenax MPO. "
+        f"sites={int(geometry.number_of_sites)}, bonds={len(geometry.bond_list)}, "
+        f"model_family={model_spec.model_family}, spin_rep={model_spec.spin_rep}, "
+        f"orbital_rep={model_spec.orbital_rep}, alpha={float(alpha):g}, "
+        f"beta={float(beta):g}, coupling_j={float(coupling_j):g}, "
+        f"external_field_terms={field_terms}. "
+        "Set --coupling-j to a non-zero value, or use "
+        "--external-field-treatment hamiltonian with a non-zero field."
+    )
 
 
 def build_tenax_model_mpo(
@@ -136,6 +200,7 @@ def build_tenax_model_mpo(
     jx: float = 1.0,
     jy: float = 1.0,
     jz: float = 1.0,
+    external_field_terms: List[Tuple[float, str]] | None = None,
     symmetry_mode: str = "none",
     symmetry_phys_charges: np.ndarray | None = None,
     strict_charge_conservation: bool = True,
@@ -143,13 +208,14 @@ def build_tenax_model_mpo(
 ) -> Any:
     length = geometry.number_of_sites
     custom_ops = build_site_ops(model_spec)
+    field_terms = list(external_field_terms or [])
     terms: List[Tuple[Any, ...]] = []
 
     progress_bar = _make_progress_bar(
         enabled=show_progress,
-        total=len(geometry.bond_list),
-        desc="Tenax MPO bonds",
-        unit="bond",
+        total=len(geometry.bond_list) + (length if field_terms else 0),
+        desc="Tenax MPO terms",
+        unit="item",
         leave=False,
     )
     for bond in geometry.bond_list:
@@ -176,8 +242,27 @@ def build_tenax_model_mpo(
         if progress_bar is not None:
             progress_bar.update(1)
 
+    for site in range(length):
+        for coefficient, op_name in field_terms:
+            terms.append((coefficient, op_name, site))
+        if field_terms and progress_bar is not None:
+            progress_bar.update(1)
+
     if progress_bar is not None:
         progress_bar.close()
+
+    terms = nonzero_auto_mpo_terms(terms)
+    if len(terms) == 0:
+        raise ValueError(
+            _empty_tenax_hamiltonian_message(
+                geometry,
+                model_spec,
+                alpha,
+                beta,
+                coupling_j,
+                field_terms,
+            )
+        )
 
     return _build_auto_mpo_from_terms(
         terms,
@@ -314,11 +399,13 @@ def _build_random_symmetric_mps(
         charge_modulus = None
         target_charge = int(target_charge)
         phys = np.asarray(phys_charges, dtype=np.int32)
+        tensor_dtype = np.float64
     elif mode == "z2":
         symmetry = _get_z2_symmetry_object()
         charge_modulus = 2
         target_charge = int(target_charge) % 2
         phys = np.asarray(phys_charges, dtype=np.int32) % 2
+        tensor_dtype = np.float64
     else:
         raise ValueError(f"Symmetric MPS builder requires symmetry mode u1/z2, got '{mode}'.")
 
@@ -364,22 +451,26 @@ def _build_random_symmetric_mps(
             left = virt_charges
             right = virt_charges
 
-        left_label = "v_left_0" if site == 0 else f"v{site - 1}_{site}"
-        right_label = "v_right" if site == length - 1 else f"v{site}_{site + 1}"
+        left_label = "v_-1_0" if site == 0 else f"v{site - 1}_{site}"
+        right_label = f"v{site}_{site + 1}"
         indices = (
             TensorIndex(symmetry, left, FlowDirection.IN, label=left_label),
-            TensorIndex(symmetry, phys, FlowDirection.IN, label=f"p_{site}"),
+            TensorIndex(symmetry, phys, FlowDirection.IN, label=f"p{site}"),
             TensorIndex(symmetry, right, FlowDirection.OUT, label=right_label),
         )
         tensor = SymmetricTensor.random_normal(
             indices,
             key=subkey,
-            dtype=np.complex128,
+            dtype=tensor_dtype,
             target=site_target,
         )
         tensors.append(tensor)
 
-    return FiniteMPS.from_tensors(tensors, target_charge=int(target_charge)).right_canonicalize()
+    mps = FiniteMPS.from_tensors(tensors, target_charge=int(target_charge))
+    try:
+        return mps.right_canonicalize()
+    except Exception:
+        return mps
 
 
 def run_tenax_cylindrical_dmrg(
@@ -394,11 +485,13 @@ def run_tenax_cylindrical_dmrg(
     jx: float = 1.0,
     jy: float = 1.0,
     jz: float = 1.0,
+    external_field_terms: List[Tuple[float, str]] | None = None,
     symmetry_mode: str = SYMMETRY_MODE,
     u1_target_total_sz2: int = U1_TARGET_TOTAL_SZ2,
     u1_target_total_tz2: int = U1_TARGET_TOTAL_TZ2,
     z2_target_parity: int = Z2_TARGET_PARITY,
     strict_symmetry_selection_rules: bool = STRICT_SYMMETRY_SELECTION_RULES,
+    num_states: int = 1,
     show_progress: bool = True,
 ) -> Tuple[Any, Any, Dict[str, Any]]:
     np.random.seed(random_seed)
@@ -440,6 +533,7 @@ def run_tenax_cylindrical_dmrg(
             jx=jx,
             jy=jy,
             jz=jz,
+            external_field_terms=external_field_terms,
             symmetry_mode=sym_mode,
             symmetry_phys_charges=symmetry_phys_charges,
             strict_charge_conservation=bool(strict_symmetry_selection_rules),
@@ -467,6 +561,8 @@ def run_tenax_cylindrical_dmrg(
             "verbose": bool(show_progress),
         }
         config_signature = inspect.signature(api["DMRGConfig"])
+        if "num_states" in config_signature.parameters:
+            config_kwargs["num_states"] = max(1, int(num_states))
         if symmetry_enabled and "target_charge" in config_signature.parameters:
             config_kwargs["target_charge"] = int(symmetry_target_charge)
         config = api["DMRGConfig"](**config_kwargs)
@@ -483,6 +579,48 @@ def run_tenax_cylindrical_dmrg(
         if show_progress:
             elapsed = time.perf_counter() - stage_start
             print(f"[stage] Tenax MPO+DMRG failed in {elapsed:.2f}s: {exc}")
+        if sym_mode != "none":
+            if show_progress:
+                print(
+                    f"[symmetry] Requested symmetry_mode={sym_mode} could not be imposed; "
+                    "retrying Tenax DMRG with symmetry_mode=none."
+                )
+            mps_retry, mpo_retry, retry_info = run_tenax_cylindrical_dmrg(
+                geometry=geometry,
+                model_spec=model_spec,
+                alpha=alpha,
+                beta=beta,
+                coupling_j=coupling_j,
+                max_bond_dimension=max_bond_dimension,
+                max_sweeps=max_sweeps,
+                random_seed=random_seed,
+                jx=jx,
+                jy=jy,
+                jz=jz,
+                external_field_terms=external_field_terms,
+                symmetry_mode="none",
+                u1_target_total_sz2=u1_target_total_sz2,
+                u1_target_total_tz2=u1_target_total_tz2,
+                z2_target_parity=z2_target_parity,
+                strict_symmetry_selection_rules=strict_symmetry_selection_rules,
+                num_states=num_states,
+                show_progress=show_progress,
+            )
+            retry_info["requested_symmetry_mode"] = sym_mode
+            retry_info["symmetry_fallback_to_dense"] = True
+            retry_info["symmetry_fallback_reason"] = str(exc)
+            retry_info["strict_symmetry_selection_rules_requested"] = bool(strict_symmetry_selection_rules)
+            if sym_mode == "u1":
+                retry_info["requested_u1_target_sector"] = {
+                    "total_Sz_times_2": int(u1_target_total_sz2),
+                    "total_Tz_times_2": int(u1_target_total_tz2),
+                }
+                retry_info["u1_charge_encoding"] = _u1_charge_encoding_summary()
+            if sym_mode == "z2":
+                retry_info["requested_z2_target_sector"] = {
+                    "global_parity": int(z2_target_parity) % 2
+                }
+            return mps_retry, mpo_retry, retry_info
         raise
 
     mps_out, dmrg_info = _extract_dmrg_result(result, mps)
@@ -490,6 +628,7 @@ def run_tenax_cylindrical_dmrg(
     dmrg_info["symmetry_enabled"] = bool(symmetry_enabled)
     dmrg_info["u1_symmetry_enabled"] = bool(sym_mode == "u1")
     dmrg_info["z2_symmetry_enabled"] = bool(sym_mode == "z2")
+    dmrg_info["num_states_requested"] = max(1, int(num_states))
     if symmetry_enabled and symmetry_phys_charges is not None:
         dmrg_info["symmetry_phys_charges"] = [
             int(val) for val in list(np.asarray(symmetry_phys_charges, dtype=np.int32))
@@ -498,6 +637,7 @@ def run_tenax_cylindrical_dmrg(
         if symmetry_basis_table is not None:
             dmrg_info["symmetry_basis_charge_table"] = symmetry_basis_table
         if sym_mode == "u1":
+            dmrg_info["u1_charge_encoding"] = _u1_charge_encoding_summary()
             dmrg_info["u1_target_sector"] = {
                 "total_Sz_times_2": int(u1_target_total_sz2),
                 "total_Tz_times_2": int(u1_target_total_tz2),
@@ -513,6 +653,187 @@ def run_tenax_cylindrical_dmrg(
         sweep_bar.close()
     _end_stage("Tenax MPO+DMRG", stage_start, show_progress)
     return mps_out, mpo, dmrg_info
+
+
+def run_tenax_ed_guided_dmrg_excited_search(
+    geometry: GeometryData,
+    model_spec: ModelSpec,
+    alpha: float,
+    beta: float,
+    coupling_j: float,
+    reference_ground_energy: float,
+    ed_ground_state_degeneracy: int | None,
+    ed_ground_state_degeneracy_tolerance: float | None,
+    ed_first_excited_energy: float | None,
+    max_trials: int,
+    max_bond_dimension: int,
+    max_sweeps: int,
+    random_seed: int,
+    jx: float = 1.0,
+    jy: float = 1.0,
+    jz: float = 1.0,
+    external_field_terms: List[Tuple[float, str]] | None = None,
+    symmetry_mode: str = SYMMETRY_MODE,
+    u1_target_total_sz2: int = U1_TARGET_TOTAL_SZ2,
+    u1_target_total_tz2: int = U1_TARGET_TOTAL_TZ2,
+    z2_target_parity: int = Z2_TARGET_PARITY,
+    strict_symmetry_selection_rules: bool = STRICT_SYMMETRY_SELECTION_RULES,
+    show_progress: bool = True,
+) -> Dict[str, Any]:
+    """Run extra finite-DMRG starts, using ED degeneracy to choose the target level.
+
+    Tenax 0.2 exposes ``DMRGConfig.num_states`` but returns a single optimized
+    MPS/energy. This helper therefore records the requested ED-guided target
+    state count and only reports a DMRG first-excited candidate when a restart
+    actually converges above the ED-guided ground-manifold tolerance.
+    """
+
+    try:
+        guide_degeneracy = int(ed_ground_state_degeneracy)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return {
+            "status": "skipped",
+            "reason": "ED ground-state degeneracy was not resolved, so no DMRG excited-state guide is available.",
+            "ground_state_degeneracy_check_enabled": True,
+            "ground_state_degeneracy_status": "not_resolved",
+        }
+    if guide_degeneracy <= 0:
+        return {
+            "status": "skipped",
+            "reason": f"Invalid ED ground-state degeneracy guide: {guide_degeneracy}.",
+            "ground_state_degeneracy_check_enabled": True,
+            "ground_state_degeneracy_status": "not_resolved",
+        }
+
+    target_state_count = max(2, guide_degeneracy + 1)
+    trial_count = max(1, min(int(max_trials), target_state_count + 1))
+    reference_ground = float(reference_ground_energy)
+    degeneracy_tolerance = max(
+        1e-8 * max(1.0, abs(reference_ground)),
+        float(ed_ground_state_degeneracy_tolerance or 0.0),
+    )
+
+    stage_start = _start_stage("ED-guided finite-DMRG excited search", show_progress)
+    trial_records: List[Dict[str, Any]] = []
+    for trial_index in range(trial_count):
+        trial_seed = int(random_seed) + 104729 * (trial_index + 1)
+        try:
+            _trial_mps, _trial_mpo, trial_info = run_tenax_cylindrical_dmrg(
+                geometry=geometry,
+                model_spec=model_spec,
+                alpha=alpha,
+                beta=beta,
+                coupling_j=coupling_j,
+                max_bond_dimension=max_bond_dimension,
+                max_sweeps=max_sweeps,
+                random_seed=trial_seed,
+                jx=jx,
+                jy=jy,
+                jz=jz,
+                external_field_terms=external_field_terms,
+                symmetry_mode=symmetry_mode,
+                u1_target_total_sz2=u1_target_total_sz2,
+                u1_target_total_tz2=u1_target_total_tz2,
+                z2_target_parity=z2_target_parity,
+                strict_symmetry_selection_rules=strict_symmetry_selection_rules,
+                num_states=target_state_count,
+                show_progress=show_progress,
+            )
+            trial_records.append(
+                {
+                    "trial_index": int(trial_index),
+                    "seed": int(trial_seed),
+                    "status": "completed",
+                    "energy": float(trial_info["E"]),
+                    "converged": trial_info.get("converged"),
+                    "sweeps_done": trial_info.get("sweeps_done"),
+                    "symmetry_mode": trial_info.get("symmetry_mode"),
+                    "num_states_requested": trial_info.get("num_states_requested", target_state_count),
+                }
+            )
+        except Exception as exc:
+            trial_records.append(
+                {
+                    "trial_index": int(trial_index),
+                    "seed": int(trial_seed),
+                    "status": "failed",
+                    "error": str(exc),
+                }
+            )
+
+    successful_energies = [
+        float(record["energy"])
+        for record in trial_records
+        if record.get("status") == "completed" and np.isfinite(float(record["energy"]))
+    ]
+    if len(successful_energies) == 0:
+        _end_stage("ED-guided finite-DMRG excited search", stage_start, show_progress)
+        return {
+            "status": "failed",
+            "reason": "All ED-guided finite-DMRG excited-search trials failed.",
+            "ground_state_degeneracy_check_enabled": True,
+            "ground_state_degeneracy": int(guide_degeneracy),
+            "ground_state_degeneracy_status": "ed_guided",
+            "ground_state_degeneracy_tolerance": float(degeneracy_tolerance),
+            "target_state_count": int(target_state_count),
+            "trials": trial_records,
+        }
+
+    all_ground_candidates = [reference_ground] + successful_energies
+    best_ground = float(min(all_ground_candidates))
+    threshold = best_ground + float(degeneracy_tolerance)
+    excited_candidates = [energy for energy in successful_energies if energy > threshold]
+    first_excited = None
+    if excited_candidates:
+        if ed_first_excited_energy is not None and np.isfinite(float(ed_first_excited_energy)):
+            ed_e1 = float(ed_first_excited_energy)
+            first_excited = float(min(excited_candidates, key=lambda value: abs(value - ed_e1)))
+        else:
+            first_excited = float(min(excited_candidates))
+    spectral_gap = (
+        float(first_excited - best_ground)
+        if first_excited is not None
+        else None
+    )
+    found_lower_ground = bool(best_ground < reference_ground - degeneracy_tolerance)
+    status = "completed" if first_excited is not None else "not_found"
+    _end_stage("ED-guided finite-DMRG excited search", stage_start, show_progress)
+    return {
+        "status": status,
+        "search_method": "ed_degeneracy_guided_multistart_dmrg",
+        "exact_orthogonal_targeting": False,
+        "method_note": (
+            "ED degeneracy sets the requested Tenax num_states and the ground-manifold "
+            "tolerance. Installed Tenax returns one variational DMRG state per run, so "
+            "the reported DMRG first-excited value is a restart candidate, not an exact "
+            "orthogonally targeted excitation."
+        ),
+        "ground_state_energy": float(best_ground),
+        "ground_state_energy_per_site": float(best_ground / geometry.number_of_sites),
+        "reference_dmrg_ground_state_energy": float(reference_ground),
+        "found_lower_ground_energy_than_original_dmrg": found_lower_ground,
+        "ground_state_degeneracy_check_enabled": True,
+        "ground_state_degeneracy": int(guide_degeneracy),
+        "ground_state_degeneracy_status": "ed_guided",
+        "ground_state_degeneracy_tolerance": float(degeneracy_tolerance),
+        "ground_state_degeneracy_is_lower_bound": False,
+        "target_state_count": int(target_state_count),
+        "trial_count": int(trial_count),
+        "successful_trial_count": int(len(successful_energies)),
+        "first_excited_energy": first_excited,
+        "first_excited_energy_per_site": (
+            float(first_excited / geometry.number_of_sites)
+            if first_excited is not None
+            else None
+        ),
+        "spectral_gap": spectral_gap,
+        "ed_guided_first_excited_reference": (
+            float(ed_first_excited_energy)
+            if ed_first_excited_energy is not None
+            else None
+        ),
+        "trials": trial_records,
+    }
 
 
 class _TenaxIDMRGSweepProgressStream(io.TextIOBase):
@@ -833,17 +1154,42 @@ def run_tenax_idmrg_x_from_finite_mpo(
 
 
 def evaluate_expectation_value(mpo_ij: Any, mps: Any) -> complex:
-    api = get_tenax_api()
-    exp_fn = api["expectation"]
-    if callable(exp_fn):
-        return complex(exp_fn(mpo_ij, mps))
     if hasattr(mps, "expectation_value"):
         return complex(mps.expectation_value(mpo_ij))
     if hasattr(mps, "expectation"):
         return complex(mps.expectation(mpo_ij))
+    api = get_tenax_api()
+    exp_fn = api["expectation"]
+    if callable(exp_fn):
+        return complex(exp_fn(mpo_ij, mps))
     raise RuntimeError(
         "No expectation evaluator found. Tenax must provide expectation(...) or MPS expectation methods."
     )
+
+
+def collect_uniform_z_observables_from_tenax(
+    mps: Any,
+    geometry: GeometryData,
+    model_spec: ModelSpec,
+) -> Dict[str, float]:
+    n_sites = int(geometry.number_of_sites)
+    custom_ops = build_site_ops(model_spec)
+    api = get_tenax_api()
+    one_site_expectation = api.get("expectation_value", None)
+    totals = {"spin_z_per_site": 0.0j, "orbital_z_per_site": 0.0j}
+    for site in range(n_sites):
+        if callable(one_site_expectation):
+            totals["spin_z_per_site"] += complex(one_site_expectation(mps, custom_ops["Sz"], site))
+            totals["orbital_z_per_site"] += complex(one_site_expectation(mps, custom_ops["Tz"], site))
+        else:
+            spin_mpo = _build_auto_mpo_from_terms([(1.0, "Sz", site)], n_sites, custom_ops)
+            orbital_mpo = _build_auto_mpo_from_terms([(1.0, "Tz", site)], n_sites, custom_ops)
+            totals["spin_z_per_site"] += evaluate_expectation_value(spin_mpo, mps)
+            totals["orbital_z_per_site"] += evaluate_expectation_value(orbital_mpo, mps)
+    return {
+        key: float(np.real(value) / float(max(1, n_sites)))
+        for key, value in totals.items()
+    }
 
 
 def collect_correlation_matrices_from_tenax(
