@@ -658,6 +658,7 @@ def compute_ed_entropy_profile_from_state(
 def compute_tenax_infinite_mps_entropy_profile(
     mps: Any,
     sites_per_idmrg_site: int,
+    finite_n_sites: int | None = None,
     orders: Tuple[int, ...] = ENTROPY_ORDERS,
 ) -> Dict[str, Any]:
     if not hasattr(mps, "singular_values") or not hasattr(mps, "unit_cell_size"):
@@ -666,24 +667,57 @@ def compute_tenax_infinite_mps_entropy_profile(
     unit_cell_size = int(mps.unit_cell_size)
     if unit_cell_size <= 0:
         raise RuntimeError("Invalid iDMRG unit cell size.")
+    original_sites_per_idmrg_site = max(int(sites_per_idmrg_site), 1)
 
     entropies = {f"S{n}": [] for n in orders}
-    cuts = [float(bond + 1) for bond in range(unit_cell_size)]
     for bond in range(unit_cell_size):
         singular_values = np.asarray(mps.singular_values[bond])
         entropy_values = _entropy_dict_from_singular_values(singular_values, orders)
         for key, value in entropy_values.items():
             entropies[key].append(value)
 
+    context: Dict[str, Any] = {
+        "unit_cell_size": unit_cell_size,
+        "sites_per_idmrg_site": original_sites_per_idmrg_site,
+        "unit_cell_original_sites": int(unit_cell_size * original_sites_per_idmrg_site),
+    }
+    if finite_n_sites is not None:
+        finite_site_count = int(finite_n_sites)
+        finite_cuts = [
+            float(cut)
+            for cut in range(original_sites_per_idmrg_site, finite_site_count, original_sites_per_idmrg_site)
+        ]
+        if finite_site_count > 0 and len(finite_cuts) > 0:
+            finite_entropies = {key: [] for key in entropies}
+            for cut in finite_cuts:
+                bond_index = (int(cut // original_sites_per_idmrg_site) - 1) % unit_cell_size
+                for key, values in entropies.items():
+                    finite_entropies[key].append(float(values[bond_index]))
+            context.update(
+                {
+                    "finite_n_sites_for_normalized_cuts": finite_site_count,
+                    "available_original_cut_spacing": original_sites_per_idmrg_site,
+                    "profile_mapping": (
+                        "iDMRG bond entropies are repeated over finite-chain cut positions "
+                        "that fall between coarse-grained iDMRG sites."
+                    ),
+                }
+            )
+            return _build_entropy_profile(
+                method_label="iDMRG-x",
+                cuts=finite_cuts,
+                total_span=float(finite_site_count),
+                entropies=finite_entropies,
+                context=context,
+            )
+
+    cuts = [float(bond + 1) for bond in range(unit_cell_size)]
     return _build_entropy_profile(
         method_label="iDMRG-x",
         cuts=cuts,
         total_span=float(max(unit_cell_size, 1)),
         entropies=entropies,
-        context={
-            "unit_cell_size": unit_cell_size,
-            "sites_per_idmrg_site": int(sites_per_idmrg_site),
-        },
+        context=context,
     )
 
 

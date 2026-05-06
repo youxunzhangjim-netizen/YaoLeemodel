@@ -54,7 +54,7 @@ LOCAL_LAPTOP_SETTINGS = {
         "lattice_type": "honeycomb",
     },
     "finite_dmrg": {
-        "max_sites": 8,
+        "max_sites": 18,
         "max_bond_dimension": 64,
         "max_sweeps": 10,
     },
@@ -65,7 +65,7 @@ LOCAL_LAPTOP_SETTINGS = {
     },
     "finite_temperature_ed": {
         "run": True,
-        "max_sites": 8,
+        "max_sites": 18,
         "max_hilbert_dim": 100_000,
         "full_spectrum_max_dim": 512,
         "max_eigenstates": 12,
@@ -78,20 +78,20 @@ LOCAL_LAPTOP_SETTINGS = {
         "run": True,
         "max_bond_dimension": 32,
         "max_iterations": 10,
-        "max_local_dim": 8,
-        "bulk_kind": "single",
+        "max_local_dim": 16,
+        "bulk_kind": "auto",
     },
 }
 
 SHARED_WORKSTATION_SETTINGS = {
     "geometry": {
         "length_x": 4,
-        "circumference_y": 2,
+        "circumference_y": 4,
         "periodic_around_cylinder": True,
         "lattice_type": "honeycomb",
     },
     "finite_dmrg": {
-        "max_sites": 16,
+        "max_sites": 32,
         "max_bond_dimension": 128,
         "max_sweeps": 20,
     },
@@ -114,9 +114,9 @@ SHARED_WORKSTATION_SETTINGS = {
     "idmrg": {
         "run": True,
         "max_bond_dimension": 32,
-        "max_iterations": 10,
-        "max_local_dim": 8,
-        "bulk_kind": "single",
+        "max_iterations": 20,
+        "max_local_dim": 16,
+        "bulk_kind": "auto",
     },
 }
 
@@ -126,7 +126,7 @@ RESOURCE_PROFILES = {
 }
 
 
-ACTIVE_RESOURCE_PROFILE = "local_laptop"  # local_laptop | shared_workstation
+ACTIVE_RESOURCE_PROFILE = "shared_workstation"  # local_laptop | shared_workstation
 ACTIVE_RESOURCE_SETTINGS = RESOURCE_PROFILES[ACTIVE_RESOURCE_PROFILE]
 
 # Geometry.
@@ -178,11 +178,11 @@ FIELD_SIGMA_FACTOR = 2.0
 # z2:   parity selection rule. Tenax 0.2 AutoMPO cannot build a true Z2
 #       block-sparse MPO because its symmetric AutoMPO path is U1-only; use
 #       none for full bond-dependent x/y Yao-Lee runs unless Tenax adds Z2 MPO support.
-SYMMETRY_MODE = "z2"      # none | u1 | z2
-U1_TARGET_TOTAL_SZ2 = 0     # equals 2 * total S^z
-U1_TARGET_TOTAL_TZ2 = 0     # equals 2 * total T^z
+SYMMETRY_MODE = "none"      # none | u1 | z2
+U1_TARGET_TOTAL_SZ2 = True     # equals 2 * total S^z
+U1_TARGET_TOTAL_TZ2 = True     # equals 2 * total T^z
 Z2_TARGET_PARITY = 0        # 0=even, 1=odd
-STRICT_SYMMETRY_SELECTION_RULES = True
+STRICT_SYMMETRY_SELECTION_RULES = False
 
 # Resource-limited solver defaults from ACTIVE_RESOURCE_SETTINGS.
 MAX_DMRG_SITES = int(ACTIVE_RESOURCE_SETTINGS["finite_dmrg"]["max_sites"])
@@ -879,6 +879,21 @@ def _extract_consistency_signature(parameters: Dict[str, Any]) -> Dict[str, Any]
         "phase_scan_classical_nematicity_threshold",
     ]
     return {key: parameters.get(key) for key in keys}
+
+
+def _finite_float_from_mapping(mapping: Any, *keys: str) -> float | None:
+    if not isinstance(mapping, dict):
+        return None
+    for key in keys:
+        if key not in mapping:
+            continue
+        try:
+            value = float(mapping[key])
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(value):
+            return value
+    return None
 
 
 def _record_output_status(
@@ -2233,12 +2248,18 @@ def main() -> None:
         and "energy_per_site" in summary["ed"]
     ):
         method_energy_comparison["ED"] = float(summary["ed"]["energy_per_site"])
+    idmrg_energy_per_site = _finite_float_from_mapping(
+        summary.get("idmrg"),
+        "energy_per_original_site",
+        "ground_state_energy_per_site",
+        "energy_per_site",
+    )
     if (
         isinstance(summary.get("idmrg"), dict)
         and summary["idmrg"].get("status") == "completed"
-        and "energy_per_original_site" in summary["idmrg"]
+        and idmrg_energy_per_site is not None
     ):
-        method_energy_comparison["iDMRG-x"] = float(summary["idmrg"]["energy_per_original_site"])
+        method_energy_comparison["iDMRG-x"] = idmrg_energy_per_site
     _save_plot_step(
         summary,
         args.output_folder,
@@ -2250,7 +2271,7 @@ def main() -> None:
             title="Finite DMRG vs ED vs iDMRG-x Energy Per Site",
             title_label=run_plot_title_label,
         ),
-        overwrite_existing,
+        overwrite_existing or "iDMRG-x" in method_energy_comparison,
         continue_on_plot_error,
     )
 
@@ -2382,11 +2403,12 @@ def main() -> None:
     if (
         isinstance(summary.get("idmrg"), dict)
         and summary["idmrg"].get("status") == "completed"
-        and "energy_per_original_site" in summary["idmrg"]
+        and idmrg_energy_per_site is not None
     ):
         method_spectrum_comparison["iDMRG-x"] = {
             "status": "ground_state_only",
-            "ground_state_energy_per_site": float(summary["idmrg"]["energy_per_original_site"]),
+            "ground_state_energy": None,
+            "ground_state_energy_per_site": idmrg_energy_per_site,
             "ground_state_degeneracy": None,
             "ground_state_degeneracy_label": "unresolved",
             "ground_state_degeneracy_status": "not_resolved",
@@ -2410,7 +2432,7 @@ def main() -> None:
             filepath=path,
             title_label=run_plot_title_label,
         ),
-        overwrite_existing,
+        overwrite_existing or "iDMRG-x" in method_spectrum_comparison,
         continue_on_plot_error,
     )
 
@@ -2536,7 +2558,7 @@ def main() -> None:
                 orders=ENTROPY_ORDERS,
                 title_label=run_plot_title_label,
             ),
-            overwrite_existing,
+            overwrite_existing or "iDMRG-x" in entropy_profiles,
             continue_on_plot_error,
         )
         _save_plot_step(
@@ -2550,7 +2572,7 @@ def main() -> None:
                 orders=ENTROPY_ORDERS,
                 title_label=run_plot_title_label,
             ),
-            overwrite_existing,
+            overwrite_existing or "iDMRG-x" in entropy_profiles,
             continue_on_plot_error,
         )
 

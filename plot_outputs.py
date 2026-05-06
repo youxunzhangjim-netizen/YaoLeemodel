@@ -279,7 +279,10 @@ def save_entropy_profiles_comparison(
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 8), dpi=150, sharex=True)
     axes_flat = list(axes.flatten())
-    method_order = _ordered_available_methods(entropy_profiles)
+    method_order = [
+        method for method in _ordered_available_methods(entropy_profiles)
+        if method != "iDMRG-x"
+    ]
 
     for axis, order_n in zip(axes_flat, orders):
         key = f"S{order_n}"
@@ -329,7 +332,10 @@ def save_entropy_method_means_comparison(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    method_order = _ordered_available_methods(entropy_profiles)
+    method_order = [
+        method for method in _ordered_available_methods(entropy_profiles)
+        if method != "iDMRG-x"
+    ]
     if len(method_order) == 0:
         raise RuntimeError("No entropy profiles available for method-mean comparison.")
 

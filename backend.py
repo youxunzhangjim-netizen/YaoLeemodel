@@ -58,6 +58,94 @@ Z2_TARGET_PARITY = Z2_TARGET_PARITY_DEFAULT
 STRICT_SYMMETRY_SELECTION_RULES = STRICT_SYMMETRY_SELECTION_RULES_DEFAULT
 
 
+def _required_site_operator_names(terms: List[Tuple[Any, ...]]) -> List[str]:
+    required = {"Id"}
+    for term in terms:
+        args = term[1:]
+        for idx in range(0, len(args), 2):
+            required.add(str(args[idx]))
+    return sorted(required)
+
+
+def _coerce_auto_mpo_coefficients(
+    terms: List[Tuple[Any, ...]],
+    *,
+    complex_coefficients: bool,
+) -> List[Tuple[Any, ...]]:
+    coerced: List[Tuple[Any, ...]] = []
+    for term in terms:
+        if len(term) == 0:
+            continue
+        coeff = complex(term[0])
+        if complex_coefficients:
+            coerced.append((np.complex128(coeff), *term[1:]))
+        elif abs(coeff.imag) <= 1e-12:
+            coerced.append((float(coeff.real), *term[1:]))
+        else:
+            coerced.append((np.complex128(coeff), *term[1:]))
+    return coerced
+
+
+def _site_ops_subset(
+    site_ops: Dict[str, np.ndarray],
+    required_ops: List[str],
+    dtype: Any,
+) -> Dict[str, np.ndarray]:
+    subset: Dict[str, np.ndarray] = {}
+    for op_name in required_ops:
+        if op_name not in site_ops:
+            continue
+        subset[op_name] = np.asarray(site_ops[op_name], dtype=dtype)
+    return subset
+
+
+def _real_site_ops_subset_if_possible(
+    site_ops: Dict[str, np.ndarray],
+    required_ops: List[str],
+) -> Dict[str, np.ndarray] | None:
+    subset: Dict[str, np.ndarray] = {}
+    for op_name in required_ops:
+        if op_name not in site_ops:
+            continue
+        op_array = np.asarray(site_ops[op_name])
+        if np.max(np.abs(np.imag(op_array))) > 1e-12:
+            return None
+        subset[op_name] = np.asarray(np.real(op_array), dtype=np.float64)
+    return subset
+
+
+def _expand_sy_ty_pair_terms_to_real_ladder_ops(
+    terms: List[Tuple[Any, ...]],
+) -> List[Tuple[Any, ...]]:
+    expanded: List[Tuple[Any, ...]] = []
+    for term in terms:
+        if len(term) == 5 and str(term[1]) == str(term[3]) and str(term[1]) in ("Sy", "Ty"):
+            coeff = complex(term[0])
+            op_plus, op_minus = ("Sp", "Sm") if str(term[1]) == "Sy" else ("Tp", "Tm")
+            i_site = int(term[2])
+            j_site = int(term[4])
+            expanded.extend(
+                [
+                    (-0.25 * coeff, op_plus, i_site, op_plus, j_site),
+                    (0.25 * coeff, op_plus, i_site, op_minus, j_site),
+                    (0.25 * coeff, op_minus, i_site, op_plus, j_site),
+                    (-0.25 * coeff, op_minus, i_site, op_minus, j_site),
+                ]
+            )
+            continue
+        expanded.append(term)
+    return nonzero_auto_mpo_terms(expanded)
+
+
+def _looks_like_tenax_complex_cast_error(exc: Exception) -> bool:
+    text = str(exc)
+    return (
+        "Cannot cast ufunc 'add' output" in text
+        and "complex128" in text
+        and "float64" in text
+    )
+
+
 def _build_auto_mpo_from_terms(
     terms: List[Tuple[Any, ...]],
     length: int,
@@ -87,23 +175,45 @@ def _build_auto_mpo_from_terms(
     auto_mpo_cls = api["AutoMPO"]
     use_symmetric_tensors = (mode != "none")
     mpo_dtype = np.float64 if mode == "u1" else np.complex128
-    site_ops_for_build = site_ops
+    terms_for_build = terms
+    required_ops = _required_site_operator_names(terms)
+    site_ops_for_build = _site_ops_subset(site_ops, required_ops, np.complex128)
     if mode == "u1":
-        required_ops = {"Id"}
-        for term in terms:
-            args = term[1:]
-            for idx in range(0, len(args), 2):
-                required_ops.add(str(args[idx]))
-        site_ops_for_build = {}
-        for op_name in sorted(required_ops):
-            if op_name not in site_ops:
-                continue
-            op_array = np.asarray(site_ops[op_name])
-            if np.max(np.abs(np.imag(op_array))) > 1e-12:
-                raise ValueError(
-                    f"U1 symmetric real Tenax DMRG cannot use complex operator '{op_name}'."
-                )
-            site_ops_for_build[op_name] = np.asarray(np.real(op_array), dtype=np.float64)
+        real_subset = _real_site_ops_subset_if_possible(site_ops, required_ops)
+        if real_subset is None:
+            complex_ops = [
+                op_name
+                for op_name in required_ops
+                if op_name in site_ops
+                and np.max(np.abs(np.imag(np.asarray(site_ops[op_name])))) > 1e-12
+            ]
+            raise ValueError(
+                "U1 symmetric real Tenax DMRG cannot use complex operators: "
+                f"{', '.join(complex_ops)}."
+            )
+        site_ops_for_build = real_subset
+        terms_for_build = _coerce_auto_mpo_coefficients(terms, complex_coefficients=False)
+    else:
+        real_candidate_terms = _coerce_auto_mpo_coefficients(
+            _expand_sy_ty_pair_terms_to_real_ladder_ops(terms),
+            complex_coefficients=False,
+        )
+        real_candidate_required_ops = _required_site_operator_names(real_candidate_terms)
+        real_candidate_site_ops = _real_site_ops_subset_if_possible(
+            site_ops,
+            real_candidate_required_ops,
+        )
+        real_candidate_coefficients = all(
+            abs(complex(term[0]).imag) <= 1e-12
+            for term in real_candidate_terms
+        )
+        if real_candidate_site_ops is not None and real_candidate_coefficients:
+            terms_for_build = real_candidate_terms
+            required_ops = real_candidate_required_ops
+            site_ops_for_build = real_candidate_site_ops
+            mpo_dtype = np.float64
+        else:
+            terms_for_build = _coerce_auto_mpo_coefficients(terms, complex_coefficients=True)
 
     if use_symmetric_tensors:
         if phys_charges is None:
@@ -111,10 +221,16 @@ def _build_auto_mpo_from_terms(
         if strict_charge_conservation:
             _validate_symmetry_conserving_terms(terms, site_ops, phys_charges, mode)
 
-    if build_auto_mpo is not None:
+    def _build_with_inputs(
+        input_terms: List[Tuple[Any, ...]],
+        input_site_ops: Dict[str, np.ndarray],
+        input_dtype: Any,
+    ) -> Any:
+        if build_auto_mpo is None:
+            raise RuntimeError("Tenax build_auto_mpo unavailable.")
         signature = inspect.signature(build_auto_mpo)
         kwargs: Dict[str, Any] = {"L": length}
-        local_dim = int(next(iter(site_ops_for_build.values())).shape[0])
+        local_dim = int(next(iter(input_site_ops.values())).shape[0])
         build_fn_supports_symmetry = (
             (not use_symmetric_tensors)
             or (
@@ -126,29 +242,46 @@ def _build_auto_mpo_from_terms(
             if "d" in signature.parameters:
                 kwargs["d"] = local_dim
             if "site_ops" in signature.parameters:
-                kwargs["site_ops"] = site_ops_for_build
+                kwargs["site_ops"] = input_site_ops
             # Our local operators include Sy/Ty, so terms are complex.
             # Dense mode stays complex-safe; U1 mode uses real Sp/Sm and z terms
             # because Tenax 0.2 symmetric DMRG casts Lanczos inner products to float.
             if "dtype" in signature.parameters:
-                kwargs["dtype"] = mpo_dtype
+                kwargs["dtype"] = input_dtype
             if use_symmetric_tensors:
                 kwargs["symmetric"] = True
                 kwargs["phys_charges"] = np.asarray(phys_charges, dtype=np.int32)
-            return build_auto_mpo(terms, **kwargs)
+            return build_auto_mpo(input_terms, **kwargs)
         if auto_mpo_cls is None:
             raise RuntimeError(
                 "The installed Tenax build_auto_mpo does not expose symmetric/phys_charges "
                 "arguments, and AutoMPO fallback is unavailable for U1/Z2 construction."
             )
+        raise RuntimeError("Tenax build_auto_mpo does not support the requested arguments.")
 
-    if auto_mpo_cls is not None:
-        local_dim = int(next(iter(site_ops_for_build.values())).shape[0])
+    def _build_with_autompo_class(
+        input_terms: List[Tuple[Any, ...]],
+        input_site_ops: Dict[str, np.ndarray],
+        input_dtype: Any,
+    ) -> Any:
+        if auto_mpo_cls is None:
+            raise RuntimeError("Tenax AutoMPO unavailable.")
+        local_dim = int(next(iter(input_site_ops.values())).shape[0])
+        signature = inspect.signature(auto_mpo_cls)
+        kwargs: Dict[str, Any] = {}
+        if "L" in signature.parameters:
+            kwargs["L"] = length
+        if "d" in signature.parameters:
+            kwargs["d"] = local_dim
+        if "site_ops" in signature.parameters:
+            kwargs["site_ops"] = input_site_ops
+        if "dtype" in signature.parameters:
+            kwargs["dtype"] = input_dtype
         try:
-            auto = auto_mpo_cls(L=length, d=local_dim)
+            auto = auto_mpo_cls(**kwargs) if kwargs else auto_mpo_cls(L=length, d=local_dim)
         except TypeError:
             auto = auto_mpo_cls(length)
-        for term in terms:
+        for term in input_terms:
             auto += term
         try:
             if use_symmetric_tensors:
@@ -156,17 +289,74 @@ def _build_auto_mpo_from_terms(
                     compress=True,
                     symmetric=True,
                     phys_charges=np.asarray(phys_charges, dtype=np.int32),
-                    dtype=mpo_dtype,
+                    dtype=input_dtype,
                 )
-            return auto.to_mpo(compress=True)
+            return auto.to_mpo(compress=True, dtype=input_dtype)
         except TypeError:
             if use_symmetric_tensors:
                 return auto.to_mpo(
                     symmetric=True,
                     phys_charges=np.asarray(phys_charges, dtype=np.int32),
-                    dtype=mpo_dtype,
+                    dtype=input_dtype,
                 )
-            return auto.to_mpo()
+            try:
+                return auto.to_mpo(dtype=input_dtype)
+            except TypeError:
+                return auto.to_mpo()
+
+    def _build_primary() -> Any:
+        if build_auto_mpo is not None:
+            try:
+                return _build_with_inputs(terms_for_build, site_ops_for_build, mpo_dtype)
+            except RuntimeError as exc:
+                if auto_mpo_cls is None:
+                    raise
+                if "does not support the requested arguments" not in str(exc):
+                    raise
+        if auto_mpo_cls is not None:
+            return _build_with_autompo_class(terms_for_build, site_ops_for_build, mpo_dtype)
+        raise RuntimeError("Tenax provides neither build_auto_mpo nor AutoMPO.")
+
+    def _build_real_ladder_fallback(original_exc: Exception) -> Any:
+        real_terms = _coerce_auto_mpo_coefficients(
+            _expand_sy_ty_pair_terms_to_real_ladder_ops(terms),
+            complex_coefficients=False,
+        )
+        real_required_ops = _required_site_operator_names(real_terms)
+        real_site_ops = _real_site_ops_subset_if_possible(site_ops, real_required_ops)
+        if real_site_ops is None:
+            raise RuntimeError(
+                "Tenax hit its complex AutoMPO cast bug, and this Hamiltonian still "
+                "requires complex one-site operators after the Sy/Ty ladder rewrite. "
+                "Use no y-axis Zeeman field or patch Tenax AutoMPO to allocate complex buffers."
+            ) from original_exc
+        try:
+            if build_auto_mpo is not None:
+                return _build_with_inputs(real_terms, real_site_ops, np.float64)
+            if auto_mpo_cls is not None:
+                return _build_with_autompo_class(real_terms, real_site_ops, np.float64)
+        except Exception as retry_exc:
+            raise RuntimeError(
+                "Tenax AutoMPO failed even after rewriting Sy/Ty pair terms to real "
+                "ladder-operator form."
+            ) from retry_exc
+        raise RuntimeError("Tenax provides neither build_auto_mpo nor AutoMPO.") from original_exc
+
+    try:
+        return _build_primary()
+    except TypeError as exc:
+        if mode == "none" and _looks_like_tenax_complex_cast_error(exc):
+            return _build_real_ladder_fallback(exc)
+        if auto_mpo_cls is None or build_auto_mpo is None:
+            raise
+        try:
+            return _build_with_autompo_class(terms_for_build, site_ops_for_build, mpo_dtype)
+        except Exception:
+            raise
+    except Exception as exc:
+        if mode != "none" or not _looks_like_tenax_complex_cast_error(exc):
+            raise
+        return _build_real_ladder_fallback(exc)
 
     raise RuntimeError("Tenax provides neither build_auto_mpo nor AutoMPO.")
 
@@ -1122,9 +1312,11 @@ def run_tenax_idmrg_x_from_finite_mpo(
     entanglement_profile = None
     entanglement_warning = None
     try:
+        finite_n_sites_for_profile = int(diagnostics.get("n_sites_finite_mpo", 0))
         entanglement_profile = compute_tenax_infinite_mps_entropy_profile(
             mps=getattr(result, "mps"),
             sites_per_idmrg_site=sites_per_idmrg_site,
+            finite_n_sites=finite_n_sites_for_profile if finite_n_sites_for_profile > 0 else None,
             orders=ENTROPY_ORDERS,
         )
     except Exception as exc:
