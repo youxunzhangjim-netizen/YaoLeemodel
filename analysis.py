@@ -10,6 +10,8 @@ construction stays in ``models.py`` and plot rendering stays in
 from __future__ import annotations
 
 import time
+import math
+import importlib.util
 from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 import numpy as np
@@ -108,6 +110,214 @@ def _end_stage(name: str, stage_start: float, enabled: bool) -> float:
     if enabled:
         print(f"[stage] {name} finished in {elapsed:.2f}s")
     return elapsed
+
+
+def _geometry_positions_array(geometry: Any) -> np.ndarray:
+    if hasattr(geometry, "positions"):
+        return np.asarray(geometry.positions, dtype=float)
+    if hasattr(geometry, "coordinates"):
+        return np.asarray(geometry.coordinates, dtype=float)
+    raise AttributeError("Geometry object must provide positions or coordinates.")
+
+
+def select_geometric_center_site(
+    geometry: Any,
+    reference_site_idx: int | None = None,
+) -> int:
+    """Choose the site closest to the geometric center of the finite cluster."""
+    n_sites = int(getattr(geometry, "number_of_sites"))
+    if n_sites <= 0:
+        raise ValueError("Cannot select a reference site for an empty geometry.")
+    if reference_site_idx is not None:
+        site = int(reference_site_idx)
+        if site < 0:
+            site = n_sites + site
+        if site < 0 or site >= n_sites:
+            raise IndexError(f"reference_site_idx={reference_site_idx} is outside [0, {n_sites - 1}].")
+        return site
+
+    positions = _geometry_positions_array(geometry)
+    if positions.shape[0] != n_sites:
+        raise ValueError(
+            f"Geometry has number_of_sites={n_sites}, but positions has length {positions.shape[0]}."
+        )
+    center = np.mean(positions, axis=0)
+    distances = np.linalg.norm(positions - center[None, :], axis=1)
+    return int(np.argmin(distances))
+
+
+def find_reference_site_idx(
+    geometry: Any,
+    reference_site_idx: int | None = None,
+) -> int:
+    """Return the requested reference site, or the site nearest the cluster center."""
+    return select_geometric_center_site(geometry, reference_site_idx)
+
+
+def extract_spin_reference_correlation(
+    correlations: Dict[str, np.ndarray],
+    reference_site_idx: int,
+) -> np.ndarray:
+    """Extract C_S[j] = <S_ref . S_j> from component correlation matrices."""
+    component_keys = ("Sx_Sx", "Sy_Sy", "Sz_Sz")
+    missing = [key for key in component_keys if key not in correlations]
+    if missing:
+        raise KeyError(f"correlations is missing spin component matrices: {', '.join(missing)}.")
+
+    matrices = [
+        np.asarray(correlations[key], dtype=np.complex128)
+        for key in component_keys
+    ]
+    first_shape = matrices[0].shape
+    if len(first_shape) != 2 or first_shape[0] != first_shape[1]:
+        raise ValueError("Spin correlation component matrices must be square.")
+    for key, matrix in zip(component_keys[1:], matrices[1:]):
+        if matrix.shape != first_shape:
+            raise ValueError(
+                f"Spin correlation component '{key}' has shape {matrix.shape}, "
+                f"but expected {first_shape}."
+            )
+
+    n_sites = int(first_shape[0])
+    ref_site = int(reference_site_idx)
+    if ref_site < 0:
+        ref_site = n_sites + ref_site
+    if ref_site < 0 or ref_site >= n_sites:
+        raise IndexError(f"reference_site_idx={reference_site_idx} is outside [0, {n_sites - 1}].")
+
+    spin_scalar = matrices[0] + matrices[1] + matrices[2]
+    return np.real_if_close(spin_scalar[ref_site, :]).astype(float)
+
+
+def build_spin_reference_correlation_pattern(
+    geometry: Any,
+    correlations: Dict[str, np.ndarray],
+    reference_site_idx: int | None = None,
+) -> Dict[str, Any]:
+    """Build the real-space spin reference-site pattern from raw correlations."""
+    ref_site = find_reference_site_idx(geometry, reference_site_idx)
+    positions = _geometry_positions_array(geometry)
+    c_s = extract_spin_reference_correlation(correlations, ref_site)
+    return {
+        "reference_site_idx": int(ref_site),
+        "reference_position": [float(value) for value in positions[ref_site]],
+        "C_S": c_s,
+        "correlations": {"S": c_s},
+        "max_abs_correlation": {"S": float(np.max(np.abs(c_s))) if c_s.size > 0 else 0.0},
+        "method": "reference_site_correlation",
+        "definition": "C_S[j] = <S_ref . S_j> with ref chosen near the geometric center",
+    }
+
+
+def _scalar_correlation_matrix(
+    scalar_correlations: Dict[str, np.ndarray],
+    key: str,
+    aliases: Sequence[str],
+) -> np.ndarray:
+    for candidate in (key, *aliases):
+        if candidate in scalar_correlations:
+            matrix = np.asarray(scalar_correlations[candidate], dtype=np.complex128)
+            if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+                raise ValueError(f"Scalar correlation '{candidate}' must be a square matrix.")
+            return matrix
+    alias_text = ", ".join((key, *aliases))
+    raise KeyError(f"scalar_correlations must contain one of: {alias_text}.")
+
+
+def build_reference_site_correlation_patterns(
+    geometry: Any,
+    scalar_correlations: Dict[str, np.ndarray],
+    reference_site_idx: int | None = None,
+) -> Dict[str, Any]:
+    """Extract real-space pattern rows C[j] = <O_ref O_j>.
+
+    Finite ED/DMRG eigenstates often keep the exact symmetry, so one-point
+    order parameters can vanish even in ordered phases. A row of the two-point
+    scalar correlation matrix reveals the relative ordering pattern without
+    forcing spontaneous symmetry breaking.
+    """
+    ref_site = select_geometric_center_site(geometry, reference_site_idx)
+    positions = _geometry_positions_array(geometry)
+    n_sites = int(getattr(geometry, "number_of_sites"))
+    if positions.shape[0] != n_sites:
+        raise ValueError(
+            f"Geometry has number_of_sites={n_sites}, but positions has length {positions.shape[0]}."
+        )
+
+    spin_matrix = _scalar_correlation_matrix(scalar_correlations, "S", ("spin_scalar",))
+    orbital_matrix = _scalar_correlation_matrix(scalar_correlations, "T", ("orbital_scalar",))
+    mixed_matrix: np.ndarray | None = None
+    try:
+        mixed_matrix = _scalar_correlation_matrix(scalar_correlations, "ST", ("mixed_scalar",))
+    except KeyError:
+        mixed_matrix = None
+
+    for name, matrix in (("S", spin_matrix), ("T", orbital_matrix)):
+        if matrix.shape[0] != n_sites:
+            raise ValueError(
+                f"Scalar correlation '{name}' has shape {matrix.shape}, but geometry has {n_sites} sites."
+            )
+    if mixed_matrix is not None and mixed_matrix.shape[0] != n_sites:
+        raise ValueError(
+            f"Scalar correlation 'ST' has shape {mixed_matrix.shape}, but geometry has {n_sites} sites."
+        )
+
+    correlations: Dict[str, np.ndarray] = {
+        "S": np.real_if_close(spin_matrix[ref_site, :]).astype(float),
+        "T": np.real_if_close(orbital_matrix[ref_site, :]).astype(float),
+    }
+    if mixed_matrix is not None:
+        correlations["ST"] = np.real_if_close(mixed_matrix[ref_site, :]).astype(float)
+
+    max_abs = {
+        key: float(np.max(np.abs(values))) if values.size > 0 else 0.0
+        for key, values in correlations.items()
+    }
+    return {
+        "reference_site_idx": int(ref_site),
+        "reference_position": [float(value) for value in positions[ref_site]],
+        "correlations": correlations,
+        "max_abs_correlation": max_abs,
+        "method": "reference_site_correlation",
+        "definition": "C_O[j] = <O_ref O_j> with ref chosen near the geometric center",
+    }
+
+
+def _classical_scalar_correlations(
+    spin_vectors: np.ndarray,
+    orbital_vectors: np.ndarray,
+) -> Dict[str, np.ndarray]:
+    """Build scalar S, T, and ST correlation matrices for a classical product state."""
+    spin = np.asarray(spin_vectors, dtype=float)
+    orbital = np.asarray(orbital_vectors, dtype=float)
+    if spin.ndim != 2 or orbital.ndim != 2 or spin.shape != orbital.shape:
+        raise ValueError("Classical spin_vectors and orbital_vectors must have matching shape (N, 3).")
+    spin_scalar = spin @ spin.T
+    orbital_scalar = orbital @ orbital.T
+    return {
+        "S": spin_scalar,
+        "T": orbital_scalar,
+        "ST": spin_scalar * orbital_scalar,
+    }
+
+
+def _reference_patterns_or_warning(
+    geometry: Any,
+    scalar_correlations: Dict[str, np.ndarray],
+    reference_site_idx: int | None,
+) -> Dict[str, Any]:
+    """Return reference-site patterns without failing the whole phase-scan point."""
+    try:
+        return build_reference_site_correlation_patterns(
+            geometry,
+            scalar_correlations,
+            reference_site_idx=reference_site_idx,
+        )
+    except Exception as exc:
+        return {
+            "available": False,
+            "warning": f"Failed to extract reference-site patterns: {exc}",
+        }
 
 
 def resolve_low_energy_spectrum(
@@ -822,6 +1032,8 @@ DEFAULT_PHASE_CLASSIFIER_THRESHOLDS = {
     "classical_weak_order": 0.075,
     "quantum_bond_nematicity": 0.10,
     "classical_bond_nematicity": 0.08,
+    "plaquette_flux_target": 1.0,
+    "plaquette_flux_tolerance": 0.15,
 }
 
 
@@ -846,6 +1058,20 @@ def phase_classifier_thresholds_from_args(args: Any) -> Dict[str, float]:
                 args,
                 "phase_scan_classical_nematicity_threshold",
                 DEFAULT_PHASE_CLASSIFIER_THRESHOLDS["classical_bond_nematicity"],
+            )
+        ),
+        "plaquette_flux_target": float(
+            getattr(
+                args,
+                "phase_scan_plaquette_flux_target",
+                DEFAULT_PHASE_CLASSIFIER_THRESHOLDS["plaquette_flux_target"],
+            )
+        ),
+        "plaquette_flux_tolerance": float(
+            getattr(
+                args,
+                "phase_scan_plaquette_flux_tolerance",
+                DEFAULT_PHASE_CLASSIFIER_THRESHOLDS["plaquette_flux_tolerance"],
             )
         ),
     }
@@ -907,6 +1133,24 @@ def _classical_bond_energy_value(
     jz: float,
 ) -> float:
     from models import model_terms_for_bond
+
+    if (
+        str(getattr(model_spec, "model_family", "")).strip().lower() == "yao_lee"
+        and int(getattr(model_spec, "orbital_dim", 1)) > 1
+    ):
+        axis_map = {"x": 0, "y": 1, "z": 2}
+        gamma = str(bond.gamma).strip().lower()
+        axis_index = axis_map[gamma]
+        spin_dot = float(np.dot(spin_vectors[bond.i], spin_vectors[bond.j]))
+        orbital_gamma = float(orbital_vectors[bond.i, axis_index] * orbital_vectors[bond.j, axis_index])
+        return float(
+            float(coupling_j)
+            * (
+                (1.0 + float(beta)) * spin_dot
+                + (1.0 - float(beta)) * orbital_gamma
+                + float(alpha) * spin_dot * orbital_gamma
+            )
+        )
 
     value = 0.0
     for coefficient, op_name in model_terms_for_bond(
@@ -978,26 +1222,66 @@ def _classical_bond_rows(
     jy: float,
     jz: float,
 ) -> List[Dict[str, Any]]:
-    return [
-        {
-            "i": int(bond.i),
-            "j": int(bond.j),
-            "gamma": str(bond.gamma),
-            "O_ij_gamma": _classical_bond_energy_value(
-                bond,
-                spin_vectors,
-                orbital_vectors,
+    from models import model_terms_for_bond
+
+    def channel_for_operator(op_name: str) -> str:
+        text = str(op_name)
+        if text.startswith("ST"):
+            return "ST"
+        if text.startswith("T"):
+            return "T"
+        if text.startswith("S"):
+            return "S"
+        return "total"
+
+    rows: List[Dict[str, Any]] = []
+    is_yao_lee_with_orbital = (
+        str(getattr(model_spec, "model_family", "")).strip().lower() == "yao_lee"
+        and int(getattr(model_spec, "orbital_dim", 1)) > 1
+    )
+    axis_map = {"x": 0, "y": 1, "z": 2}
+    for bond in geometry.bond_list:
+        if is_yao_lee_with_orbital:
+            gamma = str(bond.gamma).strip().lower()
+            axis_index = axis_map[gamma]
+            spin_dot = float(np.dot(spin_vectors[bond.i], spin_vectors[bond.j]))
+            orbital_gamma = float(orbital_vectors[bond.i, axis_index] * orbital_vectors[bond.j, axis_index])
+            channel_energies = {
+                "S": float(coupling_j) * (1.0 + float(beta)) * spin_dot,
+                "T": float(coupling_j) * (1.0 - float(beta)) * orbital_gamma,
+                "ST": float(coupling_j) * float(alpha) * spin_dot * orbital_gamma,
+            }
+        else:
+            channel_energies: Dict[str, float] = {}
+            for coefficient, op_name in model_terms_for_bond(
+                bond.gamma,
                 model_spec,
                 alpha,
                 beta,
                 coupling_j,
-                jx,
-                jy,
-                jz,
-            ),
-        }
-        for bond in geometry.bond_list
-    ]
+                jx=jx,
+                jy=jy,
+                jz=jz,
+            ):
+                left = _classical_operator_value(op_name, bond.i, spin_vectors, orbital_vectors)
+                right = _classical_operator_value(op_name, bond.j, spin_vectors, orbital_vectors)
+                channel = channel_for_operator(str(op_name))
+                channel_energies[channel] = channel_energies.get(channel, 0.0) + float(coefficient) * left * right
+        components = [
+            {"channel": channel, "energy": float(energy)}
+            for channel, energy in channel_energies.items()
+        ]
+        rows.append(
+            {
+                "i": int(bond.i),
+                "j": int(bond.j),
+                "gamma": str(bond.gamma),
+                "O_ij_gamma": float(sum(channel_energies.values())),
+                "components": components,
+                "channel_energies": channel_energies,
+            }
+        )
+    return rows
 
 
 def _classical_vector_structure_factor(
@@ -1202,17 +1486,51 @@ def _bond_energy_diagnostics(bond_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def extract_all_plaquette_fluxes(plaquette_flux: Dict[str, Any] | None) -> Dict[str, float]:
+    """Extract a JSON-friendly plaquette-index -> W_p map from flux diagnostics."""
+    if not isinstance(plaquette_flux, dict):
+        return {}
+    for map_key in ("all_plaquette_fluxes", "plaquette_flux_map"):
+        flux_map = plaquette_flux.get(map_key)
+        if isinstance(flux_map, dict):
+            output: Dict[str, float] = {}
+            for index, value in flux_map.items():
+                try:
+                    flux_value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(flux_value):
+                    output[str(index)] = flux_value
+            if output:
+                return output
+    plaquette_details = plaquette_flux.get("plaquettes")
+    if isinstance(plaquette_details, dict):
+        output = {}
+        for index, detail in plaquette_details.items():
+            if not isinstance(detail, dict):
+                continue
+            try:
+                flux_value = float(detail.get("W_p", detail.get("value")))
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(flux_value):
+                output[str(index)] = flux_value
+        return output
+    return {}
+
+
 def _phase_observable_diagnostics(
     structure_rows: List[Dict[str, Any]],
     bond_rows: List[Dict[str, Any]],
     n_sites: int,
+    plaquette_flux: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     spin_peak = _dominant_structure_channel(structure_rows, "S(Q)")
     orbital_peak = _dominant_structure_channel(structure_rows, "T(Q)")
     mixed_peak = _dominant_structure_channel(structure_rows, "ST(Q)")
     bond_diag = _bond_energy_diagnostics(bond_rows)
     norm = float(max(1, n_sites))
-    return {
+    diagnostics = {
         "spin_peak": spin_peak,
         "orbital_peak": orbital_peak,
         "mixed_peak": mixed_peak,
@@ -1221,6 +1539,12 @@ def _phase_observable_diagnostics(
         "mixed_order_strength": float(mixed_peak["value"] / norm),
         "bond_energy": bond_diag,
     }
+    if isinstance(plaquette_flux, dict):
+        diagnostics["plaquette_flux"] = plaquette_flux
+        all_fluxes = extract_all_plaquette_fluxes(plaquette_flux)
+        if all_fluxes:
+            diagnostics["all_plaquette_fluxes"] = all_fluxes
+    return diagnostics
 
 
 def _classify_phase_from_diagnostics(
@@ -1235,20 +1559,44 @@ def _classify_phase_from_diagnostics(
     spin_strength = float(diagnostics.get("spin_order_strength", 0.0))
     orbital_strength = float(diagnostics.get("orbital_order_strength", 0.0))
     nematicity = float(diagnostics.get("bond_energy", {}).get("nematicity", 0.0))
+    flux_diag = diagnostics.get("plaquette_flux", {})
+    is_quantum = str(diagram_kind) != "classical_product"
 
     ordered = max(spin_strength, orbital_strength)
     weak_order = ordered < (
         thresholds["quantum_weak_order"]
-        if diagram_kind == "quantum_ed"
+        if is_quantum
         else thresholds["classical_weak_order"]
     )
+    if str(diagram_kind) in ("quantum_ed", "tenpy_dmrg", "tenpy_idmrg", "tenax", "quspin"):
+        try:
+            from models import plaquette_flux_close_to_target
+
+            flux_value = (
+                flux_diag.get("W_p", flux_diag.get("value"))
+                if isinstance(flux_diag, dict)
+                else None
+            )
+            flux_is_conserved = bool(
+                isinstance(flux_diag, dict)
+                and flux_diag.get("available", False)
+                and plaquette_flux_close_to_target(
+                    flux_value,
+                    target=float(thresholds.get("plaquette_flux_target", 1.0)),
+                    tolerance=float(thresholds.get("plaquette_flux_tolerance", 0.15)),
+                )
+            )
+        except Exception:
+            flux_is_conserved = False
+        if flux_is_conserved and weak_order:
+            return "Spin-Orbital Liquid"
     nematic = nematicity > (
         thresholds["quantum_bond_nematicity"]
-        if diagram_kind == "quantum_ed"
+        if is_quantum
         else thresholds["classical_bond_nematicity"]
     )
 
-    if diagram_kind == "quantum_ed":
+    if is_quantum:
         if alpha <= 0.08 and beta >= 0.045 and weak_order:
             return "Spin liquid"
         if alpha <= 0.20 and beta >= 0.06 and nematic:
@@ -1272,6 +1620,106 @@ def _classify_phase_from_diagnostics(
     return "Weak/undetermined"
 
 
+def _phase_scan_symmetry_mode(args: Any) -> str:
+    mode = str(getattr(args, "symmetry_mode", "none")).strip().lower()
+    aliases = {"u1sz": "u1_sz", "u1-sz": "u1_sz", "u1tz": "u1_tz", "u1-tz": "u1_tz"}
+    return aliases.get(mode, mode)
+
+
+def _phase_scan_reductions(args: Any) -> Tuple[str, ...]:
+    value = getattr(args, "symmetry_reductions", None)
+    if value is None:
+        mode = _phase_scan_symmetry_mode(args)
+        if mode == "auto":
+            return ("auto",)
+        if mode == "u1":
+            return ("sz", "tz")
+        if mode == "u1_sz":
+            return ("sz",)
+        if mode == "u1_tz":
+            return ("tz",)
+        if mode == "z2":
+            return ("z2",)
+        return ("none",)
+    if isinstance(value, (list, tuple, set)):
+        raw_items = [str(item) for item in value]
+    else:
+        raw_items = [
+            item.strip()
+            for item in str(value).replace("+", ",").replace(";", ",").split(",")
+            if item.strip()
+        ]
+    aliases = {
+        "auto": "auto",
+        "none": "none",
+        "u1": "u1",
+        "u1_sz": "sz",
+        "u1-sz": "sz",
+        "u1sz": "sz",
+        "sz": "sz",
+        "spin": "sz",
+        "u1_tz": "tz",
+        "u1-tz": "tz",
+        "u1tz": "tz",
+        "tz": "tz",
+        "tau_z": "tz",
+        "z2": "z2",
+        "parity": "z2",
+    }
+    reductions: List[str] = []
+    for raw in raw_items:
+        item = aliases.get(str(raw).strip().lower(), str(raw).strip().lower())
+        if item == "auto":
+            return ("auto",)
+        if item == "none":
+            return ("none",)
+        if item == "u1":
+            for reduction in ("sz", "tz"):
+                if reduction not in reductions:
+                    reductions.append(reduction)
+        elif item in ("sz", "tz", "z2") and item not in reductions:
+            reductions.append(item)
+    return tuple(reductions or ["none"])
+
+
+def _phase_scan_uses_sz_block(args: Any) -> bool:
+    if hasattr(args, "use_sz_block"):
+        return bool(getattr(args, "use_sz_block"))
+    reductions = set(_phase_scan_reductions(args))
+    return bool("auto" in reductions or "sz" in reductions)
+
+
+def _phase_scan_uses_tau_z_block(args: Any) -> bool:
+    if hasattr(args, "use_tau_z_block"):
+        return bool(getattr(args, "use_tau_z_block"))
+    reductions = set(_phase_scan_reductions(args))
+    return bool("tz" in reductions)
+
+
+def _sector_dimension_for_spin_half(n_sites: int, target_m2: int) -> int:
+    n = int(n_sites)
+    numerator = n + int(target_m2)
+    if numerator % 2 != 0:
+        return 0
+    nup = numerator // 2
+    if nup < 0 or nup > n:
+        return 0
+    return int(math.comb(n, nup))
+
+
+def _phase_scan_spin_orbital_block_dimension(
+    n_sites: int,
+    use_sz_block: bool,
+    target_sz2: int,
+    use_tau_z_block: bool,
+    target_tz2: int,
+) -> int:
+    n = int(n_sites)
+    spin_dim = _sector_dimension_for_spin_half(n, target_sz2) if bool(use_sz_block) else (1 << n)
+    orbital_dim = _sector_dimension_for_spin_half(n, target_tz2) if bool(use_tau_z_block) else (1 << n)
+    return int(spin_dim * orbital_dim)
+
+
 def _phase_scan_quantum_point(
     geometry: Any,
     model_spec: Any,
@@ -1281,23 +1729,390 @@ def _phase_scan_quantum_point(
     args: Any,
     hamiltonian_external_field_terms: List[Tuple[float, str]],
     thresholds: Dict[str, float],
+    show_progress: bool = True,
 ) -> Dict[str, Any]:
-    from models import (
+    from models import all_high_symmetry_structure_factors
+    from ed_backend import (
         all_bond_energies,
-        all_high_symmetry_structure_factors,
         build_spin_orbital_scalar_correlations,
         collect_correlation_matrices_from_ed,
+        plaquette_flux_from_ed_state,
         run_small_cluster_exact_diagonalization,
     )
 
     local_dim = int(model_spec.physical_dim)
-    hilbert_dim = int(local_dim ** int(geometry.number_of_sites))
+    n_sites = int(geometry.number_of_sites)
+    full_hilbert_dim = int(local_dim ** n_sites)
+    ed_backend_name = str(getattr(args, "ed_backend", "standard")).strip().lower()
+    if ed_backend_name == "ed":
+        ed_backend_name = "standard"
+    use_sz_block = _phase_scan_uses_sz_block(args)
+    use_tau_z_block = _phase_scan_uses_tau_z_block(args)
+    use_z2_block = bool(getattr(args, "use_z2_block", False))
+    use_translation_x_block = bool(getattr(args, "use_translation_x_block", False))
+    use_translation_y_block = bool(getattr(args, "use_translation_y_block", False))
+    use_translation_block = bool(use_translation_x_block or use_translation_y_block)
+    use_reflection_block = bool(getattr(args, "use_reflection_block", False))
+    requested_translation_block = bool(use_translation_block)
+    requested_translation_x_block = bool(use_translation_x_block)
+    requested_translation_y_block = bool(use_translation_y_block)
+    requested_reflection_block = bool(use_reflection_block)
+    reflection_block = int(getattr(args, "reflection_block", 0))
+    momentum_x_block = int(getattr(args, "momentum_x_block", 0))
+    momentum_y_block = int(getattr(args, "momentum_y_block", 0))
+    target_sz2 = int(getattr(args, "u1_target_sz2", 0))
+    target_tz2 = int(getattr(args, "u1_target_tz2", 0))
+    field_ops = {
+        str(op_name)
+        for coefficient, op_name in list(hamiltonian_external_field_terms or [])
+        if abs(float(coefficient)) > 1e-14
+    }
+    if ed_backend_name == "quspin":
+        if bool(use_sz_block) and bool(field_ops.intersection({"Sx", "Sy"})):
+            use_sz_block = False
+            use_z2_block = False
+        if bool(use_z2_block) and bool(field_ops.intersection({"Sx", "Sy", "Sz"})):
+            use_z2_block = False
+        quspin_package_available = importlib.util.find_spec("quspin") is not None
+        quspin_translation_x_reason = None
+        quspin_translation_y_reason = None
+        if use_translation_block:
+            if not quspin_package_available:
+                reason = "QuSpin package is not installed, so translation blocks cannot be checked."
+                use_translation_x_block = False
+                use_translation_y_block = False
+                quspin_translation_x_reason = reason if requested_translation_x_block else None
+                quspin_translation_y_reason = reason if requested_translation_y_block else None
+            else:
+                try:
+                    import quspin_backend as quspin_validation_backend
+
+                    support = quspin_validation_backend.quspin_translation_block_support(geometry)
+                    x_support = support.get("x", {})
+                    y_support = support.get("y", {})
+                    use_translation_x_block = bool(
+                        requested_translation_x_block and x_support.get("supported", False)
+                    )
+                    use_translation_y_block = bool(
+                        requested_translation_y_block and y_support.get("supported", False)
+                    )
+                    quspin_translation_x_reason = x_support.get("reason") if requested_translation_x_block else None
+                    quspin_translation_y_reason = y_support.get("reason") if requested_translation_y_block else None
+                except Exception as exc:
+                    reason = str(exc)
+                    use_translation_x_block = False
+                    use_translation_y_block = False
+                    quspin_translation_x_reason = reason if requested_translation_x_block else None
+                    quspin_translation_y_reason = reason if requested_translation_y_block else None
+        use_translation_block = bool(use_translation_x_block or use_translation_y_block)
+        quspin_translation_reason = {
+            "x": quspin_translation_x_reason,
+            "y": quspin_translation_y_reason,
+        }
+        quspin_reflection_reason = None
+        if requested_reflection_block or reflection_block != 0:
+            quspin_reflection_reason = (
+                "QuSpin reflection/C3 blocks are not applied for the bond-directional Yao-Lee Hamiltonian; "
+                "they can permute x/y/z bond types unless a gauge map is implemented."
+            )
+        use_reflection_block = False
+        reflection_block = 0
+        compatible = (
+            quspin_package_available
+            and
+            str(getattr(model_spec, "spin_rep", "")) == "1/2"
+            and str(getattr(model_spec, "orbital_rep", "")) == "1/2"
+            and str(getattr(model_spec, "model_family", "")) == "yao_lee"
+            and str(getattr(model_spec, "ising_axis", "")) == "z"
+            and _phase_scan_spin_orbital_block_dimension(
+                n_sites,
+                use_sz_block,
+                target_sz2,
+                use_tau_z_block,
+                target_tz2,
+            ) > 0
+            and (not use_z2_block or (use_sz_block and target_sz2 == 0))
+            and not (use_tau_z_block and (use_z2_block or use_translation_block))
+        )
+        hilbert_dim = _phase_scan_spin_orbital_block_dimension(
+            n_sites,
+            use_sz_block,
+            target_sz2,
+            use_tau_z_block,
+            target_tz2,
+        )
+        basis_type = (
+            "quspin_tensor_"
+            f"spin_{'u1_block' if use_sz_block else 'full'}_"
+            f"orbital_{'u1_block' if use_tau_z_block else 'full'}"
+        )
+        pre_quspin_hilbert_dim = int(hilbert_dim)
+        quspin_basis_build_reason = None
+        if compatible:
+            try:
+                import quspin_backend as quspin_basis_backend
+
+                preflight_basis = quspin_basis_backend.build_quspin_yao_lee_basis(
+                    n_sites,
+                    geometry=geometry,
+                    use_sz_block=use_sz_block,
+                    target_sz2=target_sz2,
+                    use_tau_z_block=use_tau_z_block,
+                    target_tz2=target_tz2,
+                    use_z2_block=use_z2_block,
+                    z2_target_parity=int(getattr(args, "z2_target_parity", 0)),
+                    use_translation_block=use_translation_block,
+                    use_translation_x_block=use_translation_x_block,
+                    use_translation_y_block=use_translation_y_block,
+                    momentum_block_1=momentum_x_block,
+                    momentum_block_2=momentum_y_block,
+                    momentum_x_block=momentum_x_block,
+                    momentum_y_block=momentum_y_block,
+                    use_reflection_block=False,
+                    reflection_block=0,
+                )
+                hilbert_dim = int(preflight_basis.Ns)
+            except Exception as exc:
+                compatible = False
+                quspin_basis_build_reason = f"Failed to build the requested QuSpin reduced basis: {exc}"
+        if not compatible:
+            return {
+                "status": "skipped",
+                "alpha": float(alpha),
+                "beta": float(beta),
+                "reason": (
+                    quspin_basis_build_reason
+                    if quspin_basis_build_reason is not None
+                    else
+                    "QuSpin ED phase scan requires reachable shared U1 target sectors, "
+                    "the quspin Python package, "
+                    "spin_rep=1/2, orbital_rep=1/2, model_family=yao_lee, "
+                    "and ising_axis=z."
+                    " Reflection/C3 blocks are forbidden; spin-flip Z2 requires total Sz=0; "
+                    "tau_z is not combined with Z2/2D translations."
+                ),
+                "ed_backend": "quspin",
+                "basis_type": basis_type,
+                "effective_hilbert_dimension": int(hilbert_dim),
+                "pre_quspin_hilbert_dimension_estimate": int(pre_quspin_hilbert_dim),
+                "full_hilbert_dimension": int(full_hilbert_dim),
+                "use_sz_conserved": bool(use_sz_block),
+                "use_sz_block": bool(use_sz_block),
+                "quspin_package_available": bool(quspin_package_available),
+                "quspin_requested_translation_block": bool(requested_translation_block),
+                "quspin_requested_translation_x_block": bool(requested_translation_x_block),
+                "quspin_requested_translation_y_block": bool(requested_translation_y_block),
+                "quspin_use_translation_block": bool(use_translation_block),
+                "quspin_use_translation_x_block": bool(use_translation_x_block),
+                "quspin_use_translation_y_block": bool(use_translation_y_block),
+                "quspin_translation_reason": quspin_translation_reason,
+                "quspin_translation_x_reason": quspin_translation_x_reason,
+                "quspin_translation_y_reason": quspin_translation_y_reason,
+                "quspin_requested_reflection_block": bool(requested_reflection_block),
+                "quspin_use_reflection_block": False,
+                "quspin_reflection_reason": quspin_reflection_reason,
+            }
+        if n_sites > int(args.phase_scan_ed_max_sites):
+            return {
+                "status": "skipped",
+                "alpha": float(alpha),
+                "beta": float(beta),
+                "reason": f"Quantum phase scan limited to {int(args.phase_scan_ed_max_sites)} sites.",
+                "ed_backend": "quspin",
+                "basis_type": basis_type,
+                "effective_hilbert_dimension": int(hilbert_dim),
+                "pre_quspin_hilbert_dimension_estimate": int(pre_quspin_hilbert_dim),
+                "full_hilbert_dimension": int(full_hilbert_dim),
+                "use_sz_conserved": bool(use_sz_block),
+                "use_sz_block": bool(use_sz_block),
+            }
+        if hilbert_dim > int(args.phase_scan_ed_max_hilbert_dim):
+            return {
+                "status": "skipped",
+                "alpha": float(alpha),
+                "beta": float(beta),
+                "reason": (
+                    f"Quantum phase scan {basis_type} Hilbert dimension {hilbert_dim} exceeds "
+                    f"{int(args.phase_scan_ed_max_hilbert_dim)}."
+                ),
+                "ed_backend": "quspin",
+                "basis_type": basis_type,
+                "effective_hilbert_dimension": int(hilbert_dim),
+                "pre_quspin_hilbert_dimension_estimate": int(pre_quspin_hilbert_dim),
+                "full_hilbert_dimension": int(full_hilbert_dim),
+                "use_sz_conserved": bool(use_sz_block),
+                "use_sz_block": bool(use_sz_block),
+            }
+
+        import quspin_backend as quspin_ed_backend
+
+        spectrum, vectors = quspin_ed_backend.run_small_cluster_exact_spectrum(
+            geometry=geometry,
+            model_spec=model_spec,
+            alpha=alpha,
+            beta=beta,
+            coupling_j=args.coupling_j,
+            eigenstate_count=max(1, int(getattr(args, "ed_max_eigenstates", 2))),
+            check_ground_state_degeneracy=False,
+            jx=args.jx,
+            jy=args.jy,
+            jz=args.jz,
+            external_field_terms=hamiltonian_external_field_terms,
+            show_progress=show_progress,
+            solver=getattr(args, "ed_solver", "auto"),
+            sparse_tol=float(getattr(args, "ed_sparse_tol", 0.0)),
+            sparse_maxiter=(
+                int(getattr(args, "ed_sparse_maxiter", 0))
+                if int(getattr(args, "ed_sparse_maxiter", 0)) > 0
+                else None
+            ),
+            use_sz_block=use_sz_block,
+            target_sz2=target_sz2,
+            use_tau_z_block=use_tau_z_block,
+            target_tz2=target_tz2,
+            use_z2_block=use_z2_block,
+            z2_target_parity=int(getattr(args, "z2_target_parity", 0)),
+            use_translation_block=use_translation_block,
+            use_translation_x_block=use_translation_x_block,
+            use_translation_y_block=use_translation_y_block,
+            momentum_block_1=momentum_x_block,
+            momentum_block_2=momentum_y_block,
+            momentum_x_block=momentum_x_block,
+            momentum_y_block=momentum_y_block,
+            use_reflection_block=use_reflection_block,
+            reflection_block=reflection_block,
+            check_symm=bool(getattr(args, "quspin_check_symmetries", False)),
+            check_herm=bool(getattr(args, "quspin_check_hermiticity", False)),
+            check_pcon=bool(getattr(args, "quspin_check_particle_conservation", False)),
+        )
+        basis_use_sz_block = bool(spectrum.get("use_sz_block", use_sz_block))
+        basis_target_sz2 = int(spectrum.get("target_sz2", target_sz2))
+        basis_use_z2_block = bool(spectrum.get("use_z2_block", use_z2_block))
+        basis = quspin_ed_backend.build_quspin_yao_lee_basis(
+            n_sites,
+            geometry=geometry,
+            use_sz_block=basis_use_sz_block,
+            target_sz2=basis_target_sz2,
+            use_tau_z_block=use_tau_z_block,
+            target_tz2=target_tz2,
+            use_z2_block=basis_use_z2_block,
+            z2_target_parity=int(getattr(args, "z2_target_parity", 0)),
+            use_translation_block=use_translation_block,
+            use_translation_x_block=use_translation_x_block,
+            use_translation_y_block=use_translation_y_block,
+            momentum_block_1=momentum_x_block,
+            momentum_block_2=momentum_y_block,
+            momentum_x_block=momentum_x_block,
+            momentum_y_block=momentum_y_block,
+            use_reflection_block=use_reflection_block,
+            reflection_block=reflection_block,
+        )
+        energy = float(spectrum["ground_state_energy"])
+        state = vectors[:, 0]
+        scalar_correlations = quspin_ed_backend.build_spin_orbital_scalar_correlations(
+            basis,
+            state,
+            n_sites,
+        )
+        bond_rows = quspin_ed_backend.all_bond_energies(
+            geometry,
+            scalar_correlations,
+            alpha,
+            beta,
+            args.coupling_j,
+        )
+        structure_rows = quspin_ed_backend.all_high_symmetry_structure_factors(
+            scalar_correlations,
+            geometry,
+        )
+        plaquette_flux = spectrum.get("plaquette_flux") if isinstance(spectrum, dict) else None
+        if plaquette_flux is None:
+            try:
+                plaquette_flux = quspin_ed_backend.compute_plaquette_flux(
+                    basis,
+                    state,
+                    geometry,
+                    plaquette_center_idx=None,
+                )
+            except Exception as exc:
+                plaquette_flux = {"available": False, "warning": str(exc)}
+        diagnostics = _phase_observable_diagnostics(
+            structure_rows,
+            bond_rows,
+            geometry.number_of_sites,
+            plaquette_flux=plaquette_flux,
+        )
+        phase_label = _classify_phase_from_diagnostics(diagnostics, alpha, beta, "quantum_ed", thresholds)
+        return {
+            "status": "completed",
+            "alpha": float(alpha),
+            "beta": float(beta),
+            "ed_backend": "quspin",
+            "basis_type": basis_type,
+            "effective_hilbert_dimension": int(spectrum.get("hilbert_dimension", hilbert_dim)),
+            "pre_quspin_hilbert_dimension_estimate": int(pre_quspin_hilbert_dim),
+            "full_hilbert_dimension": int(full_hilbert_dim),
+            "use_sz_conserved": bool(use_sz_block),
+            "use_sz_block": bool(use_sz_block),
+            "selected_target_sz2": int(spectrum.get("target_sz2", target_sz2)),
+            "quspin_effective_use_z2_block": bool(spectrum.get("use_z2_block", use_z2_block)),
+            "quspin_sz_sector_scan": spectrum.get("sz_sector_scan"),
+            "quspin_package_available": bool(quspin_package_available),
+            "quspin_requested_translation_block": bool(requested_translation_block),
+            "quspin_requested_translation_x_block": bool(requested_translation_x_block),
+            "quspin_requested_translation_y_block": bool(requested_translation_y_block),
+            "quspin_use_translation_block": bool(use_translation_block),
+            "quspin_use_translation_x_block": bool(use_translation_x_block),
+            "quspin_use_translation_y_block": bool(use_translation_y_block),
+            "quspin_translation_reason": quspin_translation_reason,
+            "quspin_translation_x_reason": quspin_translation_x_reason,
+            "quspin_translation_y_reason": quspin_translation_y_reason,
+            "quspin_requested_reflection_block": bool(requested_reflection_block),
+            "quspin_use_reflection_block": False,
+            "quspin_reflection_reason": quspin_reflection_reason,
+            "phase_label": phase_label,
+            "energy": float(energy),
+            "energy_per_site": float(energy / float(max(1, geometry.number_of_sites))),
+            "diagnostics": diagnostics,
+            "plaquette_flux": plaquette_flux,
+            "all_plaquette_fluxes": extract_all_plaquette_fluxes(plaquette_flux),
+            "structure_factors": structure_rows,
+            "bond_energies": bond_rows,
+        }
+
+    use_sz_conserved_requested = bool(use_sz_block)
+    use_sz_conserved = (
+        use_sz_conserved_requested
+        and str(getattr(model_spec, "spin_rep", "")) == "1/2"
+        and str(getattr(model_spec, "orbital_rep", "")) == "1/2"
+        and _sector_dimension_for_spin_half(n_sites, target_sz2) > 0
+    )
+    if use_sz_conserved_requested and not use_sz_conserved and str(getattr(model_spec, "orbital_rep", "")) != "0":
+        return {
+            "status": "skipped",
+            "alpha": float(alpha),
+            "beta": float(beta),
+            "reason": "Standard Sz-block ED requires a reachable target 2*Sz sector with spin_rep=1/2 and orbital_rep=1/2.",
+            "ed_backend": "standard",
+            "use_sz_conserved_requested": bool(use_sz_conserved_requested),
+        }
+    if use_sz_conserved:
+        hilbert_dim = int(_sector_dimension_for_spin_half(n_sites, target_sz2) * (1 << n_sites))
+        basis_type = "bitwise_spin_orbital_total_sz_block"
+    else:
+        hilbert_dim = full_hilbert_dim
+        basis_type = "legacy_full_tensor_product"
     if int(geometry.number_of_sites) > int(args.phase_scan_ed_max_sites):
         return {
             "status": "skipped",
             "alpha": float(alpha),
             "beta": float(beta),
             "reason": f"Quantum phase scan limited to {int(args.phase_scan_ed_max_sites)} sites.",
+            "ed_backend": "standard",
+            "basis_type": basis_type,
+            "effective_hilbert_dimension": int(hilbert_dim),
+            "full_hilbert_dimension": int(full_hilbert_dim),
+            "use_sz_conserved": bool(use_sz_conserved),
         }
     if hilbert_dim > int(args.phase_scan_ed_max_hilbert_dim):
         return {
@@ -1305,57 +2120,145 @@ def _phase_scan_quantum_point(
             "alpha": float(alpha),
             "beta": float(beta),
             "reason": (
-                f"Quantum phase scan Hilbert dimension {hilbert_dim} exceeds "
+                f"Quantum phase scan {basis_type} Hilbert dimension {hilbert_dim} exceeds "
                 f"{int(args.phase_scan_ed_max_hilbert_dim)}."
             ),
+            "ed_backend": "standard",
+            "basis_type": basis_type,
+            "effective_hilbert_dimension": int(hilbert_dim),
+            "full_hilbert_dimension": int(full_hilbert_dim),
+            "use_sz_conserved": bool(use_sz_conserved),
         }
-    energy, state = run_small_cluster_exact_diagonalization(
-        geometry=geometry,
-        model_spec=model_spec,
-        alpha=alpha,
-        beta=beta,
-        coupling_j=args.coupling_j,
-        jx=args.jx,
-        jy=args.jy,
-        jz=args.jz,
-        external_field_terms=hamiltonian_external_field_terms,
-        show_progress=False,
-    )
-    correlations = collect_correlation_matrices_from_ed(
-        geometry,
-        state,
-        model_spec=model_spec,
-        show_progress=False,
-    )
-    scalar_correlations = build_spin_orbital_scalar_correlations(correlations)
+    if use_sz_conserved:
+        from ed_backend import (
+            all_bond_energies_sz_conserved,
+            build_sz_conserved_scalar_correlations,
+            collect_correlation_matrices_from_sz_conserved_ed,
+            plaquette_flux_from_sz_conserved_ed_state,
+            run_sz_conserved_exact_spectrum,
+        )
+
+        spectrum, vectors, basis_list, basis_map = run_sz_conserved_exact_spectrum(
+            geometry=geometry,
+            alpha=alpha,
+            beta=beta,
+            coupling_j=args.coupling_j,
+            eigenstate_count=3,
+            check_ground_state_degeneracy=False,
+            external_field_terms=hamiltonian_external_field_terms,
+            show_progress=show_progress,
+            sparse_tol=float(getattr(args, "ed_sparse_tol", 0.0)),
+            sparse_maxiter=(
+                int(getattr(args, "ed_sparse_maxiter", 0))
+                if int(getattr(args, "ed_sparse_maxiter", 0)) > 0
+                else None
+            ),
+            target_sz2=target_sz2,
+        )
+        energy = float(spectrum["ground_state_energy"])
+        state = vectors[:, 0]
+        correlations = collect_correlation_matrices_from_sz_conserved_ed(
+            geometry,
+            state,
+            basis_list,
+            basis_map,
+            show_progress=show_progress,
+        )
+        scalar_correlations = build_sz_conserved_scalar_correlations(correlations)
+        bond_rows = all_bond_energies_sz_conserved(
+            geometry,
+            correlations,
+            alpha,
+            beta,
+            args.coupling_j,
+            show_progress=show_progress,
+        )
+        try:
+            plaquette_flux = plaquette_flux_from_sz_conserved_ed_state(
+                geometry,
+                state,
+                basis_list,
+                basis_map,
+                plaquette_center_idx=None,
+            )
+        except Exception as exc:
+            plaquette_flux = {"available": False, "warning": str(exc)}
+    else:
+        energy, state = run_small_cluster_exact_diagonalization(
+            geometry=geometry,
+            model_spec=model_spec,
+            alpha=alpha,
+            beta=beta,
+            coupling_j=args.coupling_j,
+            jx=args.jx,
+            jy=args.jy,
+            jz=args.jz,
+            external_field_terms=hamiltonian_external_field_terms,
+            show_progress=show_progress,
+            solver=getattr(args, "ed_solver", "auto"),
+            sparse_tol=float(getattr(args, "ed_sparse_tol", 0.0)),
+            sparse_maxiter=(
+                int(getattr(args, "ed_sparse_maxiter", 0))
+                if int(getattr(args, "ed_sparse_maxiter", 0)) > 0
+                else None
+            ),
+        )
+        correlations = collect_correlation_matrices_from_ed(
+            geometry,
+            state,
+            model_spec=model_spec,
+            show_progress=show_progress,
+        )
+        scalar_correlations = build_spin_orbital_scalar_correlations(correlations)
+        bond_rows = all_bond_energies(
+            geometry,
+            correlations,
+            model_spec,
+            alpha,
+            beta,
+            args.coupling_j,
+            jx=args.jx,
+            jy=args.jy,
+            jz=args.jz,
+            show_progress=show_progress,
+        )
+        try:
+            plaquette_flux = plaquette_flux_from_ed_state(
+                geometry,
+                state,
+                model_spec,
+                plaquette_center_idx=None,
+            )
+        except Exception as exc:
+            plaquette_flux = {"available": False, "warning": str(exc)}
     structure_rows = all_high_symmetry_structure_factors(
         scalar_correlations,
         geometry,
         lattice=lattice_name,
-        show_progress=False,
+        show_progress=show_progress,
     )
-    bond_rows = all_bond_energies(
-        geometry,
-        correlations,
-        model_spec,
-        alpha,
-        beta,
-        args.coupling_j,
-        jx=args.jx,
-        jy=args.jy,
-        jz=args.jz,
-        show_progress=False,
+    diagnostics = _phase_observable_diagnostics(
+        structure_rows,
+        bond_rows,
+        geometry.number_of_sites,
+        plaquette_flux=plaquette_flux,
     )
-    diagnostics = _phase_observable_diagnostics(structure_rows, bond_rows, geometry.number_of_sites)
     phase_label = _classify_phase_from_diagnostics(diagnostics, alpha, beta, "quantum_ed", thresholds)
     return {
         "status": "completed",
         "alpha": float(alpha),
         "beta": float(beta),
+        "ed_backend": "standard",
+        "basis_type": basis_type,
+        "effective_hilbert_dimension": int(hilbert_dim),
+        "full_hilbert_dimension": int(full_hilbert_dim),
+        "use_sz_conserved": bool(use_sz_conserved),
         "phase_label": phase_label,
         "energy": float(energy),
         "energy_per_site": float(energy / float(max(1, geometry.number_of_sites))),
         "diagnostics": diagnostics,
+        "plaquette_flux": plaquette_flux,
+        "all_plaquette_fluxes": extract_all_plaquette_fluxes(plaquette_flux),
         "structure_factors": structure_rows,
         "bond_energies": bond_rows,
     }
@@ -1422,6 +2325,236 @@ def _phase_scan_classical_point(
     }
 
 
+def _phase_scan_quantum_global_skip(
+    geometry: Any,
+    model_spec: Any,
+    args: Any,
+    hamiltonian_external_field_terms: List[Tuple[float, str]] | None = None,
+) -> Dict[str, Any] | None:
+    local_dim = int(model_spec.physical_dim)
+    n_sites = int(geometry.number_of_sites)
+    full_hilbert_dim = int(local_dim ** n_sites)
+    external_field_terms = list(hamiltonian_external_field_terms or [])
+    ed_backend_name = str(getattr(args, "ed_backend", "standard")).strip().lower()
+    if ed_backend_name == "ed":
+        ed_backend_name = "standard"
+    use_sz_block = _phase_scan_uses_sz_block(args)
+    use_tau_z_block = _phase_scan_uses_tau_z_block(args)
+    use_z2_block = bool(getattr(args, "use_z2_block", False))
+    use_translation_x_block = bool(getattr(args, "use_translation_x_block", False))
+    use_translation_y_block = bool(getattr(args, "use_translation_y_block", False))
+    use_translation_block = bool(use_translation_x_block or use_translation_y_block)
+    use_reflection_block = bool(getattr(args, "use_reflection_block", False))
+    requested_translation_block = bool(use_translation_block)
+    requested_translation_x_block = bool(use_translation_x_block)
+    requested_translation_y_block = bool(use_translation_y_block)
+    requested_reflection_block = bool(use_reflection_block)
+    reflection_block = int(getattr(args, "reflection_block", 0))
+    target_sz2 = int(getattr(args, "u1_target_sz2", 0))
+    target_tz2 = int(getattr(args, "u1_target_tz2", 0))
+    field_ops = {
+        str(op_name)
+        for coefficient, op_name in list(external_field_terms or [])
+        if abs(float(coefficient)) > 1e-14
+    }
+
+    if ed_backend_name == "quspin":
+        if bool(use_sz_block) and bool(field_ops.intersection({"Sx", "Sy"})):
+            use_sz_block = False
+            use_z2_block = False
+        if bool(use_z2_block) and bool(field_ops.intersection({"Sx", "Sy", "Sz"})):
+            use_z2_block = False
+        quspin_package_available = importlib.util.find_spec("quspin") is not None
+        quspin_translation_x_reason = None
+        quspin_translation_y_reason = None
+        if use_translation_block:
+            if not quspin_package_available:
+                reason = "QuSpin package is not installed, so translation blocks cannot be checked."
+                use_translation_x_block = False
+                use_translation_y_block = False
+                quspin_translation_x_reason = reason if requested_translation_x_block else None
+                quspin_translation_y_reason = reason if requested_translation_y_block else None
+            else:
+                try:
+                    import quspin_backend as quspin_validation_backend
+
+                    support = quspin_validation_backend.quspin_translation_block_support(geometry)
+                    x_support = support.get("x", {})
+                    y_support = support.get("y", {})
+                    use_translation_x_block = bool(
+                        requested_translation_x_block and x_support.get("supported", False)
+                    )
+                    use_translation_y_block = bool(
+                        requested_translation_y_block and y_support.get("supported", False)
+                    )
+                    quspin_translation_x_reason = x_support.get("reason") if requested_translation_x_block else None
+                    quspin_translation_y_reason = y_support.get("reason") if requested_translation_y_block else None
+                except Exception as exc:
+                    reason = str(exc)
+                    use_translation_x_block = False
+                    use_translation_y_block = False
+                    quspin_translation_x_reason = reason if requested_translation_x_block else None
+                    quspin_translation_y_reason = reason if requested_translation_y_block else None
+        use_translation_block = bool(use_translation_x_block or use_translation_y_block)
+        quspin_translation_reason = {
+            "x": quspin_translation_x_reason,
+            "y": quspin_translation_y_reason,
+        }
+        quspin_reflection_reason = None
+        if requested_reflection_block or reflection_block != 0:
+            quspin_reflection_reason = (
+                "QuSpin reflection/C3 blocks are not applied for the bond-directional Yao-Lee Hamiltonian; "
+                "they can permute x/y/z bond types unless a gauge map is implemented."
+            )
+        use_reflection_block = False
+        reflection_block = 0
+        hilbert_dim = _phase_scan_spin_orbital_block_dimension(
+            n_sites,
+            use_sz_block,
+            target_sz2,
+            use_tau_z_block,
+            target_tz2,
+        )
+        basis_type = (
+            "quspin_tensor_"
+            f"spin_{'u1_block' if use_sz_block else 'full'}_"
+            f"orbital_{'u1_block' if use_tau_z_block else 'full'}"
+        )
+        compatible = (
+            quspin_package_available
+            and str(getattr(model_spec, "spin_rep", "")) == "1/2"
+            and str(getattr(model_spec, "orbital_rep", "")) == "1/2"
+            and str(getattr(model_spec, "model_family", "")) == "yao_lee"
+            and str(getattr(model_spec, "ising_axis", "")) == "z"
+            and int(hilbert_dim) > 0
+            and (not use_z2_block or (use_sz_block and target_sz2 == 0))
+            and not (use_tau_z_block and (use_z2_block or use_translation_block))
+        )
+        pre_quspin_hilbert_dim = int(hilbert_dim)
+        quspin_basis_build_reason = None
+        if compatible:
+            try:
+                import quspin_backend as quspin_basis_backend
+
+                preflight_basis = quspin_basis_backend.build_quspin_yao_lee_basis(
+                    n_sites,
+                    geometry=geometry,
+                    use_sz_block=use_sz_block,
+                    target_sz2=target_sz2,
+                    use_tau_z_block=use_tau_z_block,
+                    target_tz2=target_tz2,
+                    use_z2_block=use_z2_block,
+                    z2_target_parity=int(getattr(args, "z2_target_parity", 0)),
+                    use_translation_block=use_translation_block,
+                    use_translation_x_block=use_translation_x_block,
+                    use_translation_y_block=use_translation_y_block,
+                    momentum_block_1=int(getattr(args, "momentum_x_block", 0)),
+                    momentum_block_2=int(getattr(args, "momentum_y_block", 0)),
+                    momentum_x_block=int(getattr(args, "momentum_x_block", 0)),
+                    momentum_y_block=int(getattr(args, "momentum_y_block", 0)),
+                    use_reflection_block=False,
+                    reflection_block=0,
+                )
+                hilbert_dim = int(preflight_basis.Ns)
+            except Exception as exc:
+                compatible = False
+                quspin_basis_build_reason = f"Failed to build the requested QuSpin reduced basis: {exc}"
+        common = {
+            "ed_backend": "quspin",
+            "basis_type": basis_type,
+            "effective_hilbert_dimension": int(hilbert_dim),
+            "pre_quspin_hilbert_dimension_estimate": int(pre_quspin_hilbert_dim),
+            "full_hilbert_dimension": int(full_hilbert_dim),
+            "use_sz_conserved": bool(use_sz_block),
+            "use_sz_block": bool(use_sz_block),
+            "use_sz_conserved_requested": bool(use_sz_block),
+            "quspin_package_available": bool(quspin_package_available),
+            "quspin_requested_translation_block": bool(requested_translation_block),
+            "quspin_requested_translation_x_block": bool(requested_translation_x_block),
+            "quspin_requested_translation_y_block": bool(requested_translation_y_block),
+            "quspin_use_translation_block": bool(use_translation_block),
+            "quspin_use_translation_x_block": bool(use_translation_x_block),
+            "quspin_use_translation_y_block": bool(use_translation_y_block),
+            "quspin_translation_reason": quspin_translation_reason,
+            "quspin_translation_x_reason": quspin_translation_x_reason,
+            "quspin_translation_y_reason": quspin_translation_y_reason,
+            "quspin_requested_reflection_block": bool(requested_reflection_block),
+            "quspin_use_reflection_block": False,
+            "quspin_reflection_reason": quspin_reflection_reason,
+        }
+        if not compatible:
+            return {
+                **common,
+                "reason": (
+                    quspin_basis_build_reason
+                    if quspin_basis_build_reason is not None
+                    else
+                    "QuSpin ED phase scan requires reachable shared U1 target sectors, "
+                    "the quspin Python package, "
+                    "spin_rep=1/2, orbital_rep=1/2, model_family=yao_lee, "
+                    "and ising_axis=z. "
+                    "Reflection/C3 blocks are forbidden; spin-flip Z2 requires total Sz=0; "
+                    "tau_z is not combined with Z2/2D translations."
+                ),
+            }
+        if n_sites > int(args.phase_scan_ed_max_sites):
+            return {
+                **common,
+                "reason": f"Quantum phase scan limited to {int(args.phase_scan_ed_max_sites)} sites.",
+            }
+        if hilbert_dim > int(args.phase_scan_ed_max_hilbert_dim):
+            return {
+                **common,
+                "reason": (
+                    f"Quantum phase scan {basis_type} Hilbert dimension {hilbert_dim} exceeds "
+                    f"{int(args.phase_scan_ed_max_hilbert_dim)}."
+                ),
+            }
+        return None
+
+    use_sz_conserved_requested = bool(use_sz_block)
+    use_sz_conserved = (
+        use_sz_conserved_requested
+        and str(getattr(model_spec, "spin_rep", "")) == "1/2"
+        and str(getattr(model_spec, "orbital_rep", "")) == "1/2"
+        and _sector_dimension_for_spin_half(n_sites, target_sz2) > 0
+    )
+    if use_sz_conserved:
+        hilbert_dim = int(_sector_dimension_for_spin_half(n_sites, target_sz2) * (1 << n_sites))
+        basis_type = "bitwise_spin_orbital_total_sz_block"
+    else:
+        hilbert_dim = full_hilbert_dim
+        basis_type = "legacy_full_tensor_product"
+
+    common = {
+        "ed_backend": "standard",
+        "basis_type": basis_type,
+        "effective_hilbert_dimension": int(hilbert_dim),
+        "full_hilbert_dimension": int(full_hilbert_dim),
+        "use_sz_conserved": bool(use_sz_conserved),
+        "use_sz_conserved_requested": bool(use_sz_conserved_requested),
+    }
+    if use_sz_conserved_requested and not use_sz_conserved and str(getattr(model_spec, "orbital_rep", "")) != "0":
+        return {
+            **common,
+            "reason": "Standard Sz-block ED requires a reachable target 2*Sz sector with spin_rep=1/2 and orbital_rep=1/2.",
+        }
+    if n_sites > int(args.phase_scan_ed_max_sites):
+        return {
+            **common,
+            "reason": f"Quantum phase scan limited to {int(args.phase_scan_ed_max_sites)} sites.",
+        }
+    if hilbert_dim > int(args.phase_scan_ed_max_hilbert_dim):
+        return {
+            **common,
+            "reason": (
+                f"Quantum phase scan {basis_type} Hilbert dimension {hilbert_dim} exceeds "
+                f"{int(args.phase_scan_ed_max_hilbert_dim)}."
+            ),
+        }
+    return None
+
+
 def run_alpha_beta_phase_scan(
     geometry: Any,
     model_spec: Any,
@@ -1432,8 +2565,22 @@ def run_alpha_beta_phase_scan(
 ) -> Dict[str, Any]:
     alphas, betas = _phase_scan_grid_from_args(args)
     thresholds = phase_classifier_thresholds_from_args(args)
-    modes = ["quantum_ed", "classical_product"] if args.phase_scan_mode == "both" else [args.phase_scan_mode]
+    raw_mode = str(getattr(args, "phase_scan_mode", "quantum_ed")).strip().lower()
+    if raw_mode in ("both", "all"):
+        modes = ["quantum_ed", "classical_product"]
+    elif raw_mode in ("classical", "classical_product"):
+        modes = ["classical_product"]
+    elif raw_mode in ("quantum", "methods", "quantum_ed", "ed", "exact", "exact_diagonalization"):
+        modes = ["quantum_ed"]
+    else:
+        modes = [raw_mode]
     total_points = len(alphas) * len(betas)
+    quantum_ed_backend = str(getattr(args, "ed_backend", "standard")).strip().lower()
+    if quantum_ed_backend == "ed":
+        quantum_ed_backend = "standard"
+    quantum_ed_use_sz_block = _phase_scan_uses_sz_block(args)
+    quantum_ed_use_tau_z_block = _phase_scan_uses_tau_z_block(args)
+    quantum_ed_reductions = _phase_scan_reductions(args)
     output: Dict[str, Any] = {
         "status": "completed",
         "mode": str(args.phase_scan_mode),
@@ -1450,6 +2597,24 @@ def run_alpha_beta_phase_scan(
         "solver_controls": {
             "quantum_ed_max_sites": int(args.phase_scan_ed_max_sites),
             "quantum_ed_max_hilbert_dimension": int(args.phase_scan_ed_max_hilbert_dim),
+            "quantum_ed_backend": quantum_ed_backend,
+            "quantum_ed_solver": str(getattr(args, "ed_solver", "auto")),
+            "quantum_ed_use_sz_block": bool(quantum_ed_use_sz_block),
+            "quantum_ed_use_tau_z_block": bool(quantum_ed_use_tau_z_block),
+            "quantum_ed_use_z2_block": bool(getattr(args, "use_z2_block", False)),
+            "quantum_ed_use_translation_x_block": bool(getattr(args, "use_translation_x_block", False)),
+            "quantum_ed_use_translation_y_block": bool(getattr(args, "use_translation_y_block", False)),
+            "symmetry_reductions": list(quantum_ed_reductions),
+            "symmetry_mode": str(getattr(args, "symmetry_mode", "none")),
+            "target_sz2": int(getattr(args, "u1_target_sz2", 0)),
+            "target_tz2": int(getattr(args, "u1_target_tz2", 0)),
+            "z2_target_parity": int(getattr(args, "z2_target_parity", 0)) % 2,
+            "quantum_ed_sparse_tol": float(getattr(args, "ed_sparse_tol", 0.0)),
+            "quantum_ed_sparse_maxiter": (
+                int(getattr(args, "ed_sparse_maxiter", 0))
+                if int(getattr(args, "ed_sparse_maxiter", 0)) > 0
+                else None
+            ),
             "classical_restarts": int(args.phase_scan_classical_restarts),
             "classical_sweeps": int(args.phase_scan_classical_sweeps),
             "classical_initial_temperature": float(args.phase_scan_classical_initial_temperature),
@@ -1461,9 +2626,9 @@ def run_alpha_beta_phase_scan(
         "classifier_thresholds": thresholds,
         "classifier_note": (
             "Phase labels are finite-size, observable-based assignments from dominant "
-            "spin/orbital structure factors plus bond-energy nematicity. They are saved "
-            "with diagnostics for reproducibility and should be checked against larger "
-            "clusters or denser grids before quoting thermodynamic boundaries."
+            "spin/orbital structure factors, plaquette flux, and bond-energy nematicity. "
+            "They are saved with diagnostics for reproducibility and should be checked "
+            "against larger clusters or denser grids before quoting thermodynamic boundaries."
         ),
     }
     progress_bar = _make_progress_bar(
@@ -1475,6 +2640,32 @@ def run_alpha_beta_phase_scan(
     )
     point_index = 0
     for mode in modes:
+        if mode == "quantum_ed":
+            skip_info = _phase_scan_quantum_global_skip(
+                geometry,
+                model_spec,
+                args,
+                hamiltonian_external_field_terms,
+            )
+            if skip_info is not None:
+                output[mode] = {
+                    "status": "skipped",
+                    "reason": str(skip_info["reason"]),
+                    "rows": [],
+                    "completed_points": 0,
+                    "failed_points": 0,
+                    "skipped_points": int(total_points),
+                    **skip_info,
+                    "note": (
+                        "Quantum ED phase scan was skipped once at solver setup; "
+                        "per-alpha/beta skipped rows are intentionally omitted."
+                    ),
+                }
+                if progress_bar is not None:
+                    progress_bar.update(total_points)
+                point_index += int(total_points)
+                continue
+
         rows: List[Dict[str, Any]] = []
         for beta in betas:
             for alpha in alphas:
@@ -1489,6 +2680,7 @@ def run_alpha_beta_phase_scan(
                             args,
                             hamiltonian_external_field_terms,
                             thresholds,
+                            show_progress=False,
                         )
                     else:
                         row = _phase_scan_classical_point(

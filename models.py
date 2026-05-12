@@ -2,10 +2,10 @@
 """Shared physics layer for the Yao-Lee driver.
 
 This module owns model specifications, local operators, external-field term
-construction, lattice geometry, exact diagonalization, correlation
-post-processing, and structure factors. Scan analysis belongs in
-``analysis.py``; Tenax-specific MPO/DMRG code belongs in ``backend.py``; PNG
-output code belongs in ``plot_outputs.py``.
+construction, lattice geometry, correlation post-processing, and structure
+factors. ED lives in ``ed_backend.py``; Tenax-specific MPO/DMRG code lives in
+``tenax_backend.py``; TeNPy code lives in ``tenpy_backend.py``; scan analysis
+belongs in ``analysis.py``; PNG output code belongs in ``plot_outputs.py``.
 """
 
 from __future__ import annotations
@@ -16,10 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
-import scipy.sparse as sparse
-import scipy.sparse.linalg as sparse_linalg
-
-from analysis import _end_stage, _make_progress_bar, _start_stage, resolve_low_energy_spectrum
+from analysis import _make_progress_bar
 
 AXIS_OPTIONS = ("x", "y", "z")
 AXES = AXIS_OPTIONS
@@ -27,7 +24,8 @@ SPIN_REP_VALUES = {"1/2": 0.5, "3/2": 1.5}
 # "1" is kept as a legacy alias and normalized to "0".
 ORBITAL_REP_VALUES = {"0": 0.0, "1": 0.0, "1/2": 0.5}
 SPIN_ONLY_MODEL_FAMILIES = ("heisenberg", "xy", "xxz", "xyz")
-SYMMETRY_MODE_OPTIONS = ("none", "u1", "z2")
+U1_SYMMETRY_MODES = ("u1", "u1_sz", "u1_tz")
+SYMMETRY_MODE_OPTIONS = ("none", "auto") + U1_SYMMETRY_MODES + ("z2",)
 U1_CHARGE_TZ_STRIDE = 4096
 SPIN_REP_DEFAULT = "1/2"
 ORBITAL_REP_DEFAULT = "1/2"
@@ -143,16 +141,29 @@ def _normalize_symmetry_mode(mode: str | None) -> str:
     text = str(mode if mode is not None else "none").strip().lower()
     if text in ("none", "off", "dense", "false", "0"):
         return "none"
-    if text in ("u1", "u(1)", "u1x", "u1xu1"):
+    if text in ("auto", "best", "detect"):
+        return "auto"
+    if text in ("u1", "u(1)", "u1_pair", "u1x", "u1xu1", "u1_sz_tz", "u1_sztz"):
         return "u1"
+    if text in ("u1_sz", "u1-spin", "u1_spin", "sz", "spin_u1", "u1s"):
+        return "u1_sz"
+    if text in ("u1_tz", "u1_tau", "u1_orbital", "tz", "tau_z", "orbital_u1", "u1t"):
+        return "u1_tz"
     if text in ("z2", "z_2", "z(2)", "parity"):
         return "z2"
     raise ValueError(f"Unsupported symmetry mode '{mode}'. Choose from: {', '.join(SYMMETRY_MODE_OPTIONS)}.")
 
 
+def _is_u1_symmetry_mode(mode: str | None) -> bool:
+    return _normalize_symmetry_mode(mode) in U1_SYMMETRY_MODES
+
+
 def _m2_values_from_spin_value(spin_value: float) -> List[int]:
     two_s = int(round(2.0 * spin_value))
-    return [two_s - 2 * index for index in range(two_s + 1)]
+    # Local basis convention used throughout this project:
+    # lowest m first.  For spin/orbital 1/2 this is down, up with charges
+    # [-1, +1], matching the bitwise ED convention 0=down, 1=up.
+    return [-two_s + 2 * index for index in range(two_s + 1)]
 
 
 def _get_z2_symmetry_object() -> Any:
@@ -193,6 +204,37 @@ def _u1_encoded_phys_charges_for_model(model_spec: ModelSpec) -> np.ndarray:
     return np.asarray(encoded, dtype=np.int32)
 
 
+def _u1_sz_phys_charges_for_model(model_spec: ModelSpec) -> np.ndarray:
+    """Physical U1 charge q = 2*Sz, independent of orbital tau_z."""
+    spin_m2_values = _m2_values_from_spin_value(model_spec.spin_value)
+    orb_m2_values = _m2_values_from_spin_value(model_spec.orbital_value)
+    return np.asarray(
+        [int(sz2) for sz2 in spin_m2_values for _tz2 in orb_m2_values],
+        dtype=np.int32,
+    )
+
+
+def _u1_tz_phys_charges_for_model(model_spec: ModelSpec) -> np.ndarray:
+    """Physical U1 charge q = 2*tau_z/Tz, independent of spin Sz."""
+    spin_m2_values = _m2_values_from_spin_value(model_spec.spin_value)
+    orb_m2_values = _m2_values_from_spin_value(model_spec.orbital_value)
+    return np.asarray(
+        [int(tz2) for _sz2 in spin_m2_values for tz2 in orb_m2_values],
+        dtype=np.int32,
+    )
+
+
+def _u1_phys_charges_for_model(model_spec: ModelSpec, symmetry_mode: str) -> np.ndarray:
+    mode = _normalize_symmetry_mode(symmetry_mode)
+    if mode == "u1":
+        return _u1_encoded_phys_charges_for_model(model_spec)
+    if mode == "u1_sz":
+        return _u1_sz_phys_charges_for_model(model_spec)
+    if mode == "u1_tz":
+        return _u1_tz_phys_charges_for_model(model_spec)
+    raise ValueError(f"Mode '{mode}' is not a U1 symmetry mode.")
+
+
 def _z2_phys_charges_for_model(model_spec: ModelSpec) -> np.ndarray:
     """Parity charge per local basis state: even=0, odd=1."""
     charges: List[int] = []
@@ -206,6 +248,8 @@ def _u1_basis_charge_table_for_model(model_spec: ModelSpec) -> List[Dict[str, An
     spin_m2_values = _m2_values_from_spin_value(model_spec.spin_value)
     orb_m2_values = _m2_values_from_spin_value(model_spec.orbital_value)
     encoded = _u1_encoded_phys_charges_for_model(model_spec)
+    sz_charges = _u1_sz_phys_charges_for_model(model_spec)
+    tz_charges = _u1_tz_phys_charges_for_model(model_spec)
     table: List[Dict[str, Any]] = []
     idx = 0
     for sz2 in spin_m2_values:
@@ -216,11 +260,28 @@ def _u1_basis_charge_table_for_model(model_spec: ModelSpec) -> List[Dict[str, An
                     "Sz_times_2": int(sz2),
                     "Tz_times_2": int(tz2),
                     "encoded_u1_charge": int(encoded[idx]),
+                    "u1_sz_charge": int(sz_charges[idx]),
+                    "u1_tz_charge": int(tz_charges[idx]),
                     "u1_charge_encoding": "q = 4096*(2*Sz) + (2*Tz)",
                 }
             )
             idx += 1
     return table
+
+
+def _u1_target_charge_for_mode(
+    total_sz2: int,
+    total_tz2: int,
+    symmetry_mode: str,
+) -> int:
+    mode = _normalize_symmetry_mode(symmetry_mode)
+    if mode == "u1":
+        return _u1_encoded_target_charge(int(total_sz2), int(total_tz2))
+    if mode == "u1_sz":
+        return int(total_sz2)
+    if mode == "u1_tz":
+        return int(total_tz2)
+    raise ValueError(f"Mode '{mode}' is not a U1 symmetry mode.")
 
 
 def _z2_basis_charge_table_for_model(model_spec: ModelSpec) -> List[Dict[str, Any]]:
@@ -362,11 +423,16 @@ def build_site_ops(model_spec: ModelSpec) -> Dict[str, np.ndarray]:
         "Tp": np.kron(ident_spin, t_plus),
         "Tm": np.kron(ident_spin, t_minus),
     }
-    ops["STx"] = ops["Sx"] @ ops["Tx"]
-    ops["STy"] = ops["Sy"] @ ops["Ty"]
-    ops["STz"] = ops["Sz"] @ ops["Tz"]
-    ops["STp"] = ops["Sp"] @ ops["Tp"]
-    ops["STm"] = ops["Sm"] @ ops["Tm"]
+    for spin_op in ("Sx", "Sy", "Sz", "Sp", "Sm"):
+        for orbital_op in ("Tx", "Ty", "Tz", "Tp", "Tm"):
+            ops[f"{spin_op}{orbital_op}"] = ops[spin_op] @ ops[orbital_op]
+
+    # Legacy aliases for same-axis spin-orbital operators.
+    ops["STx"] = ops["SxTx"]
+    ops["STy"] = ops["SyTy"]
+    ops["STz"] = ops["SzTz"]
+    ops["STp"] = ops["SpTp"]
+    ops["STm"] = ops["SmTm"]
     return ops
 
 
@@ -391,6 +457,12 @@ def model_terms_for_bond(
     jy: float = 1.0,
     jz: float = 1.0,
 ) -> List[Tuple[float, str]]:
+    """Legacy same-operator bond terms.
+
+    New Hamiltonian builders should call ``two_site_operator_terms_for_bond`` so
+    U(1)-symmetric ladder-operator terms such as ``Sp_i Sm_j`` can be represented
+    exactly.  This helper is kept for spin-only benchmarks and old diagnostics.
+    """
     axis_gamma = str(gamma).lower()
     if axis_gamma not in AXES:
         raise ValueError(f"Unknown bond axis '{gamma}'.")
@@ -426,6 +498,173 @@ def model_terms_for_bond(
         (coupling_j * (1.0 - beta), f"T{axis_gamma}"),
         (coupling_j * alpha, f"ST{axis_gamma}"),
     ]
+
+
+def _combine_spin_orbital_operator_names(spin_op: str, orbital_op: str) -> str:
+    """Return the one-site product-operator name used by ``build_site_ops``."""
+    spin_name = str(spin_op)
+    orbital_name = str(orbital_op)
+    if spin_name == "Id":
+        return orbital_name
+    if orbital_name == "Id":
+        return spin_name
+    return f"{spin_name}{orbital_name}"
+
+
+def _spin_dot_two_site_terms(coefficient: complex) -> List[Tuple[complex, str, str]]:
+    """Expansion of ``coefficient * S_i.S_j`` in U(1)-compatible operators."""
+    coeff = complex(coefficient)
+    return [
+        (0.5 * coeff, "Sp", "Sm"),
+        (0.5 * coeff, "Sm", "Sp"),
+        (coeff, "Sz", "Sz"),
+    ]
+
+
+def _orbital_axis_two_site_terms(
+    gamma: str,
+    coefficient: complex,
+    *,
+    real_ladder_y: bool = True,
+) -> List[Tuple[complex, str, str]]:
+    """Expansion of ``coefficient * T_i^gamma T_j^gamma``.
+
+    The orbital sector is not charge-conserved.  The y-channel is nevertheless
+    expanded in ``Tp/Tm`` by default so Tenax's U(1) AutoMPO path can stay real
+    while representing exactly the same ``Ty_i Ty_j`` operator.
+    """
+    axis = str(gamma).strip().lower()
+    coeff = complex(coefficient)
+    if axis == "x":
+        return [(coeff, "Tx", "Tx")]
+    if axis == "z":
+        return [(coeff, "Tz", "Tz")]
+    if axis != "y":
+        raise ValueError(f"Unknown bond axis '{gamma}'.")
+    if not real_ladder_y:
+        return [(coeff, "Ty", "Ty")]
+    return [
+        (-0.25 * coeff, "Tp", "Tp"),
+        (0.25 * coeff, "Tp", "Tm"),
+        (0.25 * coeff, "Tm", "Tp"),
+        (-0.25 * coeff, "Tm", "Tm"),
+    ]
+
+
+def yao_lee_u1_two_site_terms_for_bond(
+    gamma: str,
+    alpha: float,
+    beta: float,
+    coupling_j: float,
+) -> List[Tuple[complex, str, str]]:
+    """Canonical spin/orbital Yao-Lee bond terms preserving total spin Sz.
+
+    Formula:
+        J * [(1+beta) S_i.S_j
+             + (1-beta) T_i^gamma T_j^gamma
+             + alpha (S_i.S_j)(T_i^gamma T_j^gamma)]
+
+    The spin part is written with ``Sp/Sm/Sz`` so every term has net spin-U(1)
+    charge zero.  The orbital part is unrestricted; ``Ty Ty`` is exactly
+    represented through the real ``Tp/Tm`` expansion.
+    """
+    axis = str(gamma).strip().lower()
+    if axis not in AXES:
+        raise ValueError(f"Unknown bond axis '{gamma}'.")
+
+    spin_terms = _spin_dot_two_site_terms(float(coupling_j) * (1.0 + float(beta)))
+    orbital_terms = _orbital_axis_two_site_terms(
+        axis,
+        float(coupling_j) * (1.0 - float(beta)),
+        real_ladder_y=True,
+    )
+    mixed_spin_terms = _spin_dot_two_site_terms(1.0)
+    mixed_orbital_terms = _orbital_axis_two_site_terms(axis, 1.0, real_ladder_y=True)
+
+    terms: List[Tuple[complex, str, str]] = []
+    terms.extend(spin_terms)
+    terms.extend(orbital_terms)
+    for spin_coeff, spin_i, spin_j in mixed_spin_terms:
+        for orbital_coeff, orbital_i, orbital_j in mixed_orbital_terms:
+            terms.append(
+                (
+                    complex(float(coupling_j) * float(alpha)) * spin_coeff * orbital_coeff,
+                    _combine_spin_orbital_operator_names(spin_i, orbital_i),
+                    _combine_spin_orbital_operator_names(spin_j, orbital_j),
+                )
+            )
+    return [
+        (complex(coeff), op_i, op_j)
+        for coeff, op_i, op_j in terms
+        if not _is_zero_coefficient(coeff)
+    ]
+
+
+def two_site_operator_terms_for_bond(
+    gamma: str,
+    model_spec: ModelSpec,
+    alpha: float,
+    beta: float,
+    coupling_j: float,
+    jx: float = 1.0,
+    jy: float = 1.0,
+    jz: float = 1.0,
+) -> List[Tuple[complex, str, str]]:
+    """Return explicit two-site Hamiltonian terms ``(coeff, op_i, op_j)``.
+
+    Unlike the legacy ``model_terms_for_bond`` helper, this supports different
+    one-site operators on the two sites, which is required for U(1)-symmetric
+    ladder-operator MPOs.
+    """
+    family = str(model_spec.model_family).strip().lower()
+    if family == "yao_lee" and not is_trivial_orbital(model_spec):
+        return yao_lee_u1_two_site_terms_for_bond(gamma, alpha, beta, coupling_j)
+    return [
+        (complex(coefficient), str(op_name), str(op_name))
+        for coefficient, op_name in model_terms_for_bond(
+            gamma,
+            model_spec,
+            alpha,
+            beta,
+            coupling_j,
+            jx=jx,
+            jy=jy,
+            jz=jz,
+        )
+        if not _is_zero_coefficient(coefficient)
+    ]
+
+
+def auto_mpo_terms_for_bond(
+    gamma: str,
+    model_spec: ModelSpec,
+    alpha: float,
+    beta: float,
+    coupling_j: float,
+    i: int,
+    j: int,
+    jx: float = 1.0,
+    jy: float = 1.0,
+    jz: float = 1.0,
+) -> List[Tuple[Any, str, int, str, int]]:
+    """Return Tenax/AutoMPO-ready terms for one geometry bond."""
+    terms: List[Tuple[Any, str, int, str, int]] = []
+    for coefficient, op_i, op_j in two_site_operator_terms_for_bond(
+        gamma,
+        model_spec,
+        alpha,
+        beta,
+        coupling_j,
+        jx=jx,
+        jy=jy,
+        jz=jz,
+    ):
+        coeff = _real_scalar_if_close(coefficient)
+        if int(i) <= int(j):
+            terms.append((coeff, str(op_i), int(i), str(op_j), int(j)))
+        else:
+            terms.append((coeff, str(op_j), int(j), str(op_i), int(i)))
+    return terms
 
 
 def _normalize_external_field_treatment(treatment: str | None) -> str:
@@ -500,7 +739,9 @@ def validate_external_field_symmetry_compatibility(
     symmetry_mode: str,
 ) -> None:
     mode = _normalize_symmetry_mode(symmetry_mode)
-    if mode == "none" or len(field_terms) == 0:
+    if mode in ("none", "auto") or len(field_terms) == 0:
+        return
+    if mode == "u1_tz":
         return
     breaking_terms = [op_name for _, op_name in field_terms if op_name in ("Sx", "Sy")]
     if breaking_terms:
@@ -646,8 +887,13 @@ def _u1_pair_terms_for_bond_terms(
     bond_terms: List[Tuple[float, str]],
     i: int,
     j: int,
+    symmetry_mode: str,
 ) -> List[Tuple[complex, str, int, str, int]]:
     """Convert U1-conserving x/y pairs into raising/lowering AutoMPO terms."""
+    mode = _normalize_symmetry_mode(symmetry_mode)
+    if not _is_u1_symmetry_mode(mode):
+        raise ValueError(f"Mode '{mode}' is not a U1 symmetry mode.")
+
     combined: Dict[str, complex] = {}
     order: List[str] = []
     for coefficient, op_name in bond_terms:
@@ -661,32 +907,53 @@ def _u1_pair_terms_for_bond_terms(
         combined[op_text] += coeff
 
     terms: List[Tuple[complex, str, int, str, int]] = []
+    charged_families = {
+        "u1": {"S", "T"},
+        "u1_sz": {"S"},
+        "u1_tz": {"T"},
+    }[mode]
 
-    for x_op, y_op, plus_op, minus_op in (
-        ("Sx", "Sy", "Sp", "Sm"),
-        ("Tx", "Ty", "Tp", "Tm"),
+    def append_y_axis_expansion(coeff: complex, plus_op: str, minus_op: str) -> None:
+        terms.extend(
+            [
+                (_real_scalar_if_close(-0.25 * coeff), plus_op, i, plus_op, j),
+                (_real_scalar_if_close(0.25 * coeff), plus_op, i, minus_op, j),
+                (_real_scalar_if_close(0.25 * coeff), minus_op, i, plus_op, j),
+                (_real_scalar_if_close(-0.25 * coeff), minus_op, i, minus_op, j),
+            ]
+        )
+
+    for family, x_op, y_op, plus_op, minus_op in (
+        ("S", "Sx", "Sy", "Sp", "Sm"),
+        ("T", "Tx", "Ty", "Tp", "Tm"),
     ):
         coeff_x = combined.pop(x_op, 0.0j)
         coeff_y = combined.pop(y_op, 0.0j)
         if _is_zero_coefficient(coeff_x) and _is_zero_coefficient(coeff_y):
             continue
-        if _is_zero_coefficient(coeff_x - coeff_y):
-            coeff = 0.5 * coeff_x
-            terms.append((_real_scalar_if_close(coeff), plus_op, i, minus_op, j))
-            terms.append((_real_scalar_if_close(coeff), minus_op, i, plus_op, j))
-            continue
-        raise ValueError(
-            "A U1 symmetric MPO requires transverse pair terms to appear as "
-            f"{x_op}_{i}{x_op}_{j} + {y_op}_{i}{y_op}_{j} with equal coefficients. "
-            f"Got {x_op} coefficient {coeff_x:g} and {y_op} coefficient {coeff_y:g}. "
-            "Use symmetry_mode=z2/none for single-axis x/y flip terms."
-        )
+        if family in charged_families:
+            if _is_zero_coefficient(coeff_x - coeff_y):
+                coeff = 0.5 * coeff_x
+                terms.append((_real_scalar_if_close(coeff), plus_op, i, minus_op, j))
+                terms.append((_real_scalar_if_close(coeff), minus_op, i, plus_op, j))
+                continue
+            raise ValueError(
+                f"A {mode.upper()} symmetric MPO requires charged transverse pair terms "
+                f"to appear as {x_op}_{i}{x_op}_{j} + {y_op}_{i}{y_op}_{j} "
+                f"with equal coefficients. Got {x_op} coefficient {coeff_x:g} "
+                f"and {y_op} coefficient {coeff_y:g}."
+            )
+        if not _is_zero_coefficient(coeff_x):
+            terms.append((_real_scalar_if_close(coeff_x), x_op, i, x_op, j))
+        if not _is_zero_coefficient(coeff_y):
+            append_y_axis_expansion(coeff_y, plus_op, minus_op)
+        continue
 
     for op_name in ("STx", "STy"):
         coeff = combined.get(op_name, 0.0j)
         if not _is_zero_coefficient(coeff):
             raise ValueError(
-                f"U1 symmetry cannot preserve the current {op_name}_{i}{op_name}_{j} "
+                f"{mode.upper()} symmetry cannot preserve the current {op_name}_{i}{op_name}_{j} "
                 "term without changing the Hamiltonian. Use symmetry_mode=z2 or none for "
                 "Yao-Lee x/y spin-orbital channels."
             )
@@ -709,9 +976,343 @@ def auto_mpo_pair_terms_for_bond_terms(
 ) -> List[Tuple[Any, str, int, str, int]]:
     mode = _normalize_symmetry_mode(symmetry_mode)
     active_bond_terms = nonzero_bond_terms(bond_terms)
-    if mode == "u1":
-        return list(_u1_pair_terms_for_bond_terms(active_bond_terms, i, j))
+    if _is_u1_symmetry_mode(mode):
+        return list(_u1_pair_terms_for_bond_terms(active_bond_terms, i, j, mode))
     return [(coefficient, op_name, i, op_name, j) for coefficient, op_name in active_bond_terms]
+
+
+def _reachable_charge_sums(single_site_values: List[int], n_sites: int) -> List[int]:
+    reachable = {0}
+    values = [int(value) for value in single_site_values]
+    for _site in range(max(0, int(n_sites))):
+        reachable = {int(total + value) for total in reachable for value in values}
+    return sorted(reachable)
+
+
+def _reachable_z2_sums(single_site_values: List[int], n_sites: int) -> List[int]:
+    reachable = {0}
+    values = [int(value) % 2 for value in single_site_values]
+    for _site in range(max(0, int(n_sites))):
+        reachable = {int((total + value) % 2) for total in reachable for value in values}
+    return sorted(reachable)
+
+
+def _append_limited_issue(
+    issues: List[Dict[str, Any]],
+    issue: Dict[str, Any],
+    *,
+    max_issues: int = 12,
+) -> None:
+    if len(issues) < int(max_issues):
+        issues.append(issue)
+
+
+def _auto_mpo_terms_for_symmetry_check(
+    geometry: GeometryData,
+    model_spec: ModelSpec,
+    alpha: float,
+    beta: float,
+    coupling_j: float,
+    *,
+    jx: float,
+    jy: float,
+    jz: float,
+    external_field_terms: List[Tuple[float, str]],
+    symmetry_mode: str,
+) -> Tuple[List[Tuple[Any, ...]], List[Dict[str, Any]]]:
+    mode = _normalize_symmetry_mode(symmetry_mode)
+    terms: List[Tuple[Any, ...]] = []
+    issues: List[Dict[str, Any]] = []
+    for bond in geometry.bond_list:
+        try:
+            bond_auto_terms = auto_mpo_terms_for_bond(
+                bond.gamma.lower(),
+                model_spec,
+                alpha,
+                beta,
+                coupling_j,
+                bond.i,
+                bond.j,
+                jx=jx,
+                jy=jy,
+                jz=jz,
+            )
+            terms.extend(bond_auto_terms)
+        except Exception as exc:
+            _append_limited_issue(
+                issues,
+                {
+                    "kind": "bond_term_conversion_failed",
+                    "bond": {"i": int(bond.i), "j": int(bond.j), "gamma": str(bond.gamma)},
+                    "formula": "canonical Sz-conserving Yao-Lee expansion"
+                    if str(model_spec.model_family) == "yao_lee"
+                    else "legacy same-operator two-site expansion",
+                    "error": str(exc),
+                },
+            )
+
+    for site in range(int(geometry.number_of_sites)):
+        for coefficient, op_name in external_field_terms:
+            terms.append((coefficient, op_name, site))
+
+    return nonzero_auto_mpo_terms(terms), issues
+
+
+def _check_terms_conserve_symmetry(
+    terms: List[Tuple[Any, ...]],
+    model_spec: ModelSpec,
+    symmetry_mode: str,
+) -> Tuple[bool, List[Dict[str, Any]]]:
+    mode = _normalize_symmetry_mode(symmetry_mode)
+    if _is_u1_symmetry_mode(mode):
+        phys_charges = _u1_phys_charges_for_model(model_spec, mode)
+    elif mode == "z2":
+        phys_charges = _z2_phys_charges_for_model(model_spec)
+    else:
+        return True, []
+
+    site_ops = build_site_ops(model_spec)
+    issues: List[Dict[str, Any]] = []
+    for term in terms:
+        try:
+            _validate_symmetry_conserving_terms(
+                [term],
+                site_ops,
+                phys_charges,
+                mode,
+            )
+        except Exception as exc:
+            _append_limited_issue(
+                issues,
+                {
+                    "kind": "term_not_conserved",
+                    "term": [str(item) for item in term],
+                    "error": str(exc),
+                },
+            )
+    return len(issues) == 0, issues
+
+
+def analyze_hamiltonian_symmetries(
+    geometry: GeometryData,
+    model_spec: ModelSpec,
+    alpha: float,
+    beta: float,
+    coupling_j: float,
+    *,
+    jx: float = 1.0,
+    jy: float = 1.0,
+    jz: float = 1.0,
+    external_field_terms: List[Tuple[float, str]] | None = None,
+    requested_symmetry_mode: str = "none",
+    u1_target_total_sz2: int = 0,
+    u1_target_total_tz2: int = 0,
+    z2_target_parity: int = 0,
+) -> Dict[str, Any]:
+    """Strictly report which requested symmetry sectors match the Hamiltonian.
+
+    This checks the actual finite-cluster terms after the same symmetry-aware
+    ladder-operator conversion used by the Tenax MPO path.
+    """
+
+    requested_mode = _normalize_symmetry_mode(requested_symmetry_mode)
+    n_sites = int(geometry.number_of_sites)
+    field_terms = list(external_field_terms or [])
+    spin_m2_values = _m2_values_from_spin_value(model_spec.spin_value)
+    orbital_m2_values = _m2_values_from_spin_value(model_spec.orbital_value)
+    reachable_sz2 = _reachable_charge_sums(spin_m2_values, n_sites)
+    reachable_tz2 = _reachable_charge_sums(orbital_m2_values, n_sites)
+    target_sz2 = int(u1_target_total_sz2)
+    target_tz2 = int(u1_target_total_tz2)
+    reachable_sz2_set = set(reachable_sz2)
+    reachable_tz2_set = set(reachable_tz2)
+
+    def u1_target_reachable_for_mode(mode: str) -> bool:
+        if mode == "u1":
+            return target_sz2 in reachable_sz2_set and target_tz2 in reachable_tz2_set
+        if mode == "u1_sz":
+            return target_sz2 in reachable_sz2_set
+        if mode == "u1_tz":
+            return target_tz2 in reachable_tz2_set
+        return False
+
+    def u1_target_sector_for_mode(mode: str) -> Dict[str, Any]:
+        target_charge = int(_u1_target_charge_for_mode(target_sz2, target_tz2, mode))
+        sector: Dict[str, Any] = {
+            "mode": mode,
+            "target_charge": target_charge,
+            "reachable": bool(u1_target_reachable_for_mode(mode)),
+        }
+        if mode in ("u1", "u1_sz"):
+            sector["total_Sz_times_2"] = target_sz2
+        if mode in ("u1", "u1_tz"):
+            sector["total_Tz_times_2"] = target_tz2
+        if mode == "u1":
+            sector["encoded_charge"] = target_charge
+        return sector
+
+    def build_u1_report(mode: str) -> Dict[str, Any]:
+        mode = _normalize_symmetry_mode(mode)
+        u1_terms, generation_issues = _auto_mpo_terms_for_symmetry_check(
+            geometry,
+            model_spec,
+            alpha,
+            beta,
+            coupling_j,
+            jx=jx,
+            jy=jy,
+            jz=jz,
+            external_field_terms=field_terms,
+            symmetry_mode=mode,
+        )
+        terms_conserved, term_issues = _check_terms_conserve_symmetry(
+            u1_terms,
+            model_spec,
+            mode,
+        )
+        issues = list(generation_issues) + list(term_issues)
+        conserved = len(generation_issues) == 0 and bool(terms_conserved)
+        target_reachable = u1_target_reachable_for_mode(mode)
+        if mode == "u1":
+            conserved_key = "conserved_total_Sz_and_total_Tz"
+            note = (
+                "U1 here means simultaneous conservation of total Sz and orbital tau_z/Tz. "
+                "Both spin and orbital transverse terms must be U1-paired."
+            )
+        elif mode == "u1_sz":
+            conserved_key = "conserved_total_Sz"
+            note = (
+                "Spin-only U1 conserves total Sz while allowing orbital-only terms that do "
+                "not change Sz. Spin transverse terms must still appear as conserving pairs."
+            )
+        else:
+            conserved_key = "conserved_total_Tz"
+            note = (
+                "Orbital-only U1 conserves total tau_z/Tz while allowing spin-only terms that "
+                "do not change Tz. Orbital transverse terms must still appear as conserving pairs."
+            )
+        return {
+            "mode": mode,
+            conserved_key: bool(conserved),
+            "conserved": bool(conserved),
+            "backend_supported_for_simplification": bool(conserved and target_reachable),
+            "target_sector": u1_target_sector_for_mode(mode),
+            "reachable_total_Sz_times_2": reachable_sz2,
+            "reachable_total_Tz_times_2": reachable_tz2,
+            "charge_encoding": _u1_charge_encoding_summary() if mode == "u1" else {
+                "scheme": "single_integer_charge",
+                "formula": "q = 2*Sz" if mode == "u1_sz" else "q = 2*Tz",
+            },
+            "basis_charge_table": _u1_basis_charge_table_for_model(model_spec),
+            "checked_term_count": int(len(u1_terms)),
+            "issues": issues,
+            "note": note,
+        }
+
+    u1_report = build_u1_report("u1")
+    u1_sz_report = build_u1_report("u1_sz")
+    u1_tz_report = build_u1_report("u1_tz")
+
+    z2_terms, z2_generation_issues = _auto_mpo_terms_for_symmetry_check(
+        geometry,
+        model_spec,
+        alpha,
+        beta,
+        coupling_j,
+        jx=jx,
+        jy=jy,
+        jz=jz,
+        external_field_terms=field_terms,
+        symmetry_mode="z2",
+    )
+    z2_terms_conserved, z2_term_issues = _check_terms_conserve_symmetry(
+        z2_terms,
+        model_spec,
+        "z2",
+    )
+    z2_issues = list(z2_generation_issues) + list(z2_term_issues)
+    reachable_z2 = _reachable_z2_sums(
+        [int(value) for value in _z2_phys_charges_for_model(model_spec)],
+        n_sites,
+    )
+    target_z2 = int(z2_target_parity) % 2
+    z2_target_reachable = target_z2 in set(reachable_z2)
+    z2_conserved = len(z2_generation_issues) == 0 and bool(z2_terms_conserved)
+
+    u1_reports_by_mode = {
+        "u1": u1_report,
+        "u1_sz": u1_sz_report,
+        "u1_tz": u1_tz_report,
+    }
+    supported_u1_modes = [
+        mode
+        for mode in ("u1", "u1_sz", "u1_tz")
+        if bool(u1_reports_by_mode[mode].get("backend_supported_for_simplification", False))
+    ]
+    if supported_u1_modes:
+        recommended_mode = supported_u1_modes[0]
+        recommendation_reason = (
+            f"{recommended_mode} is conserved, its requested target sector is reachable, "
+            "and Tenax can use it for U1 block-sparse simplification."
+        )
+    elif bool(z2_conserved) and bool(z2_target_reachable):
+        recommended_mode = "none"
+        recommendation_reason = (
+            "Only Z2/parity is available, but this Tenax AutoMPO path cannot build "
+            "a true Z2 block-sparse MPO; use dense mode or a backend with Z2 MPO support."
+        )
+    else:
+        recommended_mode = "none"
+        recommendation_reason = "No supported nontrivial symmetry sector passed the strict checks."
+
+    def requested_u1_report() -> Dict[str, Any] | None:
+        if requested_mode in u1_reports_by_mode:
+            return u1_reports_by_mode[requested_mode]
+        return None
+
+    requested_report = requested_u1_report()
+    requested_physical_symmetry_valid = (
+        requested_mode in ("none", "auto")
+        or (requested_report is not None and bool(requested_report.get("conserved", False))
+            and bool((requested_report.get("target_sector") or {}).get("reachable", False)))
+        or (
+            requested_mode == "z2"
+            and bool(z2_conserved)
+            and bool(z2_target_reachable)
+        )
+    )
+    requested_backend_supported = (
+        requested_mode in ("none", "auto")
+        or (requested_report is not None and bool(requested_report.get("backend_supported_for_simplification", False)))
+    )
+
+    return {
+        "requested_mode": requested_mode,
+        "requested_physical_symmetry_valid": bool(requested_physical_symmetry_valid),
+        "requested_backend_supported_for_simplification": bool(requested_backend_supported),
+        "recommended_mode_for_tenax": recommended_mode,
+        "recommendation_reason": recommendation_reason,
+        "u1": u1_report,
+        "u1_sz": u1_sz_report,
+        "u1_tz": u1_tz_report,
+        "z2": {
+            "conserved_global_parity": bool(z2_conserved),
+            "backend_supported_for_simplification": False,
+            "backend_support_note": (
+                "Tenax 0.2 AutoMPO symmetric construction used here is U1-only; "
+                "Z2 is reported as a physical conservation law but not used for block-sparse MPO speedup."
+            ),
+            "target_sector": {
+                "global_parity": target_z2,
+                "reachable": bool(z2_target_reachable),
+            },
+            "reachable_global_parities": reachable_z2,
+            "basis_charge_table": _z2_basis_charge_table_for_model(model_spec),
+            "checked_term_count": int(len(z2_terms)),
+            "issues": z2_issues,
+            "note": "Parity charge is (spin basis index + orbital basis index) mod 2.",
+        },
+    }
 
 
 # ----------------------------------------------------------------------
@@ -732,6 +1333,267 @@ class GeometryData:
     positions: np.ndarray
     cell_indices: List[Tuple[int, int]]
     sublattice_indices: List[int]
+    length_x: int | None = None
+    length_y: int | None = None
+    circumference_x: bool = False
+    circumference_y: bool = True
+
+
+PLAQUETTE_FLUX_AXES = ("x", "y", "z")
+PLAQUETTE_FLUX_NORMALIZATION = 2.0 ** 6
+
+
+def _canonical_cycle_key(cycle: List[int]) -> Tuple[int, ...]:
+    """Return an orientation-independent key for a simple cycle."""
+    values = [int(site) for site in cycle]
+    rotations: List[Tuple[int, ...]] = []
+    for seq in (values, list(reversed(values))):
+        for offset in range(len(seq)):
+            rotations.append(tuple(seq[offset:] + seq[:offset]))
+    return min(rotations)
+
+
+def _honeycomb_bond_axis_map(geometry: GeometryData) -> Dict[Tuple[int, int], str]:
+    axes: Dict[Tuple[int, int], str] = {}
+    for bond in geometry.bond_list:
+        i = int(bond.i)
+        j = int(bond.j)
+        axes[(min(i, j), max(i, j))] = str(bond.gamma).strip().lower()
+    return axes
+
+
+def _honeycomb_adjacency(geometry: GeometryData) -> Dict[int, List[int]]:
+    adjacency: Dict[int, List[int]] = {site: [] for site in range(int(geometry.number_of_sites))}
+    for bond in geometry.bond_list:
+        i = int(bond.i)
+        j = int(bond.j)
+        adjacency[i].append(j)
+        adjacency[j].append(i)
+    for neighbors in adjacency.values():
+        neighbors.sort()
+    return adjacency
+
+
+def _simple_cycles_of_length_six(geometry: GeometryData) -> List[List[int]]:
+    """Find unique simple length-six cycles in the bond graph."""
+    adjacency = _honeycomb_adjacency(geometry)
+    cycles: Dict[Tuple[int, ...], List[int]] = {}
+
+    def dfs(start: int, current: int, path: List[int]) -> None:
+        if len(path) == 6:
+            if start in adjacency[current]:
+                key = _canonical_cycle_key(path)
+                cycles.setdefault(key, list(key))
+            return
+        for neighbor in adjacency[current]:
+            if neighbor == start:
+                continue
+            if neighbor in path:
+                continue
+            if neighbor < start:
+                continue
+            dfs(start, neighbor, path + [neighbor])
+
+    for start in range(int(geometry.number_of_sites)):
+        dfs(start, start, [start])
+    return [list(cycle) for cycle in cycles.values()]
+
+
+def _elementary_honeycomb_plaquette_cycles(geometry: GeometryData) -> List[List[int]] | None:
+    """Build contractible elementary honeycomb hexagons from cell indices.
+
+    On small periodic cylinders, the bond graph can contain non-contractible
+    length-six loops around the circumference.  Those are useful paths, but
+    they are not local plaquettes.  The elementary hexagon anchored at
+    ``(x, y)`` uses the two neighboring x-cells and the next y-row:
+
+        A(x,y), B(x,y+1), A(x,y+1), B(x+1,y+1), A(x+1,y), B(x+1,y).
+
+    Missing sites or missing bonds are rejected by the caller, so open-y
+    boundaries naturally drop incomplete plaquettes.
+    """
+    if len(getattr(geometry, "cell_indices", [])) != int(geometry.number_of_sites):
+        return None
+    if len(getattr(geometry, "sublattice_indices", [])) != int(geometry.number_of_sites):
+        return None
+
+    site_by_cell: Dict[Tuple[int, int, int], int] = {}
+    x_values: set[int] = set()
+    y_values: set[int] = set()
+    for site, (cell, sublattice) in enumerate(zip(geometry.cell_indices, geometry.sublattice_indices)):
+        if len(cell) != 2:
+            return None
+        x_cell = int(cell[0])
+        y_cell = int(cell[1])
+        sub = int(sublattice)
+        site_by_cell[(x_cell, y_cell, sub)] = int(site)
+        x_values.add(x_cell)
+        y_values.add(y_cell)
+
+    sorted_x = sorted(x_values)
+    sorted_y = sorted(y_values)
+    if len(sorted_x) < 2 or len(sorted_y) < 1:
+        return []
+    circumference_x = bool(getattr(geometry, "circumference_x", False))
+    circumference_y = bool(getattr(geometry, "circumference_y", True))
+    min_x = int(sorted_x[0])
+    max_x = int(sorted_x[-1])
+    min_y = int(sorted_y[0])
+    max_y = int(sorted_y[-1])
+
+    cycles: List[List[int]] = []
+    for x_cell in sorted_x:
+        x_next = int(x_cell) + 1
+        if x_next not in x_values:
+            if circumference_x and int(x_cell) == max_x:
+                x_next = min_x
+            else:
+                continue
+        if x_next == int(x_cell):
+            continue
+        for y_cell in sorted_y:
+            y_next = int(y_cell) + 1
+            if y_next not in y_values:
+                if circumference_y and int(y_cell) == max_y:
+                    y_next = min_y
+                else:
+                    continue
+            if y_next == int(y_cell):
+                continue
+            plaquette_keys = [
+                (x_cell, y_cell, 0),
+                (x_cell, y_next, 1),
+                (x_cell, y_next, 0),
+                (x_next, y_next, 1),
+                (x_next, y_cell, 0),
+                (x_next, y_cell, 1),
+            ]
+            try:
+                cycle = [site_by_cell[key] for key in plaquette_keys]
+            except KeyError:
+                continue
+            if len(set(cycle)) == 6:
+                cycles.append([int(site) for site in cycle])
+    return cycles
+
+
+def _plaquette_axes_for_cycle(
+    cycle: List[int],
+    bond_axes: Dict[Tuple[int, int], str],
+) -> List[str] | None:
+    axes: List[str] = []
+    for index, site in enumerate(cycle):
+        previous_site = cycle[(index - 1) % len(cycle)]
+        next_site = cycle[(index + 1) % len(cycle)]
+        edge_axes = {
+            bond_axes.get((min(site, previous_site), max(site, previous_site))),
+            bond_axes.get((min(site, next_site), max(site, next_site))),
+        }
+        if None in edge_axes:
+            return None
+        missing_axes = [axis for axis in PLAQUETTE_FLUX_AXES if axis not in edge_axes]
+        if len(missing_axes) != 1:
+            return None
+        axes.append(missing_axes[0])
+    return axes
+
+
+def honeycomb_plaquette_flux_operators(geometry: GeometryData) -> List[Dict[str, Any]]:
+    """Return normalized orbital plaquette-flux operators for honeycomb hexagons.
+
+    The local orbital matrices in this project are spin-1/2 operators
+    ``tau_a = sigma_a / 2``.  The flux diagnostic is normalized as
+    ``W_p = prod_l (2 tau_l^{gamma_l})`` so the conserved values are near
+    ``+/-1`` rather than ``+/-1/64``.
+
+    Only elementary six-site honeycomb plaquettes are returned.  In
+    particular, non-contractible length-six loops caused by small periodic
+    circumferences are filtered out.
+    """
+    if int(geometry.number_of_sites) < 6:
+        return []
+    bond_axes = _honeycomb_bond_axis_map(geometry)
+    plaquettes: List[Dict[str, Any]] = []
+    elementary_cycles = _elementary_honeycomb_plaquette_cycles(geometry)
+    candidate_cycles = (
+        _simple_cycles_of_length_six(geometry)
+        if elementary_cycles is None
+        else elementary_cycles
+    )
+    if len(candidate_cycles) == 0:
+        return []
+    seen_cycles: set[Tuple[int, ...]] = set()
+    for cycle in candidate_cycles:
+        key = _canonical_cycle_key(cycle)
+        if key in seen_cycles:
+            continue
+        seen_cycles.add(key)
+        axes = _plaquette_axes_for_cycle(cycle, bond_axes)
+        if axes is None:
+            continue
+        positions = np.asarray([geometry.positions[site] for site in cycle], dtype=float)
+        center = np.mean(positions, axis=0)
+        plaquettes.append(
+            {
+                "plaquette_index": 0,
+                "sites": [int(site) for site in cycle],
+                "axes": [str(axis) for axis in axes],
+                "operator_names": [f"T{axis}" for axis in axes],
+                "tenpy_operator_names": [f"tau_{axis}" for axis in axes],
+                "center": [float(center[0]), float(center[1])],
+                "normalization": float(PLAQUETTE_FLUX_NORMALIZATION),
+                "definition": "W_p = product_l (2 tau_l^{gamma_l}) around one honeycomb hexagon",
+            }
+        )
+    plaquettes.sort(key=lambda item: (float(item["center"][0]), float(item["center"][1]), item["sites"]))
+    for index, item in enumerate(plaquettes):
+        item["plaquette_index"] = int(index)
+    return plaquettes
+
+
+def select_honeycomb_plaquette_flux_operator(
+    geometry: GeometryData,
+    plaquette_center_idx: int | None = None,
+) -> Dict[str, Any]:
+    """Select one plaquette-flux operator by sorted plaquette index.
+
+    ``plaquette_center_idx=None`` chooses the central plaquette in the sorted
+    list, which is useful for finite cylinders where boundary plaquettes may be
+    less representative.
+    """
+    plaquettes = honeycomb_plaquette_flux_operators(geometry)
+    if len(plaquettes) == 0:
+        raise ValueError("No honeycomb length-six plaquette was found in this geometry.")
+    index = len(plaquettes) // 2 if plaquette_center_idx is None else int(plaquette_center_idx)
+    if index < 0:
+        index = len(plaquettes) + index
+    if index < 0 or index >= len(plaquettes):
+        raise IndexError(
+            f"plaquette_center_idx={plaquette_center_idx} is outside the available "
+            f"plaquette range [0, {len(plaquettes) - 1}]."
+        )
+    return dict(plaquettes[index])
+
+
+def plaquette_flux_close_to_target(
+    value: Any,
+    *,
+    target: float = 1.0,
+    tolerance: float = 0.15,
+) -> bool:
+    """Check whether a normalized plaquette flux is near its conserved value."""
+    try:
+        flux = float(np.real(value))
+    except (TypeError, ValueError):
+        return False
+    if not np.isfinite(flux):
+        return False
+    target_value = float(target)
+    tol = abs(float(tolerance))
+    return bool(
+        abs(flux - target_value) <= tol
+        or abs(abs(flux) - abs(target_value)) <= tol
+    )
 
 
 def honeycomb_real_space_position(x_cell: int, y_cell: int, sublattice: int) -> np.ndarray:
@@ -746,26 +1608,44 @@ def honeycomb_real_space_position(x_cell: int, y_cell: int, sublattice: int) -> 
     return position
 
 
-def snake_y_values(x_cell: int, circumference_y: int):
+def _validate_lattice_length(name: str, value: int) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"{name} must be positive.")
+    return parsed
+
+
+def _validate_length_y(length_y: int) -> int:
+    value = int(length_y)
+    if value <= 0:
+        raise ValueError("length_y must be positive.")
+    return value
+
+
+def snake_y_values(x_cell: int, length_y: int):
     if x_cell % 2 == 0:
-        return range(circumference_y)
-    return range(circumference_y - 1, -1, -1)
+        return range(length_y)
+    return range(length_y - 1, -1, -1)
 
 
 def build_honeycomb_cylinder_geometry(
     length_x: int,
-    circumference_y: int,
-    periodic_y: bool = True,
+    *,
+    length_y: int,
+    circumference_x: bool = False,
+    circumference_y: bool = True,
 ) -> GeometryData:
+    length_x = _validate_lattice_length("length_x", length_x)
+    length_y_value = _validate_length_y(length_y)
     bond_list: List[Bond] = []
     positions: List[np.ndarray] = []
     cell_indices: List[Tuple[int, int]] = []
     sublattice_indices: List[int] = []
-    n_sites = length_x * circumference_y * 2
+    n_sites = length_x * length_y_value * 2
     site_to_index: Dict[Tuple[int, int, int], int] = {}
 
     for x in range(length_x):
-        for y in snake_y_values(x, circumference_y):
+        for y in snake_y_values(x, length_y_value):
             for sub in (0, 1):
                 site_to_index[(x, y, sub)] = len(positions)
                 positions.append(honeycomb_real_space_position(x, y, sub))
@@ -775,18 +1655,19 @@ def build_honeycomb_cylinder_geometry(
         raise RuntimeError("Internal geometry error: honeycomb snake ordering generated wrong site count.")
 
     for x in range(length_x):
-        for y in range(circumference_y):
+        for y in range(length_y_value):
             i_a = site_to_index[(x, y, 0)]
             i_b = site_to_index[(x, y, 1)]
             bond_list.append(Bond(i_a, i_b, "z"))
 
-            y_plus_1 = (y + 1) % circumference_y
-            if periodic_y or (y + 1 < circumference_y):
+            y_plus_1 = (y + 1) % length_y_value
+            if circumference_y or (y + 1 < length_y_value):
                 j_b_y = site_to_index[(x, y_plus_1, 1)]
                 bond_list.append(Bond(i_a, j_b_y, "y"))
 
-            if x + 1 < length_x:
-                j_b_x = site_to_index[(x + 1, y, 1)]
+            x_plus_1 = (x + 1) % length_x
+            if circumference_x or (x + 1 < length_x):
+                j_b_x = site_to_index[(x_plus_1, y, 1)]
                 bond_list.append(Bond(i_a, j_b_x, "x"))
 
     return GeometryData(
@@ -795,6 +1676,10 @@ def build_honeycomb_cylinder_geometry(
         positions=np.asarray(positions, dtype=float),
         cell_indices=cell_indices,
         sublattice_indices=sublattice_indices,
+        length_x=length_x,
+        length_y=length_y_value,
+        circumference_x=bool(circumference_x),
+        circumference_y=bool(circumference_y),
     )
 
 
@@ -804,18 +1689,22 @@ def square_real_space_position(x_cell: int, y_cell: int) -> np.ndarray:
 
 def build_square_cylinder_geometry(
     length_x: int,
-    circumference_y: int,
-    periodic_y: bool = True,
+    *,
+    length_y: int,
+    circumference_x: bool = False,
+    circumference_y: bool = True,
 ) -> GeometryData:
+    length_x = _validate_lattice_length("length_x", length_x)
+    length_y_value = _validate_length_y(length_y)
     bond_list: List[Bond] = []
     positions: List[np.ndarray] = []
     cell_indices: List[Tuple[int, int]] = []
     sublattice_indices: List[int] = []
-    n_sites = length_x * circumference_y
+    n_sites = length_x * length_y_value
     site_to_index: Dict[Tuple[int, int], int] = {}
 
     for x in range(length_x):
-        for y in snake_y_values(x, circumference_y):
+        for y in snake_y_values(x, length_y_value):
             site_to_index[(x, y)] = len(positions)
             positions.append(square_real_space_position(x, y))
             cell_indices.append((x, y))
@@ -824,14 +1713,16 @@ def build_square_cylinder_geometry(
         raise RuntimeError("Internal geometry error: square snake ordering generated wrong site count.")
 
     for x in range(length_x):
-        for y in range(circumference_y):
+        for y in range(length_y_value):
             i_site = site_to_index[(x, y)]
-            if x + 1 < length_x:
-                j_x = site_to_index[(x + 1, y)]
-                bond_list.append(Bond(i_site, j_x, "x"))
+            x_plus_1 = (x + 1) % length_x
+            if circumference_x or (x + 1 < length_x):
+                j_x = site_to_index[(x_plus_1, y)]
+                if j_x != i_site:
+                    bond_list.append(Bond(i_site, j_x, "x"))
 
-            y_plus_1 = (y + 1) % circumference_y
-            if periodic_y or (y + 1 < circumference_y):
+            y_plus_1 = (y + 1) % length_y_value
+            if circumference_y or (y + 1 < length_y_value):
                 j_y = site_to_index[(x, y_plus_1)]
                 if j_y != i_site:
                     bond_list.append(Bond(i_site, j_y, "y"))
@@ -842,6 +1733,10 @@ def build_square_cylinder_geometry(
         positions=np.asarray(positions, dtype=float),
         cell_indices=cell_indices,
         sublattice_indices=sublattice_indices,
+        length_x=length_x,
+        length_y=length_y_value,
+        circumference_x=bool(circumference_x),
+        circumference_y=bool(circumference_y),
     )
 
 
@@ -859,18 +1754,22 @@ def triangular_real_space_position(x_cell: int, y_cell: int) -> np.ndarray:
 
 def build_triangular_cylinder_geometry(
     length_x: int,
-    circumference_y: int,
-    periodic_y: bool = True,
+    *,
+    length_y: int,
+    circumference_x: bool = False,
+    circumference_y: bool = True,
 ) -> GeometryData:
+    length_x = _validate_lattice_length("length_x", length_x)
+    length_y_value = _validate_length_y(length_y)
     bond_list: List[Bond] = []
     positions: List[np.ndarray] = []
     cell_indices: List[Tuple[int, int]] = []
     sublattice_indices: List[int] = []
-    n_sites = length_x * circumference_y
+    n_sites = length_x * length_y_value
     site_to_index: Dict[Tuple[int, int], int] = {}
 
     for x in range(length_x):
-        for y in snake_y_values(x, circumference_y):
+        for y in snake_y_values(x, length_y_value):
             site_to_index[(x, y)] = len(positions)
             positions.append(triangular_real_space_position(x, y))
             cell_indices.append((x, y))
@@ -879,24 +1778,27 @@ def build_triangular_cylinder_geometry(
         raise RuntimeError("Internal geometry error: triangular snake ordering generated wrong site count.")
 
     for x in range(length_x):
-        for y in range(circumference_y):
+        for y in range(length_y_value):
             i_site = site_to_index[(x, y)]
 
-            if x + 1 < length_x:
-                j_x = site_to_index[(x + 1, y)]
-                bond_list.append(Bond(i_site, j_x, "x"))
+            x_plus_1 = (x + 1) % length_x
+            if circumference_x or (x + 1 < length_x):
+                j_x = site_to_index[(x_plus_1, y)]
+                if j_x != i_site:
+                    bond_list.append(Bond(i_site, j_x, "x"))
 
-            y_plus_1 = (y + 1) % circumference_y
-            if periodic_y or (y + 1 < circumference_y):
+            y_plus_1 = (y + 1) % length_y_value
+            if circumference_y or (y + 1 < length_y_value):
                 j_y = site_to_index[(x, y_plus_1)]
                 if j_y != i_site:
                     bond_list.append(Bond(i_site, j_y, "y"))
 
-            if x + 1 < length_x:
-                y_minus_1 = (y - 1) % circumference_y
-                if periodic_y or (y - 1 >= 0):
-                    j_z = site_to_index[(x + 1, y_minus_1)]
-                    bond_list.append(Bond(i_site, j_z, "z"))
+            if circumference_x or (x + 1 < length_x):
+                y_minus_1 = (y - 1) % length_y_value
+                if circumference_y or (y - 1 >= 0):
+                    j_z = site_to_index[(x_plus_1, y_minus_1)]
+                    if j_z != i_site:
+                        bond_list.append(Bond(i_site, j_z, "z"))
 
     return GeometryData(
         number_of_sites=n_sites,
@@ -904,424 +1806,44 @@ def build_triangular_cylinder_geometry(
         positions=np.asarray(positions, dtype=float),
         cell_indices=cell_indices,
         sublattice_indices=sublattice_indices,
+        length_x=length_x,
+        length_y=length_y_value,
+        circumference_x=bool(circumference_x),
+        circumference_y=bool(circumference_y),
     )
 
 
 def build_lattice_geometry(
     lattice: str,
     length_x: int,
-    circumference_y: int,
-    periodic_y: bool = True,
+    *,
+    length_y: int,
+    circumference_x: bool = False,
+    circumference_y: bool = True,
 ) -> GeometryData:
     lattice_name = lattice.lower()
     if lattice_name == "honeycomb":
-        return build_honeycomb_cylinder_geometry(length_x, circumference_y, periodic_y)
+        return build_honeycomb_cylinder_geometry(
+            length_x,
+            length_y=length_y,
+            circumference_x=circumference_x,
+            circumference_y=circumference_y,
+        )
     if lattice_name == "square":
-        return build_square_cylinder_geometry(length_x, circumference_y, periodic_y)
+        return build_square_cylinder_geometry(
+            length_x,
+            length_y=length_y,
+            circumference_x=circumference_x,
+            circumference_y=circumference_y,
+        )
     if lattice_name == "triangular":
-        return build_triangular_cylinder_geometry(length_x, circumference_y, periodic_y)
+        return build_triangular_cylinder_geometry(
+            length_x,
+            length_y=length_y,
+            circumference_x=circumference_x,
+            circumference_y=circumference_y,
+        )
     raise ValueError(f"Unsupported lattice '{lattice}'. Choose from: honeycomb, square, triangular.")
-
-
-# ----------------------------------------------------------------------
-
-
-def kron_all(op_list: List[sparse.spmatrix]) -> sparse.spmatrix:
-    out = op_list[0]
-    for op in op_list[1:]:
-        out = sparse.kron(out, op, format="csr")
-    return out
-
-
-def build_global_operator_cache() -> Dict[str, sparse.spmatrix]:
-    default_spec = build_model_spec(
-        spin_rep=SPIN_REP,
-        orbital_rep=ORBITAL_REP,
-        model_family=MODEL_FAMILY,
-        ising_axis=ISING_AXIS,
-    )
-    ops = build_site_ops(default_spec)
-    return {name: sparse.csr_matrix(mat) for name, mat in ops.items()}
-
-
-def build_global_operator_cache_for_model(model_spec: ModelSpec) -> Dict[str, sparse.spmatrix]:
-    ops = build_site_ops(model_spec)
-    return {name: sparse.csr_matrix(mat) for name, mat in ops.items()}
-
-
-def build_exact_hamiltonian(
-    geometry: GeometryData,
-    model_spec: ModelSpec,
-    alpha: float,
-    beta: float,
-    coupling_j: float,
-    jx: float = 1.0,
-    jy: float = 1.0,
-    jz: float = 1.0,
-    external_field_terms: List[Tuple[float, str]] | None = None,
-    show_progress: bool = True,
-) -> sparse.spmatrix:
-    n_sites = geometry.number_of_sites
-    op_cache = build_global_operator_cache_for_model(model_spec)
-    ident = op_cache["Id"]
-    local_dim = int(ident.shape[0])
-    h_exact = sparse.csr_matrix((local_dim ** n_sites, local_dim ** n_sites), dtype=complex)
-
-    bond_terms: List[Tuple[Any, List[Tuple[complex, str]]]] = []
-    total_terms = 0
-    field_terms = list(external_field_terms or [])
-    for bond in geometry.bond_list:
-        terms = list(
-            model_terms_for_bond(
-                bond.gamma.lower(),
-                model_spec,
-                alpha,
-                beta,
-                coupling_j,
-                jx=jx,
-                jy=jy,
-                jz=jz,
-            )
-        )
-        bond_terms.append((bond, terms))
-        total_terms += len(terms)
-    total_terms += n_sites * len(field_terms)
-
-    bond_progress_bar = _make_progress_bar(
-        enabled=show_progress,
-        total=len(bond_terms),
-        desc="ED H bonds",
-        unit="bond",
-        leave=False,
-    )
-    term_progress_bar = _make_progress_bar(
-        enabled=show_progress,
-        total=total_terms,
-        desc="ED H terms",
-        unit="term",
-        leave=False,
-    )
-    for bond, terms in bond_terms:
-        i, j = bond.i, bond.j
-        for coeff, op_name in terms:
-            op_list = [ident] * n_sites
-            op_list[i] = op_cache[op_name]
-            op_list[j] = op_cache[op_name]
-            h_exact = h_exact + coeff * kron_all(op_list)
-            if term_progress_bar is not None:
-                term_progress_bar.update(1)
-        if bond_progress_bar is not None:
-            bond_progress_bar.update(1)
-
-    for site in range(n_sites):
-        for coeff, op_name in field_terms:
-            op_list = [ident] * n_sites
-            op_list[site] = op_cache[op_name]
-            h_exact = h_exact + coeff * kron_all(op_list)
-            if term_progress_bar is not None:
-                term_progress_bar.update(1)
-
-    if term_progress_bar is not None:
-        term_progress_bar.close()
-    if bond_progress_bar is not None:
-        bond_progress_bar.close()
-
-    return h_exact
-
-
-def run_small_cluster_exact_diagonalization(
-    geometry: GeometryData,
-    model_spec: ModelSpec,
-    alpha: float,
-    beta: float,
-    coupling_j: float,
-    jx: float = 1.0,
-    jy: float = 1.0,
-    jz: float = 1.0,
-    external_field_terms: List[Tuple[float, str]] | None = None,
-    show_progress: bool = True,
-) -> Tuple[float, np.ndarray]:
-    spectrum, eigenvectors = run_small_cluster_exact_spectrum(
-        geometry=geometry,
-        model_spec=model_spec,
-        alpha=alpha,
-        beta=beta,
-        coupling_j=coupling_j,
-        eigenstate_count=1,
-        jx=jx,
-        jy=jy,
-        jz=jz,
-        external_field_terms=external_field_terms,
-        show_progress=show_progress,
-    )
-    return float(spectrum["ground_state_energy"]), eigenvectors[:, 0]
-
-
-def run_small_cluster_exact_spectrum(
-    geometry: GeometryData,
-    model_spec: ModelSpec,
-    alpha: float,
-    beta: float,
-    coupling_j: float,
-    eigenstate_count: int = 2,
-    check_ground_state_degeneracy: bool = True,
-    jx: float = 1.0,
-    jy: float = 1.0,
-    jz: float = 1.0,
-    external_field_terms: List[Tuple[float, str]] | None = None,
-    show_progress: bool = True,
-    ground_manifold_abs_tol: float = 1e-12,
-    ground_manifold_rel_tol: float = 1e-12,
-) -> Tuple[Dict[str, Any], np.ndarray]:
-    stage_start = _start_stage("ED diagonalization", show_progress)
-    hamiltonian = build_exact_hamiltonian(
-        geometry,
-        model_spec,
-        alpha,
-        beta,
-        coupling_j,
-        jx=jx,
-        jy=jy,
-        jz=jz,
-        external_field_terms=external_field_terms,
-        show_progress=show_progress,
-    )
-    hilbert_dim = int(hamiltonian.shape[0])
-    requested_count = max(1, int(eigenstate_count))
-    solve_count = min(requested_count, hilbert_dim)
-    if show_progress:
-        print(
-            f"[ed] eigensolve started: dim={hamiltonian.shape[0]}, nnz={hamiltonian.nnz}, k={solve_count}"
-        )
-    if solve_count >= hilbert_dim - 1:
-        dense_hamiltonian = hamiltonian.toarray()
-        eigenvalues, eigenvectors = np.linalg.eigh(dense_hamiltonian)
-        eigenvalues = eigenvalues[:solve_count]
-        eigenvectors = eigenvectors[:, :solve_count]
-        solver_mode = "dense"
-    else:
-        eigenvalues, eigenvectors = sparse_linalg.eigsh(hamiltonian, k=solve_count, which="SA")
-        solver_mode = "sparse"
-    order = np.argsort(np.real(eigenvalues))
-    eigenvalues = np.asarray(np.real(eigenvalues[order]), dtype=float)
-    eigenvectors = np.asarray(eigenvectors[:, order], dtype=np.complex128)
-    _end_stage("ED diagonalization", stage_start, show_progress)
-    low_energy_resolution = resolve_low_energy_spectrum(
-        eigenvalues,
-        check_ground_state_degeneracy=bool(check_ground_state_degeneracy),
-        hilbert_dim=hilbert_dim,
-        degeneracy_tolerance_abs=float(ground_manifold_abs_tol),
-        degeneracy_tolerance_rel=float(ground_manifold_rel_tol),
-    )
-    e0 = float(low_energy_resolution["ground_state_energy"])
-    spectrum: Dict[str, Any] = {
-        "solver_mode": solver_mode,
-        "hilbert_dim": hilbert_dim,
-        "eigenstates_requested": requested_count,
-        "eigenstates_returned": int(eigenvalues.size),
-        "energies": [float(value) for value in eigenvalues],
-        "ground_state_energy": e0,
-        **low_energy_resolution,
-    }
-    return spectrum, eigenvectors
-
-
-def two_point_expectation_from_state(
-    state: np.ndarray,
-    op1_name: str,
-    i: int,
-    op2_name: str,
-    j: int,
-    n_sites: int,
-    op_cache: Dict[str, sparse.spmatrix],
-    ident: sparse.spmatrix,
-) -> complex:
-    op_list = [ident] * n_sites
-    op_list[i] = op_cache[op1_name]
-    op_list[j] = op_cache[op2_name]
-    op_ij = kron_all(op_list)
-    return complex(np.vdot(state, op_ij.dot(state)))
-
-
-def one_point_expectation_from_state(
-    state: np.ndarray,
-    op_name: str,
-    i: int,
-    n_sites: int,
-    op_cache: Dict[str, sparse.spmatrix],
-    ident: sparse.spmatrix,
-) -> complex:
-    op_list = [ident] * n_sites
-    op_list[i] = op_cache[op_name]
-    op_i = kron_all(op_list)
-    return complex(np.vdot(state, op_i.dot(state)))
-
-
-def collect_uniform_z_observables_from_ed_state(
-    geometry: GeometryData,
-    state: np.ndarray,
-    model_spec: ModelSpec,
-) -> Dict[str, float]:
-    n_sites = geometry.number_of_sites
-    op_cache = build_global_operator_cache_for_model(model_spec)
-    ident = op_cache["Id"]
-    spin_z = 0.0j
-    orbital_z = 0.0j
-    for site in range(n_sites):
-        spin_z += one_point_expectation_from_state(state, "Sz", site, n_sites, op_cache, ident)
-        orbital_z += one_point_expectation_from_state(state, "Tz", site, n_sites, op_cache, ident)
-    return {
-        "spin_z_per_site": float(np.real(spin_z) / n_sites),
-        "orbital_z_per_site": float(np.real(orbital_z) / n_sites),
-    }
-
-
-def collect_correlation_matrices_from_ed(
-    geometry: GeometryData,
-    state: np.ndarray,
-    model_spec: ModelSpec,
-    show_progress: bool = True,
-) -> Dict[str, np.ndarray]:
-    n_sites = geometry.number_of_sites
-    op_cache = build_global_operator_cache_for_model(model_spec)
-    ident = op_cache["Id"]
-    op_pairs = [
-        ("Sx", "Sx"), ("Sy", "Sy"), ("Sz", "Sz"),
-        ("Tx", "Tx"), ("Ty", "Ty"), ("Tz", "Tz"),
-        ("STx", "STx"), ("STy", "STy"), ("STz", "STz"),
-    ]
-    correlations = {f"{op1}_{op2}": np.zeros((n_sites, n_sites), dtype=complex) for op1, op2 in op_pairs}
-
-    pair_progress_bar = _make_progress_bar(
-        enabled=show_progress,
-        total=(n_sites * (n_sites - 1)) * len(op_pairs),
-        desc="ED correlations",
-        unit="pair",
-        leave=False,
-    )
-    row_progress_bar = _make_progress_bar(
-        enabled=show_progress,
-        total=n_sites,
-        desc="ED corr rows",
-        unit="row",
-        leave=False,
-    )
-    for i in range(n_sites):
-        for j in range(n_sites):
-            if i == j:
-                continue
-            for op1, op2 in op_pairs:
-                correlations[f"{op1}_{op2}"][i, j] = two_point_expectation_from_state(
-                    state, op1, i, op2, j, n_sites, op_cache, ident
-                )
-                if pair_progress_bar is not None:
-                    pair_progress_bar.update(1)
-        if row_progress_bar is not None:
-            row_progress_bar.update(1)
-
-    if pair_progress_bar is not None:
-        pair_progress_bar.close()
-    if row_progress_bar is not None:
-        row_progress_bar.close()
-
-    return correlations
-
-
-# ----------------------------------------------------------------------
-# Observables
-# ----------------------------------------------------------------------
-
-def build_spin_orbital_scalar_correlations(correlations: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-    scalar = {
-        "S": np.zeros_like(correlations["Sx_Sx"]),
-        "T": np.zeros_like(correlations["Tx_Tx"]),
-        "ST": np.zeros_like(correlations["STx_STx"]),
-    }
-    for gamma in ("x", "y", "z"):
-        scalar["S"] = scalar["S"] + correlations[f"S{gamma}_S{gamma}"]
-        scalar["T"] = scalar["T"] + correlations[f"T{gamma}_T{gamma}"]
-        scalar["ST"] = scalar["ST"] + correlations[f"ST{gamma}_ST{gamma}"]
-    return scalar
-
-
-def bond_energy_from_correlations(
-    i: int,
-    j: int,
-    gamma: str,
-    correlations: Dict[str, np.ndarray],
-    model_spec: ModelSpec,
-    alpha: float,
-    beta: float,
-    coupling_j: float,
-    jx: float = 1.0,
-    jy: float = 1.0,
-    jz: float = 1.0,
-) -> float:
-    e_bond = 0.0j
-    for coeff, op_name in model_terms_for_bond(
-        gamma,
-        model_spec,
-        alpha,
-        beta,
-        coupling_j,
-        jx=jx,
-        jy=jy,
-        jz=jz,
-    ):
-        key = f"{op_name}_{op_name}"
-        if key not in correlations:
-            raise KeyError(f"Missing correlation channel '{key}' required by current model.")
-        e_bond = e_bond + coeff * correlations[key][i, j]
-    return float(np.real(e_bond))
-
-
-def all_bond_energies(
-    geometry: GeometryData,
-    correlations: Dict[str, np.ndarray],
-    model_spec: ModelSpec,
-    alpha: float,
-    beta: float,
-    coupling_j: float,
-    jx: float = 1.0,
-    jy: float = 1.0,
-    jz: float = 1.0,
-    show_progress: bool = False,
-    progress_desc: str = "Bond energies",
-) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    progress_bar = _make_progress_bar(
-        enabled=show_progress,
-        total=len(geometry.bond_list),
-        desc=progress_desc,
-        unit="bond",
-        leave=False,
-    )
-    for bond in geometry.bond_list:
-        rows.append(
-            {
-                "i": bond.i,
-                "j": bond.j,
-                "gamma": bond.gamma,
-                "O_ij_gamma": bond_energy_from_correlations(
-                    bond.i,
-                    bond.j,
-                    bond.gamma,
-                    correlations,
-                    model_spec,
-                    alpha,
-                    beta,
-                    coupling_j,
-                    jx=jx,
-                    jy=jy,
-                    jz=jz,
-                ),
-            }
-        )
-        if progress_bar is not None:
-            progress_bar.update(1)
-    if progress_bar is not None:
-        progress_bar.close()
-    return rows
 
 
 def mps_path_quality(geometry: GeometryData) -> Dict[str, Any]:
@@ -1335,6 +1857,10 @@ def mps_path_quality(geometry: GeometryData) -> Dict[str, Any]:
     if len(geometry.bond_list) == 0:
         return {
             "ordering": "snake_x_alternating_y",
+            "boundary": {
+                "circumference_x": bool(getattr(geometry, "circumference_x", False)),
+                "circumference_y": bool(getattr(geometry, "circumference_y", True)),
+            },
             "bond_count": 0,
             "mean_index_span": 0.0,
             "median_index_span": 0.0,
@@ -1359,6 +1885,10 @@ def mps_path_quality(geometry: GeometryData) -> Dict[str, Any]:
 
     return {
         "ordering": "snake_x_alternating_y",
+        "boundary": {
+            "circumference_x": bool(getattr(geometry, "circumference_x", False)),
+            "circumference_y": bool(getattr(geometry, "circumference_y", True)),
+        },
         "bond_count": int(spans.size),
         "mean_index_span": float(np.mean(spans)),
         "median_index_span": float(np.median(spans)),
@@ -1424,17 +1954,20 @@ def geometry_size_filename_label(
     geometry: GeometryData,
     lattice: str,
     length_x: int,
-    circumference_y: int,
-    periodic_y: bool,
+    *,
+    length_y: int,
+    circumference_x: bool = False,
+    circumference_y: bool = True,
 ) -> str:
+    length_y_value = _validate_length_y(length_y)
     lattice_short = {
         "honeycomb": "hc",
         "square": "sq",
         "triangular": "tri",
     }.get(lattice.lower(), lattice.lower())
-    boundary = "pbcY" if periodic_y else "obcY"
+    boundary = f"{'pbcX' if circumference_x else 'obcX'}_{'pbcY' if circumference_y else 'obcY'}"
     return _safe_filename_token(
-        f"{lattice_short}_Lx{int(length_x)}_Cy{int(circumference_y)}_N{int(geometry.number_of_sites)}_{boundary}"
+        f"{lattice_short}_Lx{int(length_x)}_Ly{int(length_y_value)}_N{int(geometry.number_of_sites)}_{boundary}"
     )
 
 
@@ -1442,13 +1975,16 @@ def geometry_size_display_label(
     geometry: GeometryData,
     lattice: str,
     length_x: int,
-    circumference_y: int,
-    periodic_y: bool,
+    *,
+    length_y: int,
+    circumference_x: bool = False,
+    circumference_y: bool = True,
 ) -> str:
-    boundary = "PBC-y" if periodic_y else "OBC-y"
+    length_y_value = _validate_length_y(length_y)
+    boundary = f"{'PBC-x' if circumference_x else 'OBC-x'}, {'PBC-y' if circumference_y else 'OBC-y'}"
     return (
         f"{lattice_display_name(lattice)} Lx={int(length_x)}, "
-        f"Cy={int(circumference_y)}, N={int(geometry.number_of_sites)}, {boundary}"
+        f"Ly={int(length_y_value)}, N={int(geometry.number_of_sites)}, {boundary}"
     )
 
 
@@ -1457,11 +1993,14 @@ def run_output_prefix(
     geometry: GeometryData,
     lattice: str,
     length_x: int,
-    circumference_y: int,
-    periodic_y: bool,
+    *,
+    length_y: int,
+    circumference_x: bool = False,
+    circumference_y: bool = True,
 ) -> str:
     return _safe_filename_token(
-        f"{model_simplified_name(model_spec)}_{geometry_size_filename_label(geometry, lattice, length_x, circumference_y, periodic_y)}"
+        f"{model_simplified_name(model_spec)}_"
+        f"{geometry_size_filename_label(geometry, lattice, length_x, length_y=length_y, circumference_x=circumference_x, circumference_y=circumference_y)}"
     )
 
 
@@ -1470,12 +2009,14 @@ def run_title_label(
     geometry: GeometryData,
     lattice: str,
     length_x: int,
-    circumference_y: int,
-    periodic_y: bool,
+    *,
+    length_y: int,
+    circumference_x: bool = False,
+    circumference_y: bool = True,
 ) -> str:
     return (
         f"{model_display_short_name(model_spec)} | "
-        f"{geometry_size_display_label(geometry, lattice, length_x, circumference_y, periodic_y)}"
+        f"{geometry_size_display_label(geometry, lattice, length_x, length_y=length_y, circumference_x=circumference_x, circumference_y=circumference_y)}"
     )
 
 
@@ -1567,460 +2108,6 @@ def all_high_symmetry_structure_factors(
     if progress_bar is not None:
         progress_bar.close()
     return rows
-
-
-def finite_temperature_grid(
-    temperature_min: float,
-    temperature_max: float,
-    temperature_points: int,
-    temperature_scale: str = "log",
-) -> np.ndarray:
-    if float(temperature_min) <= 0.0:
-        raise ValueError("temperature_min must be positive for canonical finite-temperature ED.")
-    if float(temperature_max) < float(temperature_min):
-        raise ValueError("temperature_max must be >= temperature_min.")
-    points = int(temperature_points)
-    if points < 2:
-        raise ValueError("temperature_points must be at least 2.")
-    scale = str(temperature_scale).strip().lower()
-    if scale == "linear":
-        return np.linspace(float(temperature_min), float(temperature_max), points)
-    if scale == "log":
-        return np.geomspace(float(temperature_min), float(temperature_max), points)
-    raise ValueError("temperature_scale must be 'linear' or 'log'.")
-
-
-def _weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
-    return float(np.real(np.dot(weights, np.asarray(values, dtype=np.complex128))))
-
-
-def run_finite_temperature_ed(
-    geometry: GeometryData,
-    model_spec: ModelSpec,
-    alpha: float,
-    beta: float,
-    coupling_j: float,
-    *,
-    lattice: str,
-    temperature_min: float,
-    temperature_max: float,
-    temperature_points: int,
-    temperature_scale: str = "log",
-    max_eigenstates: int = 16,
-    full_spectrum_max_dim: int = 512,
-    jx: float = 1.0,
-    jy: float = 1.0,
-    jz: float = 1.0,
-    external_field_terms: List[Tuple[float, str]] | None = None,
-    show_progress: bool = True,
-    ground_manifold_abs_tol: float = 1e-12,
-    ground_manifold_rel_tol: float = 1e-12,
-) -> Dict[str, Any]:
-    """Compute finite-temperature ED observables from a full or low-energy spectrum.
-
-    Full spectra are exact but only feasible for tiny Hilbert spaces. Larger
-    allowed ED clusters use the lowest ``max_eigenstates`` eigenpairs, which is
-    useful for low-temperature trends and is recorded as truncated in metadata.
-    """
-    n_sites = int(geometry.number_of_sites)
-    temperatures = finite_temperature_grid(
-        temperature_min=temperature_min,
-        temperature_max=temperature_max,
-        temperature_points=temperature_points,
-        temperature_scale=temperature_scale,
-    )
-
-    stage_start = _start_stage("Finite-temperature ED", show_progress)
-    hamiltonian = build_exact_hamiltonian(
-        geometry,
-        model_spec,
-        alpha,
-        beta,
-        coupling_j,
-        jx=jx,
-        jy=jy,
-        jz=jz,
-        external_field_terms=external_field_terms,
-        show_progress=show_progress,
-    )
-    hilbert_dim = int(hamiltonian.shape[0])
-    if hilbert_dim <= int(full_spectrum_max_dim):
-        if show_progress:
-            print(f"[thermal-ed] dense full diagonalization started: dim={hilbert_dim}")
-        dense_hamiltonian = hamiltonian.toarray()
-        eigenvalues, eigenvectors = np.linalg.eigh(dense_hamiltonian)
-        spectrum_mode = "full"
-        full_spectrum = True
-    else:
-        eigenstate_count = max(1, min(int(max_eigenstates), hilbert_dim - 2))
-        if show_progress:
-            print(
-                "[thermal-ed] sparse low-energy eigensolve started: "
-                f"dim={hilbert_dim}, nnz={hamiltonian.nnz}, k={eigenstate_count}"
-            )
-        eigenvalues, eigenvectors = sparse_linalg.eigsh(
-            hamiltonian,
-            k=eigenstate_count,
-            which="SA",
-        )
-        spectrum_mode = "low_energy_truncated"
-        full_spectrum = False
-
-    order = np.argsort(np.real(eigenvalues))
-    eigenvalues = np.asarray(np.real(eigenvalues[order]), dtype=float)
-    eigenvectors = np.asarray(eigenvectors[:, order], dtype=np.complex128)
-    eigenstate_count = int(eigenvalues.size)
-
-    state_rows: List[Dict[str, Any]] = []
-    state_progress_bar = _make_progress_bar(
-        enabled=show_progress,
-        total=eigenstate_count,
-        desc="Thermal ED states",
-        unit="state",
-        leave=False,
-    )
-    for state_index in range(eigenstate_count):
-        state = eigenvectors[:, state_index]
-        correlations = collect_correlation_matrices_from_ed(
-            geometry,
-            state,
-            model_spec=model_spec,
-            show_progress=False,
-        )
-        scalar_correlations = build_spin_orbital_scalar_correlations(correlations)
-        structure_rows = all_high_symmetry_structure_factors(
-            scalar_correlations,
-            geometry,
-            lattice=lattice,
-            show_progress=False,
-        )
-        bond_rows = all_bond_energies(
-            geometry,
-            correlations,
-            model_spec,
-            alpha,
-            beta,
-            coupling_j,
-            jx=jx,
-            jy=jy,
-            jz=jz,
-            show_progress=False,
-        )
-        if len(geometry.bond_list) > 0:
-            nn_s = float(
-                np.mean([np.real(scalar_correlations["S"][bond.i, bond.j]) for bond in geometry.bond_list])
-            )
-            nn_t = float(
-                np.mean([np.real(scalar_correlations["T"][bond.i, bond.j]) for bond in geometry.bond_list])
-            )
-            nn_st = float(
-                np.mean([np.real(scalar_correlations["ST"][bond.i, bond.j]) for bond in geometry.bond_list])
-            )
-        else:
-            nn_s = 0.0
-            nn_t = 0.0
-            nn_st = 0.0
-        uniform_z = collect_uniform_z_observables_from_ed_state(geometry, state, model_spec)
-        state_rows.append(
-            {
-                "state_index": int(state_index),
-                "energy": float(eigenvalues[state_index]),
-                "spin_z_per_site": float(uniform_z["spin_z_per_site"]),
-                "orbital_z_per_site": float(uniform_z["orbital_z_per_site"]),
-                "nearest_neighbor_S": nn_s,
-                "nearest_neighbor_T": nn_t,
-                "nearest_neighbor_ST": nn_st,
-                "bond_energy_per_site": float(
-                    np.sum([float(row["O_ij_gamma"]) for row in bond_rows]) / float(max(1, n_sites))
-                ),
-                "structure_factors": structure_rows,
-            }
-        )
-        if state_progress_bar is not None:
-            state_progress_bar.update(1)
-    if state_progress_bar is not None:
-        state_progress_bar.close()
-
-    state_arrays = {
-        key: np.asarray([float(row[key]) for row in state_rows], dtype=float)
-        for key in (
-            "spin_z_per_site",
-            "orbital_z_per_site",
-            "nearest_neighbor_S",
-            "nearest_neighbor_T",
-            "nearest_neighbor_ST",
-            "bond_energy_per_site",
-        )
-    }
-    sf_labels = [row["Q_label"] for row in state_rows[0]["structure_factors"]] if state_rows else []
-    sf_channels = ("S(Q)", "T(Q)", "ST(Q)")
-
-    observables: List[Dict[str, Any]] = []
-    correlation_rows: List[Dict[str, Any]] = []
-    structure_rows_by_temperature: List[Dict[str, Any]] = []
-    e0 = float(eigenvalues[0])
-    shifted_energies = eigenvalues - e0
-    for temperature in temperatures:
-        t_value = float(temperature)
-        weights_raw = np.exp(-shifted_energies / t_value)
-        partition_shifted = float(np.sum(weights_raw))
-        weights = weights_raw / partition_shifted
-        energy = _weighted_mean(eigenvalues, weights)
-        energy2 = _weighted_mean(eigenvalues * eigenvalues, weights)
-        heat_capacity = max(0.0, (energy2 - energy * energy) / (t_value * t_value * n_sites))
-        entropy = float(np.log(partition_shifted) + (energy - e0) / t_value)
-        free_energy = float(e0 - t_value * np.log(partition_shifted))
-
-        observables.append(
-            {
-                "T": t_value,
-                "energy": energy,
-                "energy_per_site": float(energy / n_sites),
-                "free_energy_per_site": float(free_energy / n_sites),
-                "entropy_per_site": float(entropy / n_sites),
-                "specific_heat_per_site": float(heat_capacity),
-                "spin_z_per_site": _weighted_mean(state_arrays["spin_z_per_site"], weights),
-                "orbital_z_per_site": _weighted_mean(state_arrays["orbital_z_per_site"], weights),
-                "partition_function_shifted": partition_shifted,
-            }
-        )
-        correlation_rows.append(
-            {
-                "T": t_value,
-                "nearest_neighbor_S": _weighted_mean(state_arrays["nearest_neighbor_S"], weights),
-                "nearest_neighbor_T": _weighted_mean(state_arrays["nearest_neighbor_T"], weights),
-                "nearest_neighbor_ST": _weighted_mean(state_arrays["nearest_neighbor_ST"], weights),
-                "bond_energy_per_site": _weighted_mean(state_arrays["bond_energy_per_site"], weights),
-            }
-        )
-        for q_index, q_label in enumerate(sf_labels):
-            row: Dict[str, Any] = {"T": t_value, "Q_label": q_label}
-            for channel in sf_channels:
-                values = np.asarray(
-                    [float(state_row["structure_factors"][q_index][channel]) for state_row in state_rows],
-                    dtype=float,
-                )
-                row[channel] = _weighted_mean(values, weights)
-            structure_rows_by_temperature.append(row)
-
-    low_energy_resolution = resolve_low_energy_spectrum(
-        eigenvalues,
-        check_ground_state_degeneracy=True,
-        hilbert_dim=hilbert_dim,
-        degeneracy_tolerance_abs=float(ground_manifold_abs_tol),
-        degeneracy_tolerance_rel=float(ground_manifold_rel_tol),
-    )
-    degeneracy_tolerance = float(low_energy_resolution["ground_state_degeneracy_tolerance"])
-    ground_indices = np.asarray(
-        low_energy_resolution.get("ground_state_indices", [0]),
-        dtype=int,
-    )
-    if ground_indices.size == 0:
-        ground_indices = np.asarray([0], dtype=int)
-    first_excited_energy = low_energy_resolution.get("first_excited_energy")
-    spectral_gap = low_energy_resolution.get("spectral_gap")
-    gap_above_ground_manifold = low_energy_resolution.get("gap_above_ground_manifold")
-
-    def _ground_average(key: str) -> float:
-        return float(np.mean([float(state_rows[int(index)][key]) for index in ground_indices]))
-
-    ground_observables = {
-        "T": 0.0,
-        "energy": e0,
-        "energy_per_site": float(e0 / n_sites),
-        "spin_z_per_site": _ground_average("spin_z_per_site"),
-        "orbital_z_per_site": _ground_average("orbital_z_per_site"),
-    }
-    ground_correlations = {
-        "T": 0.0,
-        "nearest_neighbor_S": _ground_average("nearest_neighbor_S"),
-        "nearest_neighbor_T": _ground_average("nearest_neighbor_T"),
-        "nearest_neighbor_ST": _ground_average("nearest_neighbor_ST"),
-        "bond_energy_per_site": _ground_average("bond_energy_per_site"),
-    }
-    ground_structure_rows: List[Dict[str, Any]] = []
-    if state_rows:
-        for q_index, q_label in enumerate(sf_labels):
-            row: Dict[str, Any] = {"T": 0.0, "Q_label": q_label}
-            for channel in sf_channels:
-                row[channel] = float(
-                    np.mean(
-                        [
-                            float(state_rows[int(index)]["structure_factors"][q_index][channel])
-                            for index in ground_indices
-                        ]
-                    )
-                )
-            first_state_row = state_rows[0]["structure_factors"][q_index]
-            if "Qx" in first_state_row:
-                row["Qx"] = float(first_state_row["Qx"])
-            if "Qy" in first_state_row:
-                row["Qy"] = float(first_state_row["Qy"])
-            ground_structure_rows.append(row)
-
-    t_min = float(temperatures[0])
-    weights_raw_min = np.exp(-shifted_energies / t_min)
-    weights_min = weights_raw_min / float(np.sum(weights_raw_min))
-    ground_weight_min = float(np.sum(weights_min[ground_indices]))
-    first_observable_row = observables[0] if observables else {}
-    first_correlation_row = correlation_rows[0] if correlation_rows else {}
-    first_structure_rows = {
-        str(row.get("Q_label")): row
-        for row in structure_rows_by_temperature
-        if abs(float(row.get("T", np.nan)) - t_min) <= 1e-14
-    }
-
-    observable_diffs: Dict[str, Dict[str, float]] = {}
-    for key, target in ground_observables.items():
-        if key == "T" or key not in first_observable_row:
-            continue
-        actual = float(first_observable_row[key])
-        observable_diffs[key] = {
-            "T_min": actual,
-            "ground_limit": float(target),
-            "abs_difference": float(abs(actual - float(target))),
-        }
-    correlation_diffs: Dict[str, Dict[str, float]] = {}
-    for key, target in ground_correlations.items():
-        if key == "T" or key not in first_correlation_row:
-            continue
-        actual = float(first_correlation_row[key])
-        correlation_diffs[key] = {
-            "T_min": actual,
-            "ground_limit": float(target),
-            "abs_difference": float(abs(actual - float(target))),
-        }
-    structure_diffs: List[Dict[str, Any]] = []
-    for ground_row in ground_structure_rows:
-        q_label = str(ground_row["Q_label"])
-        t_row = first_structure_rows.get(q_label, {})
-        for channel in sf_channels:
-            if channel not in t_row:
-                continue
-            actual = float(t_row[channel])
-            target = float(ground_row[channel])
-            structure_diffs.append(
-                {
-                    "Q_label": q_label,
-                    "channel": channel,
-                    "T_min": actual,
-                    "ground_limit": target,
-                    "abs_difference": float(abs(actual - target)),
-                }
-            )
-    max_observable_diff = max(
-        [item["abs_difference"] for item in observable_diffs.values()] or [0.0]
-    )
-    max_correlation_diff = max(
-        [item["abs_difference"] for item in correlation_diffs.values()] or [0.0]
-    )
-    max_structure_diff = max(
-        [item["abs_difference"] for item in structure_diffs] or [0.0]
-    )
-    t_min_over_gap = (
-        float(t_min / gap_above_ground_manifold)
-        if gap_above_ground_manifold is not None and gap_above_ground_manifold > 0.0
-        else None
-    )
-    ground_limit_abs_tolerance = 1e-5
-    if (
-        ground_weight_min >= 0.99
-        and max(max_observable_diff, max_correlation_diff, max_structure_diff) <= ground_limit_abs_tolerance
-    ):
-        ground_limit_status = "passed"
-    elif t_min_over_gap is not None and t_min_over_gap >= 0.1:
-        ground_limit_status = "temperature_min_not_below_gap"
-    else:
-        ground_limit_status = "not_at_ground_limit"
-
-    _end_stage("Finite-temperature ED", stage_start, show_progress)
-    return {
-        "spectrum": {
-            "mode": spectrum_mode,
-            "full_spectrum": bool(full_spectrum),
-            "hilbert_dim": hilbert_dim,
-            "eigenstates_used": eigenstate_count,
-            "ground_state_energy": e0,
-            "first_excited_energy": first_excited_energy,
-            "spectral_gap": spectral_gap,
-            "ground_manifold_degeneracy": int(
-                low_energy_resolution.get("ground_state_degeneracy", ground_indices.size)
-            ),
-            "ground_manifold_tolerance": float(degeneracy_tolerance),
-            "ground_manifold_absolute_tolerance": float(
-                low_energy_resolution.get(
-                    "ground_state_degeneracy_absolute_tolerance",
-                    ground_manifold_abs_tol,
-                )
-            ),
-            "ground_manifold_relative_tolerance": float(
-                low_energy_resolution.get(
-                    "ground_state_degeneracy_relative_tolerance",
-                    ground_manifold_rel_tol,
-                )
-            ),
-            "gap_above_ground_manifold": gap_above_ground_manifold,
-            "low_energy_resolution": low_energy_resolution,
-            "highest_included_energy": float(eigenvalues[-1]),
-            "included_eigenvalues": [float(value) for value in eigenvalues],
-            "truncated_spectrum_may_miss_degenerate_ground_states": bool(
-                (not full_spectrum) and abs(float(eigenvalues[-1] - e0)) <= degeneracy_tolerance
-            ),
-            "note": (
-                "Exact canonical trace over the full spectrum."
-                if full_spectrum
-                else (
-                    "Low-energy truncated canonical trace. Treat high-temperature "
-                    "values as qualitative unless max_eigenstates spans the relevant spectrum."
-                )
-            ),
-        },
-        "ground_state_limit_check": {
-            "status": ground_limit_status,
-            "temperature_min": t_min,
-            "ground_manifold_boltzmann_weight_at_temperature_min": ground_weight_min,
-            "temperature_min_over_gap_above_ground_manifold": t_min_over_gap,
-            "max_observable_abs_difference": float(max_observable_diff),
-            "max_correlation_abs_difference": float(max_correlation_diff),
-            "max_structure_factor_abs_difference": float(max_structure_diff),
-            "abs_difference_tolerance": float(ground_limit_abs_tolerance),
-            "observable_differences": observable_diffs,
-            "correlation_differences": correlation_diffs,
-            "structure_factor_differences": structure_diffs,
-            "structure_factor_definition": {
-                "onsite_i_equals_j_terms_included": False,
-                "note": (
-                    "ED and DMRG structure factors in this driver are built from correlation "
-                    "matrices whose diagonal entries are left at zero, so T-independent onsite "
-                    "terms are not the source of flat curves here."
-                ),
-            },
-        },
-        "zero_temperature_references": {
-            "ED-GS": {
-                "method": "ED-GS",
-                "temperature": 0.0,
-                "note": (
-                    "Canonical T->0 ED reference. If the ground state is degenerate, this is "
-                    "the equal-weight average over the resolved ground manifold."
-                ),
-                "observables": ground_observables,
-                "correlations": ground_correlations,
-                "structure_factors": ground_structure_rows,
-            }
-        },
-        "temperature_grid": {
-            "min": float(temperature_min),
-            "max": float(temperature_max),
-            "points": int(temperature_points),
-            "scale": str(temperature_scale).strip().lower(),
-            "values": [float(value) for value in temperatures],
-        },
-        "observables": observables,
-        "correlations": correlation_rows,
-        "structure_factors": structure_rows_by_temperature,
-        "state_observables": state_rows,
-    }
 
 
 # ----------------------------------------------------------------------

@@ -1,0 +1,1003 @@
+{
+  "active_resource_settings": {
+    "ed": {
+      "max_eigenstates": 6,
+      "max_hilbert_dim": 5000000,
+      "max_sites": 16,
+      "run": true,
+      "solver": "sparse",
+      "sparse_maxiter": 0,
+      "sparse_tol": 0.0
+    },
+    "finite_dmrg": {
+      "max_bond_dimension": 64,
+      "max_sites": 18,
+      "max_sweeps": 10
+    },
+    "finite_temperature_ed": {
+      "full_spectrum_max_dim": 512,
+      "max_eigenstates": 12,
+      "max_hilbert_dim": 5000000,
+      "max_sites": 16,
+      "run": true,
+      "temperature_max": 2.0,
+      "temperature_min": 0.05,
+      "temperature_points": 32,
+      "temperature_scale": "log"
+    },
+    "geometry": {
+      "circumference_y": 2,
+      "lattice_type": "honeycomb",
+      "length_x": 2,
+      "periodic_around_cylinder": true
+    },
+    "idmrg": {
+      "bulk_kind": "auto",
+      "max_bond_dimension": 32,
+      "max_iterations": 10,
+      "max_local_dim": 16,
+      "run": true
+    }
+  },
+  "external_field": {
+    "active": false,
+    "axis": "111",
+    "field_sign": 1.0,
+    "field_vector_hx_hy_hz": [
+      0.5773502691896258,
+      0.5773502691896258,
+      0.5773502691896258
+    ],
+    "formula": "H_Z = field_sign * mu_B * sigma_factor * sum_i (hx*Sx_i + hy*Sy_i + hz*Sz_i); orbital Zeeman coupling is omitted because eg L=0.",
+    "hamiltonian_field_terms": [],
+    "model_insertion": "off or zero field",
+    "mu_B": 1.0,
+    "perturbative_assumption": "vison gap finite; field treated outside the unperturbed bond Hamiltonian unless treatment=hamiltonian",
+    "sigma_factor": 2.0,
+    "treatment": "off"
+  },
+  "geometry": {
+    "lattice": "honeycomb",
+    "mps_path": {
+      "bond_count": 10,
+      "by_gamma": {
+        "x": {
+          "bond_count": 2,
+          "max_index_span": 7,
+          "mean_index_span": 5.0
+        },
+        "y": {
+          "bond_count": 4,
+          "max_index_span": 3,
+          "mean_index_span": 2.0
+        },
+        "z": {
+          "bond_count": 4,
+          "max_index_span": 1,
+          "mean_index_span": 1.0
+        }
+      },
+      "max_index_span": 7,
+      "mean_index_span": 2.2,
+      "median_index_span": 1.0,
+      "ordering": "snake_x_alternating_y",
+      "p90_index_span": 3.3999999999999986
+    },
+    "number_of_bonds": 10,
+    "number_of_sites": 8
+  },
+  "model_construction_annotations": {
+    "external_field": {
+      "active": false,
+      "axis": "111",
+      "field_sign": 1.0,
+      "field_vector_hx_hy_hz": [
+        0.5773502691896258,
+        0.5773502691896258,
+        0.5773502691896258
+      ],
+      "formula": "H_Z = field_sign * mu_B * sigma_factor * sum_i (hx*Sx_i + hy*Sy_i + hz*Sz_i); orbital Zeeman coupling is omitted because eg L=0.",
+      "hamiltonian_field_terms": [],
+      "model_insertion": "off or zero field",
+      "mu_B": 1.0,
+      "perturbative_assumption": "vison gap finite; field treated outside the unperturbed bond Hamiltonian unless treatment=hamiltonian",
+      "sigma_factor": 2.0,
+      "treatment": "off"
+    },
+    "phase_scan": {
+      "alpha_points": 17,
+      "beta_points": 13,
+      "classical_restarts": 6,
+      "classical_sweeps": 320,
+      "classifier_thresholds": {
+        "classical_bond_nematicity": 0.08,
+        "classical_weak_order": 0.075,
+        "plaquette_flux_target": 1.0,
+        "plaquette_flux_tolerance": 0.15,
+        "quantum_bond_nematicity": 0.1,
+        "quantum_weak_order": 0.035
+      },
+      "dmrg_backend": "tenpy",
+      "dmrg_effective_symmetry_mode": "u1_sz",
+      "mode": "quantum",
+      "note": "Phase-scan mode chooses quantum, classical, or both. Quantum methods choose ED, finite-DMRG, iDMRG, or all quantum outputs.",
+      "phase_diagram_enabled": false,
+      "quantum_ed_max_hilbert_dimension": 5000000,
+      "quantum_ed_max_sites": 16,
+      "quantum_ed_solver": "sparse",
+      "quantum_ed_sparse_maxiter": null,
+      "quantum_ed_sparse_tol": 0.0,
+      "quantum_ed_use_sz_block": true,
+      "quantum_methods": [
+        "idmrg"
+      ],
+      "selected_outputs": [
+        "idmrg"
+      ],
+      "symmetry_reductions": {
+        "legacy_tenax_mode": "u1_sz",
+        "momentum_block": 0,
+        "momentum_x_block": 0,
+        "momentum_y_block": 0,
+        "reflection_block": 0,
+        "requested_reductions": [
+          "sz",
+          "z2"
+        ],
+        "source": "shared_symmetry_reductions",
+        "target_sz2": 0,
+        "target_tz2": 0,
+        "use_reflection_block": false,
+        "use_sz_block": true,
+        "use_tau_z_block": false,
+        "use_translation_block": false,
+        "use_translation_x_block": false,
+        "use_translation_y_block": false,
+        "use_z2_block": true,
+        "z2_target_parity": 0
+      }
+    },
+    "quspin_ed": {
+      "note": "QuSpin consumes the same shared symmetry reductions as standard ED and phase scans when implemented.",
+      "settings": {
+        "check_hermiticity": true,
+        "check_particle_conservation": false,
+        "check_symmetries": false,
+        "symmetry_reductions": {
+          "legacy_tenax_mode": "u1_sz",
+          "momentum_block": 0,
+          "momentum_x_block": 0,
+          "momentum_y_block": 0,
+          "reflection_block": 0,
+          "requested_reductions": [
+            "sz",
+            "z2"
+          ],
+          "source": "shared_symmetry_reductions",
+          "target_sz2": 0,
+          "target_tz2": 0,
+          "use_reflection_block": false,
+          "use_sz_block": true,
+          "use_tau_z_block": false,
+          "use_translation_block": false,
+          "use_translation_x_block": false,
+          "use_translation_y_block": false,
+          "use_z2_block": true,
+          "z2_target_parity": 0
+        }
+      }
+    },
+    "symmetry": {
+      "allow_dense_fallback": true,
+      "applied_reductions": {
+        "legacy_tenax_mode": "u1_sz",
+        "momentum_block": 0,
+        "momentum_x_block": 0,
+        "momentum_y_block": 0,
+        "reflection_block": 0,
+        "requested_reductions": [
+          "sz",
+          "z2"
+        ],
+        "source": "shared_symmetry_reductions",
+        "target_sz2": 0,
+        "target_tz2": 0,
+        "use_reflection_block": false,
+        "use_sz_block": true,
+        "use_tau_z_block": false,
+        "use_translation_block": false,
+        "use_translation_x_block": false,
+        "use_translation_y_block": false,
+        "use_z2_block": true,
+        "z2_target_parity": 0
+      },
+      "effective_mode_for_tenax": "u1_sz",
+      "precheck": {
+        "effective_mode_for_tenax": "u1_sz",
+        "effective_reductions": {
+          "sz": true,
+          "tz": false,
+          "z2": true
+        },
+        "recommendation_reason": "u1_sz is conserved, its requested target sector is reachable, and Tenax can use it for U1 block-sparse simplification.",
+        "recommended_mode_for_tenax": "u1_sz",
+        "requested_backend_supported_for_simplification": true,
+        "requested_mode": "u1_sz",
+        "requested_physical_symmetry_valid": true,
+        "requested_reductions": [
+          "sz",
+          "z2"
+        ],
+        "status": "completed",
+        "strict_precheck_failures": [],
+        "u1": {
+          "backend_supported_for_simplification": false,
+          "basis_charge_table": [
+            {
+              "Sz_times_2": -1,
+              "Tz_times_2": -1,
+              "basis": "|Sz=-0.5,Tz=-0.5>",
+              "encoded_u1_charge": -4097,
+              "u1_charge_encoding": "q = 4096*(2*Sz) + (2*Tz)",
+              "u1_sz_charge": -1,
+              "u1_tz_charge": -1
+            },
+            {
+              "Sz_times_2": -1,
+              "Tz_times_2": 1,
+              "basis": "|Sz=-0.5,Tz=+0.5>",
+              "encoded_u1_charge": -4095,
+              "u1_charge_encoding": "q = 4096*(2*Sz) + (2*Tz)",
+              "u1_sz_charge": -1,
+              "u1_tz_charge": 1
+            },
+            {
+              "Sz_times_2": 1,
+              "Tz_times_2": -1,
+              "basis": "|Sz=+0.5,Tz=-0.5>",
+              "encoded_u1_charge": 4095,
+              "u1_charge_encoding": "q = 4096*(2*Sz) + (2*Tz)",
+              "u1_sz_charge": 1,
+              "u1_tz_charge": -1
+            },
+            {
+              "Sz_times_2": 1,
+              "Tz_times_2": 1,
+              "basis": "|Sz=+0.5,Tz=+0.5>",
+              "encoded_u1_charge": 4097,
+              "u1_charge_encoding": "q = 4096*(2*Sz) + (2*Tz)",
+              "u1_sz_charge": 1,
+              "u1_tz_charge": 1
+            }
+          ],
+          "charge_encoding": {
+            "U1_CHARGE_TZ_STRIDE": 4096,
+            "formula": "q = U1_CHARGE_TZ_STRIDE * (2*Sz) + (2*Tz)",
+            "reason": "Tenax AutoMPO computes U1 operator charge by raw integer differences; packed ProductSymmetry charges are not additive under that operation.",
+            "scheme": "additive_integer_pair"
+          },
+          "checked_term_count": 118,
+          "conserved": false,
+          "conserved_total_Sz_and_total_Tz": false,
+          "issues": [
+            {
+              "error": "Found non-charge-conserving term for strict U1 build: (-0.125, 'Tp', 0, 'Tp', 3) (net charge transfer=-4).",
+              "kind": "term_not_conserved",
+              "term": [
+                "-0.125",
+                "Tp",
+                "0",
+                "Tp",
+                "3"
+              ]
+            },
+            {
+              "error": "Found non-charge-conserving term for strict U1 build: (-0.125, 'Tm', 0, 'Tm', 3) (net charge transfer=4).",
+              "kind": "term_not_conserved",
+              "term": [
+                "-0.125",
+                "Tm",
+                "0",
+                "Tm",
+                "3"
+              ]
+            },
+            {
+              "error": "Found non-charge-conserving term for strict U1 build: (-0.125, 'SpTp', 0, 'SmTp', 3) (net charge transfer=-4).",
+              "kind": "term_not_conserved",
+              "term": [
+                "-0.125",
+                "SpTp",
+                "0",
+                "SmTp",
+                "3"
+              ]
+            },
+            {
+              "error": "Found non-charge-conserving term for strict U1 build: (-0.125, 'SpTm', 0, 'SmTm', 3) (net charge transfer=4).",
+              "kind": "term_not_conserved",
+              "term": [
+                "-0.125",
+                "SpTm",
+                "0",
+                "SmTm",
+                "3"
+              ]
+            },
+            {
+              "error": "Found non-charge-conserving term for strict U1 build: (-0.125, 'SmTp', 0, 'SpTp', 3) (net charge transfer=-4).",
+              "kind": "term_not_conserved",
+              "term": [
+                "-0.125",
+                "SmTp",
+                "0",
+                "SpTp",
+                "3"
+              ]
+            },
+            {
+              "error": "Found non-charge-conserving term for strict U1 build: (-0.125, 'SmTm', 0, 'SpTm', 3) (net charge transfer=4).",
+              "kind": "term_not_conserved",
+              "term": [
+                "-0.125",
+                "SmTm",
+                "0",
+                "SpTm",
+                "3"
+              ]
+            },
+            {
+              "error": "Found non-charge-conserving term for strict U1 build: (-0.25, 'SzTp', 0, 'SzTp', 3) (net charge transfer=-4).",
+              "kind": "term_not_conserved",
+              "term": [
+                "-0.25",
+                "SzTp",
+                "0",
+                "SzTp",
+                "3"
+              ]
+            },
+            {
+              "error": "Found non-charge-conserving term for strict U1 build: (-0.25, 'SzTm', 0, 'SzTm', 3) (net charge transfer=4).",
+              "kind": "term_not_conserved",
+              "term": [
+                "-0.25",
+                "SzTm",
+                "0",
+                "SzTm",
+                "3"
+              ]
+            },
+            {
+              "error": "Operator 'Tx' in term (0.5, 'Tx', 0, 'Tx', 7) is not compatible with strict U1 symmetry. Use a symmetry-adapted operator pair, switch to symmetry_mode=z2/none, or choose a U1-conserving model.",
+              "kind": "term_not_conserved",
+              "term": [
+                "0.5",
+                "Tx",
+                "0",
+                "Tx",
+                "7"
+              ]
+            },
+            {
+              "error": "Operator 'SpTx' in term (0.5, 'SpTx', 0, 'SmTx', 7) is not compatible with strict U1 symmetry. Use a symmetry-adapted operator pair, switch to symmetry_mode=z2/none, or choose a U1-conserving model.",
+              "kind": "term_not_conserved",
+              "term": [
+                "0.5",
+                "SpTx",
+                "0",
+                "SmTx",
+                "7"
+              ]
+            },
+            {
+              "error": "Operator 'SmTx' in term (0.5, 'SmTx', 0, 'SpTx', 7) is not compatible with strict U1 symmetry. Use a symmetry-adapted operator pair, switch to symmetry_mode=z2/none, or choose a U1-conserving model.",
+              "kind": "term_not_conserved",
+              "term": [
+                "0.5",
+                "SmTx",
+                "0",
+                "SpTx",
+                "7"
+              ]
+            },
+            {
+              "error": "Operator 'SzTx' in term (1.0, 'SzTx', 0, 'SzTx', 7) is not compatible with strict U1 symmetry. Use a symmetry-adapted operator pair, switch to symmetry_mode=z2/none, or choose a U1-conserving model.",
+              "kind": "term_not_conserved",
+              "term": [
+                "1.0",
+                "SzTx",
+                "0",
+                "SzTx",
+                "7"
+              ]
+            }
+          ],
+          "mode": "u1",
+          "note": "U1 here means simultaneous conservation of total Sz and orbital tau_z/Tz. Both spin and orbital transverse terms must be U1-paired.",
+          "reachable_total_Sz_times_2": [
+            -8,
+            -6,
+            -4,
+            -2,
+            0,
+            2,
+            4,
+            6,
+            8
+          ],
+          "reachable_total_Tz_times_2": [
+            -8,
+            -6,
+            -4,
+            -2,
+            0,
+            2,
+            4,
+            6,
+            8
+          ],
+          "target_sector": {
+            "encoded_charge": 0,
+            "mode": "u1",
+            "reachable": true,
+            "target_charge": 0,
+            "total_Sz_times_2": 0,
+            "total_Tz_times_2": 0
+          }
+        },
+        "u1_sz": {
+          "backend_supported_for_simplification": true,
+          "basis_charge_table": [
+            {
+              "Sz_times_2": -1,
+              "Tz_times_2": -1,
+              "basis": "|Sz=-0.5,Tz=-0.5>",
+              "encoded_u1_charge": -4097,
+              "u1_charge_encoding": "q = 4096*(2*Sz) + (2*Tz)",
+              "u1_sz_charge": -1,
+              "u1_tz_charge": -1
+            },
+            {
+              "Sz_times_2": -1,
+              "Tz_times_2": 1,
+              "basis": "|Sz=-0.5,Tz=+0.5>",
+              "encoded_u1_charge": -4095,
+              "u1_charge_encoding": "q = 4096*(2*Sz) + (2*Tz)",
+              "u1_sz_charge": -1,
+              "u1_tz_charge": 1
+            },
+            {
+              "Sz_times_2": 1,
+              "Tz_times_2": -1,
+              "basis": "|Sz=+0.5,Tz=-0.5>",
+              "encoded_u1_charge": 4095,
+              "u1_charge_encoding": "q = 4096*(2*Sz) + (2*Tz)",
+              "u1_sz_charge": 1,
+              "u1_tz_charge": -1
+            },
+            {
+              "Sz_times_2": 1,
+              "Tz_times_2": 1,
+              "basis": "|Sz=+0.5,Tz=+0.5>",
+              "encoded_u1_charge": 4097,
+              "u1_charge_encoding": "q = 4096*(2*Sz) + (2*Tz)",
+              "u1_sz_charge": 1,
+              "u1_tz_charge": 1
+            }
+          ],
+          "charge_encoding": {
+            "formula": "q = 2*Sz",
+            "scheme": "single_integer_charge"
+          },
+          "checked_term_count": 118,
+          "conserved": true,
+          "conserved_total_Sz": true,
+          "issues": [],
+          "mode": "u1_sz",
+          "note": "Spin-only U1 conserves total Sz while allowing orbital-only terms that do not change Sz. Spin transverse terms must still appear as conserving pairs.",
+          "reachable_total_Sz_times_2": [
+            -8,
+            -6,
+            -4,
+            -2,
+            0,
+            2,
+            4,
+            6,
+            8
+          ],
+          "reachable_total_Tz_times_2": [
+            -8,
+            -6,
+            -4,
+            -2,
+            0,
+            2,
+            4,
+            6,
+            8
+          ],
+          "target_sector": {
+            "mode": "u1_sz",
+            "reachable": true,
+            "target_charge": 0,
+            "total_Sz_times_2": 0
+          }
+        },
+        "u1_tz": {
+          "backend_supported_for_simplification": false,
+          "basis_charge_table": [
+            {
+              "Sz_times_2": -1,
+              "Tz_times_2": -1,
+              "basis": "|Sz=-0.5,Tz=-0.5>",
+              "encoded_u1_charge": -4097,
+              "u1_charge_encoding": "q = 4096*(2*Sz) + (2*Tz)",
+              "u1_sz_charge": -1,
+              "u1_tz_charge": -1
+            },
+            {
+              "Sz_times_2": -1,
+              "Tz_times_2": 1,
+              "basis": "|Sz=-0.5,Tz=+0.5>",
+              "encoded_u1_charge": -4095,
+              "u1_charge_encoding": "q = 4096*(2*Sz) + (2*Tz)",
+              "u1_sz_charge": -1,
+              "u1_tz_charge": 1
+            },
+            {
+              "Sz_times_2": 1,
+              "Tz_times_2": -1,
+              "basis": "|Sz=+0.5,Tz=-0.5>",
+              "encoded_u1_charge": 4095,
+              "u1_charge_encoding": "q = 4096*(2*Sz) + (2*Tz)",
+              "u1_sz_charge": 1,
+              "u1_tz_charge": -1
+            },
+            {
+              "Sz_times_2": 1,
+              "Tz_times_2": 1,
+              "basis": "|Sz=+0.5,Tz=+0.5>",
+              "encoded_u1_charge": 4097,
+              "u1_charge_encoding": "q = 4096*(2*Sz) + (2*Tz)",
+              "u1_sz_charge": 1,
+              "u1_tz_charge": 1
+            }
+          ],
+          "charge_encoding": {
+            "formula": "q = 2*Tz",
+            "scheme": "single_integer_charge"
+          },
+          "checked_term_count": 118,
+          "conserved": false,
+          "conserved_total_Tz": false,
+          "issues": [
+            {
+              "error": "Found non-charge-conserving term for strict U1_TZ build: (-0.125, 'Tp', 0, 'Tp', 3) (net charge transfer=-4).",
+              "kind": "term_not_conserved",
+              "term": [
+                "-0.125",
+                "Tp",
+                "0",
+                "Tp",
+                "3"
+              ]
+            },
+            {
+              "error": "Found non-charge-conserving term for strict U1_TZ build: (-0.125, 'Tm', 0, 'Tm', 3) (net charge transfer=4).",
+              "kind": "term_not_conserved",
+              "term": [
+                "-0.125",
+                "Tm",
+                "0",
+                "Tm",
+                "3"
+              ]
+            },
+            {
+              "error": "Found non-charge-conserving term for strict U1_TZ build: (-0.125, 'SpTp', 0, 'SmTp', 3) (net charge transfer=-4).",
+              "kind": "term_not_conserved",
+              "term": [
+                "-0.125",
+                "SpTp",
+                "0",
+                "SmTp",
+                "3"
+              ]
+            },
+            {
+              "error": "Found non-charge-conserving term for strict U1_TZ build: (-0.125, 'SpTm', 0, 'SmTm', 3) (net charge transfer=4).",
+              "kind": "term_not_conserved",
+              "term": [
+                "-0.125",
+                "SpTm",
+                "0",
+                "SmTm",
+                "3"
+              ]
+            },
+            {
+              "error": "Found non-charge-conserving term for strict U1_TZ build: (-0.125, 'SmTp', 0, 'SpTp', 3) (net charge transfer=-4).",
+              "kind": "term_not_conserved",
+              "term": [
+                "-0.125",
+                "SmTp",
+                "0",
+                "SpTp",
+                "3"
+              ]
+            },
+            {
+              "error": "Found non-charge-conserving term for strict U1_TZ build: (-0.125, 'SmTm', 0, 'SpTm', 3) (net charge transfer=4).",
+              "kind": "term_not_conserved",
+              "term": [
+                "-0.125",
+                "SmTm",
+                "0",
+                "SpTm",
+                "3"
+              ]
+            },
+            {
+              "error": "Found non-charge-conserving term for strict U1_TZ build: (-0.25, 'SzTp', 0, 'SzTp', 3) (net charge transfer=-4).",
+              "kind": "term_not_conserved",
+              "term": [
+                "-0.25",
+                "SzTp",
+                "0",
+                "SzTp",
+                "3"
+              ]
+            },
+            {
+              "error": "Found non-charge-conserving term for strict U1_TZ build: (-0.25, 'SzTm', 0, 'SzTm', 3) (net charge transfer=4).",
+              "kind": "term_not_conserved",
+              "term": [
+                "-0.25",
+                "SzTm",
+                "0",
+                "SzTm",
+                "3"
+              ]
+            },
+            {
+              "error": "Operator 'Tx' in term (0.5, 'Tx', 0, 'Tx', 7) is not compatible with strict U1_TZ symmetry. Use a symmetry-adapted operator pair, switch to symmetry_mode=z2/none, or choose a U1-conserving model.",
+              "kind": "term_not_conserved",
+              "term": [
+                "0.5",
+                "Tx",
+                "0",
+                "Tx",
+                "7"
+              ]
+            },
+            {
+              "error": "Operator 'SpTx' in term (0.5, 'SpTx', 0, 'SmTx', 7) is not compatible with strict U1_TZ symmetry. Use a symmetry-adapted operator pair, switch to symmetry_mode=z2/none, or choose a U1-conserving model.",
+              "kind": "term_not_conserved",
+              "term": [
+                "0.5",
+                "SpTx",
+                "0",
+                "SmTx",
+                "7"
+              ]
+            },
+            {
+              "error": "Operator 'SmTx' in term (0.5, 'SmTx', 0, 'SpTx', 7) is not compatible with strict U1_TZ symmetry. Use a symmetry-adapted operator pair, switch to symmetry_mode=z2/none, or choose a U1-conserving model.",
+              "kind": "term_not_conserved",
+              "term": [
+                "0.5",
+                "SmTx",
+                "0",
+                "SpTx",
+                "7"
+              ]
+            },
+            {
+              "error": "Operator 'SzTx' in term (1.0, 'SzTx', 0, 'SzTx', 7) is not compatible with strict U1_TZ symmetry. Use a symmetry-adapted operator pair, switch to symmetry_mode=z2/none, or choose a U1-conserving model.",
+              "kind": "term_not_conserved",
+              "term": [
+                "1.0",
+                "SzTx",
+                "0",
+                "SzTx",
+                "7"
+              ]
+            }
+          ],
+          "mode": "u1_tz",
+          "note": "Orbital-only U1 conserves total tau_z/Tz while allowing spin-only terms that do not change Tz. Orbital transverse terms must still appear as conserving pairs.",
+          "reachable_total_Sz_times_2": [
+            -8,
+            -6,
+            -4,
+            -2,
+            0,
+            2,
+            4,
+            6,
+            8
+          ],
+          "reachable_total_Tz_times_2": [
+            -8,
+            -6,
+            -4,
+            -2,
+            0,
+            2,
+            4,
+            6,
+            8
+          ],
+          "target_sector": {
+            "mode": "u1_tz",
+            "reachable": true,
+            "target_charge": 0,
+            "total_Tz_times_2": 0
+          }
+        },
+        "z2": {
+          "backend_support_note": "Tenax 0.2 AutoMPO symmetric construction used here is U1-only; Z2 is reported as a physical conservation law but not used for block-sparse MPO speedup.",
+          "backend_supported_for_simplification": false,
+          "basis_charge_table": [
+            {
+              "Sz_times_2": -1,
+              "Tz_times_2": -1,
+              "basis": "|Sz=-0.5,Tz=-0.5>",
+              "parity_charge": 0,
+              "parity_formula": "(0+0) mod 2",
+              "parity_label": "even"
+            },
+            {
+              "Sz_times_2": -1,
+              "Tz_times_2": 1,
+              "basis": "|Sz=-0.5,Tz=+0.5>",
+              "parity_charge": 1,
+              "parity_formula": "(0+1) mod 2",
+              "parity_label": "odd"
+            },
+            {
+              "Sz_times_2": 1,
+              "Tz_times_2": -1,
+              "basis": "|Sz=+0.5,Tz=-0.5>",
+              "parity_charge": 1,
+              "parity_formula": "(1+0) mod 2",
+              "parity_label": "odd"
+            },
+            {
+              "Sz_times_2": 1,
+              "Tz_times_2": 1,
+              "basis": "|Sz=+0.5,Tz=+0.5>",
+              "parity_charge": 0,
+              "parity_formula": "(1+1) mod 2",
+              "parity_label": "even"
+            }
+          ],
+          "checked_term_count": 118,
+          "conserved_global_parity": true,
+          "issues": [],
+          "note": "Parity charge is (spin basis index + orbital basis index) mod 2.",
+          "reachable_global_parities": [
+            0,
+            1
+          ],
+          "target_sector": {
+            "global_parity": 0,
+            "reachable": true
+          }
+        }
+      },
+      "requested_mode": "u1_sz",
+      "requested_reductions": [
+        "sz",
+        "z2"
+      ],
+      "strict_precheck": true
+    }
+  },
+  "model_name": "Honeycomb phase scan",
+  "model_spec": {
+    "ising_axis": "z",
+    "model_family": "yao_lee",
+    "orbital_rep": "1/2",
+    "physical_dim": 4,
+    "spin_rep": "1/2"
+  },
+  "monitor_data_name": "YL_S12_T12_hc_Lx2_Cy2_N8_pbcY_run_summary.json",
+  "observable_controls": {
+    "calculate": {
+      "bond_energies": true,
+      "correlations": true,
+      "correlations_requested": true,
+      "entanglement": true,
+      "note": "Bond energies, structure factors, and real-space patterns require correlation matrices, so calculate_correlations is promoted to true when any of them is enabled.",
+      "real_space_patterns": true,
+      "reference_site_idx": null,
+      "structure_factors": true,
+      "uniform_observables": true
+    },
+    "phase_diagram": {
+      "enabled": false,
+      "mode": "quantum",
+      "note": "The phase_diagram switch ties phase-scan calculation and phase-diagram plotting together by default.",
+      "plot": false,
+      "quantum_methods": [
+        "idmrg"
+      ],
+      "run": true,
+      "selected_outputs": [
+        "idmrg"
+      ]
+    },
+    "plot": {
+      "bond_energies": true,
+      "correlation_heatmaps": true,
+      "energy_comparison": true,
+      "entanglement": true,
+      "finite_temperature": true,
+      "geometry": true,
+      "low_energy_spectrum": true,
+      "phase_scan": false,
+      "real_space_patterns": true,
+      "structure_factors": true
+    }
+  },
+  "output_status": {
+    "geometry_diagram_png": {
+      "status": "saved"
+    }
+  },
+  "outputs": {
+    "geometry_diagram_png": "YL_S12_T12_hc_Lx2_Cy2_N8_pbcY_geometry_diagram.png",
+    "monitor_data_json": "YL_S12_T12_hc_Lx2_Cy2_N8_pbcY_run_summary.json",
+    "run_summary_json": "YL_S12_T12_hc_Lx2_Cy2_N8_pbcY_run_summary.json"
+  },
+  "parameters": {
+    "alpha": 1.0,
+    "backend": "tenpy",
+    "beta": 0.5,
+    "calculate_bond_energies": true,
+    "calculate_correlations": true,
+    "calculate_entanglement": true,
+    "calculate_real_space_patterns": true,
+    "calculate_structure_factors": true,
+    "calculate_uniform_observables": true,
+    "check_ground_state_degeneracy": true,
+    "circumference_y": 2,
+    "coupling_j": 1.0,
+    "dmrg_excited_energy_tol": 1e-07,
+    "dmrg_excited_max_attempts": 10,
+    "dmrg_excited_overlap_tol": 1e-06,
+    "dmrg_excited_variance_tol": 1e-07,
+    "ed_backend": "quspin",
+    "ed_ground_manifold_abs_tol": 1e-12,
+    "ed_ground_manifold_rel_tol": 1e-12,
+    "ed_max_eigenstates": 6,
+    "ed_solver": "sparse",
+    "ed_sparse_maxiter": 0,
+    "ed_sparse_tol": 0.0,
+    "external_field_axis": "111",
+    "external_field_strength": 1.0,
+    "external_field_treatment": "off",
+    "field_hx": 0.0,
+    "field_hy": 0.0,
+    "field_hz": 1.0,
+    "field_sigma_factor": 2.0,
+    "field_sign": 1.0,
+    "idmrg_bulk_kind": "auto",
+    "idmrg_max_bond_dimension": 32,
+    "idmrg_max_iterations": 10,
+    "idmrg_max_local_dim": 16,
+    "initial_state": "random",
+    "ising_axis": "z",
+    "jx": 1.0,
+    "jy": 1.0,
+    "jz": 1.0,
+    "lattice": "honeycomb",
+    "length_x": 2,
+    "max_bond_dimension": 64,
+    "max_dmrg_sites": 18,
+    "max_ed_hilbert_dim": 5000000,
+    "max_ed_sites": 16,
+    "max_sweeps": 10,
+    "model_family": "yao_lee",
+    "momentum_block": 0,
+    "momentum_x_block": 0,
+    "momentum_y_block": 0,
+    "mu_b": 1.0,
+    "open_around_cylinder": false,
+    "orbital_rep": "1/2",
+    "output_folder": "DMRG/outputs",
+    "overwrite_plots": true,
+    "phase_diagram": 0,
+    "phase_scan_alpha_max": 2.25,
+    "phase_scan_alpha_min": 0.0,
+    "phase_scan_alpha_points": 17,
+    "phase_scan_beta_max": 0.27,
+    "phase_scan_beta_min": 0.0,
+    "phase_scan_beta_points": 13,
+    "phase_scan_classical_final_step": 0.05,
+    "phase_scan_classical_final_temperature": 0.001,
+    "phase_scan_classical_initial_step": 0.8,
+    "phase_scan_classical_initial_temperature": 0.08,
+    "phase_scan_classical_nematicity_threshold": 0.08,
+    "phase_scan_classical_restarts": 6,
+    "phase_scan_classical_sweeps": 320,
+    "phase_scan_classical_weak_order_threshold": 0.075,
+    "phase_scan_ed_max_hilbert_dim": 5000000,
+    "phase_scan_ed_max_sites": 16,
+    "phase_scan_methods": [
+      "idmrg"
+    ],
+    "phase_scan_mode": "quantum",
+    "phase_scan_only": 1,
+    "phase_scan_plaquette_flux_target": 1.0,
+    "phase_scan_plaquette_flux_tolerance": 0.15,
+    "phase_scan_quantum_methods": [
+      "idmrg"
+    ],
+    "phase_scan_quantum_nematicity_threshold": 0.1,
+    "phase_scan_quantum_weak_order_threshold": 0.035,
+    "phase_scan_random_seed": 1042,
+    "plot_bond_energies": true,
+    "plot_correlation_heatmaps": true,
+    "plot_energy_comparison": true,
+    "plot_entanglement": true,
+    "plot_finite_temperature": true,
+    "plot_geometry": true,
+    "plot_low_energy_spectrum": true,
+    "plot_phase_scan": false,
+    "plot_real_space_patterns": true,
+    "plot_structure_factors": true,
+    "progress": true,
+    "quspin_check_hermiticity": true,
+    "quspin_check_particle_conservation": false,
+    "quspin_check_symmetries": false,
+    "reference_site_idx": null,
+    "reflection_block": 0,
+    "run_ed": true,
+    "run_finite_temperature": true,
+    "run_idmrg": true,
+    "run_phase_scan": true,
+    "seed": 42,
+    "spin_rep": "1/2",
+    "strict_plot_errors": false,
+    "strict_symmetry_precheck": true,
+    "strict_symmetry_selection_rules": true,
+    "symmetry_allow_dense_fallback": true,
+    "symmetry_mode": "u1_sz",
+    "symmetry_precheck": true,
+    "symmetry_reductions": [
+      "sz",
+      "z2"
+    ],
+    "temperature_max": 2.0,
+    "temperature_min": 0.05,
+    "temperature_points": 32,
+    "temperature_scale": "log",
+    "thermal_full_spectrum_max_dim": 512,
+    "thermal_max_eigenstates": 12,
+    "thermal_max_hilbert_dim": 5000000,
+    "thermal_max_sites": 16,
+    "truncation_cutoff": 1e-08,
+    "u1_target_sz2": 0,
+    "u1_target_tz2": 0,
+    "use_reflection_block": 0,
+    "use_sz_block": true,
+    "use_sz_conserved": true,
+    "use_tau_z_block": false,
+    "use_translation_block": false,
+    "use_translation_x_block": false,
+    "use_translation_y_block": false,
+    "use_z2_block": true,
+    "z2_target_parity": 0
+  },
+  "plot_title_label": "YL S=1/2, T=1/2, axis=z | Honeycomb Lx=2, Cy=2, N=8, PBC-y",
+  "resource_profile": "local_laptop",
+  "run_output_prefix": "YL_S12_T12_hc_Lx2_Cy2_N8_pbcY",
+  "run_status": "running",
+  "stages": {
+    "phase_scan": "running"
+  }
+}

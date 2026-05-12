@@ -2,19 +2,31 @@
 """PNG output helpers for the Yao-Lee driver.
 
 This module owns plotting, diagram rendering, and filesystem output helpers
-only. Hamiltonian construction remains in ``models.py``; scan analysis remains
-in ``analysis.py``; Tenax execution remains in ``backend.py``.
+only. Hamiltonian construction remains in ``models.py``/``ed_backend.py``;
+scan analysis remains in ``analysis.py``; Tenax execution remains in
+``tenax_backend.py``.
 """
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
+from matplotlib.collections import PatchCollection
+from matplotlib.patches import Polygon
 
 from analysis import ENTROPY_ORDERS
-from models import GeometryData, lattice_display_name
+from models import (
+    GeometryData,
+    ModelSpec,
+    build_lattice_geometry,
+    honeycomb_plaquette_flux_operators,
+    lattice_display_name,
+    model_terms_for_bond,
+)
 
 
 METHOD_ORDER = ("DMRG", "ED", "iDMRG-x")
@@ -33,6 +45,26 @@ METHOD_LINESTYLES = {
     "ED": "--",
     "iDMRG-x": ":",
 }
+CHANNEL_ORDER = ("S", "T", "ST")
+CHANNEL_COLORS = {
+    "S": "#1f77b4",
+    "T": "#9467bd",
+    "ST": "#2ca02c",
+    "total": "#666666",
+}
+CHANNEL_LINESTYLES = {
+    "S": "solid",
+    "T": "dashed",
+    "ST": "dotted",
+    "total": "solid",
+}
+CHANNEL_LABELS = {
+    "S": "spin S",
+    "T": "orbital T",
+    "ST": "mixed ST",
+    "total": "total",
+}
+GAMMA_COLORS = {"x": "#1f77b4", "y": "#2ca02c", "z": "#d62728"}
 
 
 def titled_for_run(base_title: str, title_label: str | None = None) -> str:
@@ -65,24 +97,151 @@ def _bond_i_j_gamma(bond: Any) -> Tuple[int, int, str]:
     raise AttributeError("Bond object must have (i,j,gamma) or (site_i,site_j,bond_type).")
 
 
+def _operator_channel(op_name: str) -> str:
+    if op_name.startswith("ST"):
+        return "ST"
+    if op_name.startswith("T"):
+        return "T"
+    if op_name.startswith("S"):
+        return "S"
+    return op_name
+
+
+def _ordered_channels(channels: List[str]) -> List[str]:
+    seen = set(channels)
+    ordered = [channel for channel in CHANNEL_ORDER if channel in seen]
+    ordered.extend(sorted(channel for channel in seen if channel not in CHANNEL_ORDER))
+    return ordered
+
+
+def _centered_offsets(count: int, spacing: float) -> List[float]:
+    if count <= 1:
+        return [0.0]
+    center = 0.5 * float(count - 1)
+    return [(float(index) - center) * spacing for index in range(count)]
+
+
+def _offset_segment(p_i: np.ndarray, p_j: np.ndarray, offset: float) -> List[np.ndarray]:
+    direction = np.asarray(p_j, dtype=float) - np.asarray(p_i, dtype=float)
+    length = float(np.linalg.norm(direction))
+    if length <= 1e-12:
+        normal = np.asarray([0.0, 1.0])
+    else:
+        normal = np.asarray([-direction[1], direction[0]]) / length
+    return [np.asarray(p_i, dtype=float) + offset * normal, np.asarray(p_j, dtype=float) + offset * normal]
+
+
+def _position_span(positions: np.ndarray) -> float:
+    if positions.size == 0:
+        return 1.0
+    return max(float(np.ptp(positions[:, 0])), float(np.ptp(positions[:, 1])), 1.0)
+
+
+def _channels_for_geometry_bond(
+    gamma: str,
+    model_spec: ModelSpec | None,
+    alpha: float,
+    beta: float,
+    coupling_j: float,
+    jx: float,
+    jy: float,
+    jz: float,
+) -> List[str]:
+    if model_spec is None:
+        return []
+    channels: List[str] = []
+    for coeff, op_name in model_terms_for_bond(
+        gamma,
+        model_spec,
+        alpha,
+        beta,
+        coupling_j,
+        jx=jx,
+        jy=jy,
+        jz=jz,
+    ):
+        if abs(float(coeff)) <= 1e-14:
+            continue
+        channels.append(_operator_channel(str(op_name)))
+    return _ordered_channels(channels)
+
+
+def _bond_row_channel_values(row: Dict[str, Any]) -> Dict[str, float]:
+    if isinstance(row.get("channel_energies"), dict):
+        return {
+            str(channel): float(value)
+            for channel, value in row["channel_energies"].items()
+        }
+    values: Dict[str, float] = {}
+    components = row.get("components", [])
+    if isinstance(components, list):
+        for component in components:
+            if not isinstance(component, dict):
+                continue
+            channel = str(component.get("channel", "total"))
+            values[channel] = values.get(channel, 0.0) + float(component.get("energy", 0.0))
+    if len(values) == 0:
+        values["total"] = float(row["O_ij_gamma"])
+    return values
+
+
 def save_geometry_diagram(
     geometry: GeometryData,
     filepath: str,
     lattice: str,
     title_label: str | None = None,
+    model_spec: ModelSpec | None = None,
+    alpha: float = 1.0,
+    beta: float = 0.5,
+    coupling_j: float = 1.0,
+    jx: float = 1.0,
+    jy: float = 1.0,
+    jz: float = 1.0,
 ) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
 
-    colors = {"x": "#1f77b4", "y": "#2ca02c", "z": "#d62728"}
     positions = _geometry_positions(geometry)
+    offset_spacing = 0.025 * _position_span(positions)
     fig, ax = plt.subplots(figsize=(8, 6), dpi=150)
     for bond in geometry.bond_list:
         site_i, site_j, gamma = _bond_i_j_gamma(bond)
         p_i = positions[site_i]
         p_j = positions[site_j]
-        ax.plot([p_i[0], p_j[0]], [p_i[1], p_j[1]], color=colors.get(gamma, "#666666"), linewidth=1.5, alpha=0.9)
+        channels = _channels_for_geometry_bond(gamma, model_spec, alpha, beta, coupling_j, jx, jy, jz)
+        if len(channels) == 0:
+            ax.plot(
+                [p_i[0], p_j[0]],
+                [p_i[1], p_j[1]],
+                color=GAMMA_COLORS.get(gamma, "#666666"),
+                linewidth=1.5,
+                alpha=0.9,
+            )
+            continue
+        ax.plot([p_i[0], p_j[0]], [p_i[1], p_j[1]], color="#bbbbbb", linewidth=0.8, alpha=0.5)
+        for channel, offset in zip(channels, _centered_offsets(len(channels), offset_spacing)):
+            segment = _offset_segment(p_i, p_j, offset)
+            ax.plot(
+                [segment[0][0], segment[1][0]],
+                [segment[0][1], segment[1][1]],
+                color=CHANNEL_COLORS.get(channel, "#666666"),
+                linestyle=CHANNEL_LINESTYLES.get(channel, "solid"),
+                linewidth=1.5,
+                alpha=0.95,
+            )
+        midpoint = 0.5 * (p_i + p_j)
+        ax.text(
+            midpoint[0],
+            midpoint[1],
+            gamma,
+            color=GAMMA_COLORS.get(gamma, "#666666"),
+            fontsize=7,
+            ha="center",
+            va="center",
+            zorder=4,
+        )
 
     if hasattr(geometry, "sublattice_indices"):
         sublattice = np.asarray(geometry.sublattice_indices)
@@ -95,10 +254,25 @@ def save_geometry_diagram(
             ax.scatter(positions[:, 0], positions[:, 1], s=16, c="#111111", label="sites")
     else:
         ax.scatter(positions[:, 0], positions[:, 1], s=16, c="#111111", label="sites")
-    ax.set_title(titled_for_run(f"{lattice_display_name(lattice)} Cylinder Geometry", title_label))
+    ax.set_title(titled_for_run(f"{lattice_display_name(lattice)} Lattice Geometry", title_label))
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.legend(loc="upper right")
+    handles, labels = ax.get_legend_handles_labels()
+    if model_spec is not None:
+        channel_handles = [
+            Line2D(
+                [0],
+                [0],
+                color=CHANNEL_COLORS.get(channel, "#666666"),
+                linestyle=CHANNEL_LINESTYLES.get(channel, "solid"),
+                linewidth=1.8,
+                label=CHANNEL_LABELS.get(channel, channel),
+            )
+            for channel in CHANNEL_ORDER
+        ]
+        handles.extend(channel_handles)
+        labels.extend([handle.get_label() for handle in channel_handles])
+    ax.legend(handles, labels, loc="upper right", fontsize=8)
     ax.set_aspect("equal", adjustable="datalim")
     fig.tight_layout()
     fig.savefig(filepath)
@@ -114,29 +288,77 @@ def save_bond_energy_diagram(
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
     from matplotlib.collections import LineCollection
+    from matplotlib.lines import Line2D
 
     positions = _geometry_positions(geometry)
-    segments = []
-    values = []
+    offset_spacing = 0.018 * _position_span(positions)
+    segments_by_channel: Dict[str, List[List[np.ndarray]]] = {}
+    values_by_channel: Dict[str, List[float]] = {}
     for row in bond_rows:
         i, j = int(row["i"]), int(row["j"])
-        segments.append([positions[i], positions[j]])
-        values.append(float(row["O_ij_gamma"]))
+        p_i = positions[i]
+        p_j = positions[j]
+        channel_values = _bond_row_channel_values(row)
+        channels = _ordered_channels(list(channel_values.keys()))
+        for channel, offset in zip(channels, _centered_offsets(len(channels), offset_spacing)):
+            segments_by_channel.setdefault(channel, []).append(_offset_segment(p_i, p_j, offset))
+            values_by_channel.setdefault(channel, []).append(float(channel_values[channel]))
 
-    values_arr = np.asarray(values, dtype=float)
+    all_values = [
+        value
+        for channel_values in values_by_channel.values()
+        for value in channel_values
+    ]
+    if len(all_values) == 0:
+        raise RuntimeError("No bond-energy links available to plot.")
+    values_arr = np.asarray(all_values, dtype=float)
+    v_min = float(np.min(values_arr))
+    v_max = float(np.max(values_arr))
+    if not np.isfinite(v_min) or not np.isfinite(v_max):
+        raise RuntimeError("Bond-energy values contain non-finite entries.")
+    if v_min == v_max:
+        pad = max(1e-8, 0.08 * max(abs(v_min), 1e-6))
+        v_min -= pad
+        v_max += pad
+    norm = Normalize(vmin=v_min, vmax=v_max)
     fig, ax = plt.subplots(figsize=(8, 6), dpi=150)
-    collection = LineCollection(segments, cmap="coolwarm", linewidths=3.0)
-    collection.set_array(values_arr)
-    ax.add_collection(collection)
+    collections = []
+    for channel in _ordered_channels(list(segments_by_channel.keys())):
+        channel_values = np.asarray(values_by_channel[channel], dtype=float)
+        collection = LineCollection(
+            segments_by_channel[channel],
+            cmap="coolwarm",
+            norm=norm,
+            linewidths=2.6,
+            linestyles=CHANNEL_LINESTYLES.get(channel, "solid"),
+            alpha=0.95,
+        )
+        collection.set_array(channel_values)
+        ax.add_collection(collection)
+        collections.append(collection)
     ax.scatter(positions[:, 0], positions[:, 1], c="black", s=10, zorder=3)
+    legend_handles = [
+        Line2D(
+            [0],
+            [0],
+            color="#444444",
+            linestyle=CHANNEL_LINESTYLES.get(channel, "solid"),
+            linewidth=2.0,
+            label=CHANNEL_LABELS.get(channel, channel),
+        )
+        for channel in _ordered_channels(list(segments_by_channel.keys()))
+    ]
+    if len(legend_handles) > 0:
+        ax.legend(handles=legend_handles, loc="upper right", fontsize=8)
     ax.autoscale()
     ax.set_title(title)
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_aspect("equal", adjustable="datalim")
-    cbar = fig.colorbar(collection, ax=ax, shrink=0.9)
-    cbar.set_label("Bond energy O_ij_gamma")
+    cbar = fig.colorbar(collections[0], ax=ax, shrink=0.9)
+    cbar.set_label("Channel bond-energy contribution")
     fig.tight_layout()
     fig.savefig(filepath)
     plt.close(fig)
@@ -190,6 +412,483 @@ def save_scalar_correlation_heatmaps(
         fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
     fig.tight_layout()
     fig.savefig(filepath)
+    plt.close(fig)
+
+
+def _correlation_site_color(value: float, scale: float) -> Tuple[float, float, float, float]:
+    if not np.isfinite(value):
+        return (0.45, 0.45, 0.45, 0.25)
+    if scale <= 1e-14 or abs(value) <= 1e-14:
+        return (0.45, 0.45, 0.45, 0.22)
+    alpha = min(1.0, max(0.12, abs(float(value)) / float(scale)))
+    if value > 0.0:
+        return (0.84, 0.15, 0.16, alpha)
+    return (0.12, 0.47, 0.71, alpha)
+
+
+def plot_real_space_pattern(
+    geometry: GeometryData,
+    correlation_array: np.ndarray,
+    reference_site_idx: int,
+    ax: Any | None = None,
+    title: str | None = None,
+    channel_label: str = "correlation",
+):
+    """Draw the reference-site real-space ordering pattern on the lattice."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+    from matplotlib.lines import Line2D
+
+    positions = _geometry_positions(geometry)
+    values = np.real_if_close(np.asarray(correlation_array)).astype(float).reshape(-1)
+    n_sites = int(getattr(geometry, "number_of_sites", len(values)))
+    if values.size != n_sites:
+        raise ValueError(f"correlation_array has length {values.size}, but geometry has {n_sites} sites.")
+    reference_site_idx = int(reference_site_idx)
+    if reference_site_idx < 0:
+        reference_site_idx = n_sites + reference_site_idx
+    if reference_site_idx < 0 or reference_site_idx >= n_sites:
+        raise IndexError(f"reference_site_idx={reference_site_idx} is outside [0, {n_sites - 1}].")
+
+    created_figure = ax is None
+    if created_figure:
+        fig, ax = plt.subplots(figsize=(8, 6), dpi=150)
+    else:
+        fig = ax.figure
+
+    for bond in geometry.bond_list:
+        site_i, site_j, gamma = _bond_i_j_gamma(bond)
+        p_i = positions[site_i]
+        p_j = positions[site_j]
+        ax.plot(
+            [p_i[0], p_j[0]],
+            [p_i[1], p_j[1]],
+            color=GAMMA_COLORS.get(gamma, "#9a9a9a"),
+            linewidth=1.0,
+            alpha=0.45,
+            zorder=1,
+        )
+
+    other_sites = np.asarray([site for site in range(n_sites) if site != reference_site_idx], dtype=int)
+    other_values = values[other_sites] if other_sites.size > 0 else np.asarray([], dtype=float)
+    scale = float(np.max(np.abs(other_values))) if other_values.size > 0 else 0.0
+    if not np.isfinite(scale) or scale <= 1e-14:
+        scale = float(np.max(np.abs(values))) if values.size > 0 else 1.0
+    if not np.isfinite(scale) or scale <= 1e-14:
+        scale = 1.0
+
+    colors = [_correlation_site_color(float(values[site]), scale) for site in other_sites]
+    if other_sites.size > 0:
+        ax.scatter(
+            positions[other_sites, 0],
+            positions[other_sites, 1],
+            s=95,
+            c=colors,
+            edgecolors="#222222",
+            linewidths=0.6,
+            zorder=3,
+        )
+
+    reference_position = positions[reference_site_idx]
+    ax.scatter(
+        [reference_position[0]],
+        [reference_position[1]],
+        s=250,
+        marker="*",
+        c="#ffd92f",
+        edgecolors="#111111",
+        linewidths=1.0,
+        zorder=5,
+        label=f"reference site {reference_site_idx}",
+    )
+    ax.text(
+        reference_position[0],
+        reference_position[1],
+        str(reference_site_idx),
+        fontsize=7,
+        ha="center",
+        va="center",
+        color="#111111",
+        zorder=6,
+    )
+
+    vmax = max(scale, 1e-12)
+    colorbar = fig.colorbar(
+        ScalarMappable(norm=Normalize(vmin=-vmax, vmax=vmax), cmap="coolwarm"),
+        ax=ax,
+        shrink=0.86,
+    )
+    colorbar.set_label(channel_label)
+    legend_handles = [
+        Line2D([0], [0], marker="*", color="none", markerfacecolor="#ffd92f", markeredgecolor="#111111",
+               markersize=12, label="reference site"),
+        Line2D([0], [0], marker="o", color="none", markerfacecolor="#d62728", markeredgecolor="#222222",
+               markersize=8, label="positive relative alignment"),
+        Line2D([0], [0], marker="o", color="none", markerfacecolor="#1f77b4", markeredgecolor="#222222",
+               markersize=8, label="negative relative alignment"),
+    ]
+    ax.legend(handles=legend_handles, loc="upper right", fontsize=8)
+    if title is not None:
+        ax.set_title(title)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.autoscale()
+    if created_figure:
+        fig.tight_layout()
+    return fig, ax
+
+
+def save_real_space_pattern_diagram(
+    geometry: GeometryData,
+    correlation_array: np.ndarray,
+    reference_site_idx: int,
+    filepath: str,
+    title: str,
+    channel_label: str,
+) -> None:
+    fig, _ = plot_real_space_pattern(
+        geometry,
+        correlation_array,
+        reference_site_idx,
+        title=title,
+        channel_label=channel_label,
+    )
+    fig.savefig(filepath)
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+
+
+def save_phase_representative_pattern(
+    geometry: GeometryData,
+    spin_correlation_array: np.ndarray,
+    reference_site_idx: int,
+    bond_rows: List[Dict[str, Any]] | None,
+    filepath: str,
+    title: str,
+) -> None:
+    """Save one compact phase-representative plot with spin arrows and resolved bonds."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.collections import LineCollection
+    from matplotlib.colors import Normalize
+    from matplotlib.lines import Line2D
+
+    positions = _geometry_positions(geometry)
+    values = np.real_if_close(np.asarray(spin_correlation_array)).astype(float).reshape(-1)
+    n_sites = int(getattr(geometry, "number_of_sites", len(values)))
+    if values.size != n_sites:
+        raise ValueError(f"spin_correlation_array has length {values.size}, but geometry has {n_sites} sites.")
+    reference_site_idx = int(reference_site_idx)
+    if reference_site_idx < 0:
+        reference_site_idx = n_sites + reference_site_idx
+    if reference_site_idx < 0 or reference_site_idx >= n_sites:
+        raise IndexError(f"reference_site_idx={reference_site_idx} is outside [0, {n_sites - 1}].")
+
+    fig, ax = plt.subplots(figsize=(8.8, 6.4), dpi=150)
+
+    for bond in geometry.bond_list:
+        site_i, site_j, gamma = _bond_i_j_gamma(bond)
+        p_i = positions[site_i]
+        p_j = positions[site_j]
+        ax.plot(
+            [p_i[0], p_j[0]],
+            [p_i[1], p_j[1]],
+            color=GAMMA_COLORS.get(gamma, "#bdbdbd"),
+            linewidth=0.9,
+            alpha=0.28,
+            zorder=1,
+        )
+
+    rows = [row for row in (bond_rows or []) if isinstance(row, dict)]
+    offset_spacing = 0.024 * _position_span(positions)
+    channel_order = ("S", "T", "ST", "total")
+    segments_by_channel: Dict[str, List[List[np.ndarray]]] = {}
+    values_by_channel: Dict[str, List[float]] = {}
+    for row in rows:
+        try:
+            i, j = int(row["i"]), int(row["j"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if i < 0 or j < 0 or i >= positions.shape[0] or j >= positions.shape[0]:
+            continue
+        channel_values = _bond_row_channel_values(row)
+        channels = [
+            channel for channel in channel_order
+            if channel in channel_values and np.isfinite(float(channel_values[channel]))
+        ]
+        if len(channels) == 0:
+            continue
+        for channel, offset in zip(channels, _centered_offsets(len(channels), offset_spacing)):
+            segments_by_channel.setdefault(channel, []).append(_offset_segment(positions[i], positions[j], offset))
+            values_by_channel.setdefault(channel, []).append(float(channel_values[channel]))
+
+    all_bond_values = [
+        value
+        for channel_values in values_by_channel.values()
+        for value in channel_values
+        if np.isfinite(float(value))
+    ]
+    bond_abs_max = max([abs(value) for value in all_bond_values], default=0.0)
+    bond_norm = Normalize(vmin=-bond_abs_max, vmax=bond_abs_max) if bond_abs_max > 1e-14 else Normalize(vmin=-1.0, vmax=1.0)
+    cmap = plt.get_cmap("coolwarm")
+    first_collection = None
+    for channel in [channel for channel in channel_order if channel in segments_by_channel]:
+        channel_values = np.asarray(values_by_channel[channel], dtype=float)
+        widths = 1.2 + 3.4 * (np.abs(channel_values) / max(bond_abs_max, 1e-12))
+        collection = LineCollection(
+            segments_by_channel[channel],
+            cmap=cmap,
+            norm=bond_norm,
+            linewidths=widths,
+            linestyles=CHANNEL_LINESTYLES.get(channel, "solid"),
+            alpha=0.92,
+            zorder=2,
+        )
+        collection.set_array(channel_values)
+        ax.add_collection(collection)
+        if first_collection is None:
+            first_collection = collection
+
+    ax.scatter(
+        positions[:, 0],
+        positions[:, 1],
+        s=32,
+        c="#f7f7f7",
+        edgecolors="#222222",
+        linewidths=0.7,
+        zorder=4,
+    )
+
+    non_reference_sites = np.asarray([site for site in range(n_sites) if site != reference_site_idx], dtype=int)
+    non_reference_values = values[non_reference_sites] if non_reference_sites.size > 0 else np.asarray([], dtype=float)
+    spin_scale = (
+        float(np.max(np.abs(non_reference_values)))
+        if non_reference_values.size > 0
+        else float(np.max(np.abs(values)))
+    )
+    if not np.isfinite(spin_scale) or spin_scale <= 1e-14:
+        spin_scale = 1.0
+    arrow_base = 0.27 * _position_span(positions) / max(np.sqrt(max(n_sites, 1)), 2.0)
+
+    reference_position = positions[reference_site_idx]
+    ax.scatter(
+        [reference_position[0]],
+        [reference_position[1]],
+        s=190,
+        marker="*",
+        c="#ffd92f",
+        edgecolors="#111111",
+        linewidths=1.0,
+        zorder=6,
+    )
+
+    for site in range(n_sites):
+        value = float(values[site])
+        if not np.isfinite(value) or abs(value) <= 1e-14:
+            continue
+        sign = 1.0 if value > 0.0 else -1.0
+        magnitude = min(1.0, abs(value) / spin_scale)
+        length = arrow_base * (0.35 + 0.65 * magnitude)
+        vector = np.asarray([sign * length, 0.0], dtype=float)
+        start = positions[site] - 0.5 * vector
+        color = "#d62728" if value > 0.0 else "#1f77b4"
+        is_reference = int(site) == int(reference_site_idx)
+        ax.quiver(
+            [start[0]],
+            [start[1]],
+            [vector[0]],
+            [vector[1]],
+            angles="xy",
+            scale_units="xy",
+            scale=1.0,
+            color=color,
+            width=0.008,
+            headwidth=4.0,
+            headlength=5.0,
+            headaxislength=4.2,
+            pivot="tail",
+            zorder=8 if is_reference else 5,
+        )
+
+    legend_handles = [
+        Line2D([0], [0], marker="*", color="none", markerfacecolor="#ffd92f",
+               markeredgecolor="#111111", markersize=12, label="reference site"),
+        Line2D([0], [0], color="#d62728", linewidth=2.2, marker=">", markevery=[1],
+               label="spin arrow: C_S > 0"),
+        Line2D([0], [0], color="#1f77b4", linewidth=2.2, marker="<", markevery=[1],
+               label="spin arrow: C_S < 0"),
+    ]
+    for channel in [channel for channel in channel_order if channel in segments_by_channel]:
+        legend_handles.append(
+            Line2D(
+                [0],
+                [0],
+                color="#555555",
+                linestyle=CHANNEL_LINESTYLES.get(channel, "solid"),
+                linewidth=2.3,
+                label=f"{CHANNEL_LABELS.get(channel, channel)} bond",
+            )
+        )
+    ax.legend(
+        handles=legend_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.12),
+        ncol=3,
+        fontsize=8,
+        framealpha=0.94,
+    )
+    if first_collection is not None:
+        colorbar = fig.colorbar(first_collection, ax=ax, shrink=0.84)
+        colorbar.set_label("Resolved bond-energy contribution")
+    else:
+        colorbar = fig.colorbar(
+            ScalarMappable(norm=Normalize(vmin=-spin_scale, vmax=spin_scale), cmap="coolwarm"),
+            ax=ax,
+            shrink=0.84,
+        )
+        colorbar.set_label("C_S reference correlation")
+
+    ax.set_title(title)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.autoscale()
+    fig.tight_layout(rect=(0.0, 0.14, 1.0, 1.0))
+    fig.savefig(filepath, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plaquette_flux_value(value: Any) -> float | None:
+    if isinstance(value, dict):
+        value = value.get("W_p", value.get("value"))
+    try:
+        output = float(value)
+    except (TypeError, ValueError):
+        return None
+    return output if np.isfinite(output) else None
+
+
+def _ordered_polygon_vertices(site_positions: np.ndarray) -> np.ndarray:
+    vertices = np.asarray(site_positions, dtype=float)
+    if vertices.shape != (6, 2):
+        raise ValueError(f"Plaquette vertices must have shape (6, 2); got {vertices.shape}.")
+    center = np.mean(vertices, axis=0)
+    angles = np.arctan2(vertices[:, 1] - center[1], vertices[:, 0] - center[0])
+    return vertices[np.argsort(angles)]
+
+
+def save_flux_crystal_pattern(
+    geometry: GeometryData,
+    all_fluxes_dict: Dict[Any, Any],
+    filepath: str,
+    title: str,
+) -> None:
+    """Draw a real-space plaquette-flux pattern for vison-crystal diagnostics."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+
+    positions = _geometry_positions(geometry)
+    plaquettes = honeycomb_plaquette_flux_operators(geometry)
+    plaquette_by_index = {
+        int(plaquette["plaquette_index"]): plaquette
+        for plaquette in plaquettes
+    }
+    if not isinstance(all_fluxes_dict, dict) or len(all_fluxes_dict) == 0:
+        raise RuntimeError("No plaquette-flux values were provided.")
+
+    patches: List[Polygon] = []
+    values: List[float] = []
+    for raw_index, raw_value in all_fluxes_dict.items():
+        try:
+            plaquette_index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        plaquette = plaquette_by_index.get(plaquette_index)
+        if plaquette is None:
+            continue
+        flux_value = _plaquette_flux_value(raw_value)
+        if flux_value is None:
+            continue
+        sites = [int(site) for site in plaquette["sites"]]
+        vertices = _ordered_polygon_vertices(positions[sites])
+        patches.append(Polygon(vertices, closed=True))
+        values.append(float(flux_value))
+
+    if len(patches) == 0:
+        raise RuntimeError("No provided plaquette-flux indices matched valid honeycomb plaquettes.")
+
+    fig, ax = plt.subplots(figsize=(8, 6), dpi=150)
+    for bond in geometry.bond_list:
+        site_i, site_j, gamma = _bond_i_j_gamma(bond)
+        p_i = positions[site_i]
+        p_j = positions[site_j]
+        ax.plot(
+            [p_i[0], p_j[0]],
+            [p_i[1], p_j[1]],
+            color=GAMMA_COLORS.get(gamma, "#9a9a9a"),
+            linewidth=0.8,
+            alpha=0.32,
+            zorder=1,
+        )
+
+    collection = PatchCollection(
+        patches,
+        cmap="RdBu_r",
+        norm=Normalize(vmin=-1.0, vmax=1.0, clip=True),
+        edgecolor="#222222",
+        linewidth=0.8,
+        alpha=0.88,
+        zorder=2,
+    )
+    collection.set_array(np.asarray(values, dtype=float))
+    ax.add_collection(collection)
+
+    ax.scatter(
+        positions[:, 0],
+        positions[:, 1],
+        s=16,
+        c="#222222",
+        edgecolors="white",
+        linewidths=0.35,
+        zorder=3,
+    )
+    colorbar = fig.colorbar(collection, ax=ax, shrink=0.86)
+    colorbar.set_label("Plaquette Flux W_p")
+    ax.set_title(title)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.autoscale()
+    ax.margins(0.08)
+    fig.tight_layout()
+    fig.savefig(filepath)
+    plt.close(fig)
+
+
+def plot_real_space_correlation_pattern(
+    geometry: GeometryData,
+    C_S: np.ndarray,
+    reference_site_idx: int,
+    output_path: str,
+) -> None:
+    """Save the spin reference-site correlation pattern on the honeycomb lattice."""
+    fig, _ = plot_real_space_pattern(
+        geometry,
+        C_S,
+        reference_site_idx,
+        title="DMRG Reference-Site Spin Correlation Pattern",
+        channel_label="C_S[j] = <S_ref . S_j>",
+    )
+    fig.savefig(output_path)
+    import matplotlib.pyplot as plt
     plt.close(fig)
 
 
@@ -975,6 +1674,91 @@ def _grid_edges(values: np.ndarray) -> np.ndarray:
     return np.concatenate([[first], mids, [last]])
 
 
+def _nested_phase_observable_value(row: Dict[str, Any], path: Tuple[str, ...]) -> float:
+    value: Any = row
+    for key in path:
+        if not isinstance(value, dict) or key not in value:
+            return float("nan")
+        value = value[key]
+    try:
+        output = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return output if np.isfinite(output) else float("nan")
+
+
+def save_phase_observable_heatmap(
+    rows: List[Dict[str, Any]],
+    filepath: str,
+    observable_path: Tuple[str, ...],
+    title: str,
+    colorbar_label: str,
+    title_label: str | None = None,
+) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    good_rows = [
+        row for row in rows
+        if str(row.get("status", "completed")) == "completed"
+    ]
+    if len(good_rows) == 0:
+        raise RuntimeError("No completed observable-scan rows available to plot.")
+
+    alphas = np.asarray(sorted({float(row["alpha"]) for row in good_rows}), dtype=float)
+    betas = np.asarray(sorted({float(row["beta"]) for row in good_rows}), dtype=float)
+    value_grid = np.full((len(betas), len(alphas)), np.nan, dtype=float)
+    alpha_index = {float(value): idx for idx, value in enumerate(alphas)}
+    beta_index = {float(value): idx for idx, value in enumerate(betas)}
+
+    for row in good_rows:
+        alpha = float(row["alpha"])
+        beta = float(row["beta"])
+        value_grid[beta_index[beta], alpha_index[alpha]] = _nested_phase_observable_value(
+            row,
+            observable_path,
+        )
+
+    if not np.any(np.isfinite(value_grid)):
+        raise RuntimeError(f"No finite values available for observable path {'.'.join(observable_path)}.")
+
+    alpha_edges = _grid_edges(alphas)
+    beta_edges = _grid_edges(betas)
+    masked_grid = np.ma.masked_invalid(value_grid)
+
+    fig, ax = plt.subplots(figsize=(7.1, 5.2), dpi=150)
+    mesh = ax.pcolormesh(
+        alpha_edges,
+        beta_edges,
+        masked_grid,
+        cmap="viridis",
+        shading="flat",
+        edgecolors=(0.0, 0.0, 0.0, 0.10),
+        linewidth=0.25,
+    )
+    ax.scatter(
+        [float(row["alpha"]) for row in good_rows],
+        [float(row["beta"]) for row in good_rows],
+        c="black",
+        s=7,
+        marker=".",
+        linewidths=0,
+        zorder=3,
+    )
+    ax.set_xlabel(r"$\alpha$")
+    ax.set_ylabel(r"$\beta$")
+    ax.set_title(titled_for_run(title, title_label))
+    ax.set_xlim(float(alpha_edges[0]), float(alpha_edges[-1]))
+    ax.set_ylim(float(beta_edges[0]), float(beta_edges[-1]))
+    ax.grid(color="black", alpha=0.12, linewidth=0.4)
+    colorbar = fig.colorbar(mesh, ax=ax)
+    colorbar.set_label(colorbar_label)
+    fig.tight_layout()
+    fig.savefig(filepath)
+    plt.close(fig)
+
+
 def save_phase_diagram_plot(
     rows: List[Dict[str, Any]],
     filepath: str,
@@ -1086,3 +1870,310 @@ def save_phase_diagram_plot(
 
 
 # ----------------------------------------------------------------------
+
+PHASE_DIAGRAM_TITLES: tuple[tuple[str, str], ...] = (
+    ("classical_product", "Classical Product-State Phase Diagram"),
+    ("quantum_ed", "Quantum ED Phase Diagram"),
+    ("tenax_dmrg", "Tenax Finite-DMRG Phase Diagram"),
+    ("tenpy_dmrg", "TeNPy Finite-DMRG Phase Diagram"),
+    ("tenax_idmrg", "Tenax iDMRG Phase Diagram"),
+    ("tenpy_idmrg", "TeNPy iDMRG Phase Diagram"),
+)
+
+TENSOR_NETWORK_OBSERVABLE_TITLES: tuple[tuple[str, str], ...] = (
+    ("tenpy_dmrg", "TeNPy finite-DMRG"),
+    ("tenpy_idmrg", "TeNPy iDMRG"),
+)
+
+BASE_PHASE_OBSERVABLE_SPECS: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    ("S_E", ("observables", "S_E"), "Center-bond entanglement entropy"),
+    ("Sz_center", ("observables", "local_order_parameters", "Sz_center_mean"), "Center-site <Sz>"),
+    ("tau_z_center", ("observables", "local_order_parameters", "tau_z_center_mean"), "Center-site <tau_z>"),
+    ("W_p", ("observables", "W_p"), "Plaquette flux W_p"),
+)
+
+
+def _load_json_object(json_path: str) -> dict[str, Any]:
+    with open(json_path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError("The JSON file must contain an object.")
+    return data
+
+
+def _phase_scan_from_json_object(data: dict[str, Any]) -> dict[str, Any]:
+    phase_scan = data.get("phase_scan")
+    if isinstance(phase_scan, dict):
+        return phase_scan
+    if any(mode_key in data for mode_key, _title in PHASE_DIAGRAM_TITLES):
+        return data
+    raise KeyError("No phase_scan object found in the JSON file.")
+
+
+def _default_phase_json_prefix(json_path: str, data: dict[str, Any]) -> str:
+    prefix = data.get("run_output_prefix")
+    if isinstance(prefix, str) and prefix.strip():
+        return prefix.strip()
+
+    stem = os.path.splitext(os.path.basename(json_path))[0]
+    for suffix in ("_run_summary", "_phase_scan_summary"):
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)]
+    return stem
+
+
+def _phase_diagram_base_name(mode_key: str) -> str:
+    if mode_key == "classical_product":
+        return "classical_phase_diagram.png"
+    if mode_key == "quantum_ed":
+        return "quantum_phase_diagram.png"
+    return f"{mode_key}_phase_diagram.png"
+
+
+def _labeled_filename(prefix: str, base_name: str) -> str:
+    return f"{prefix}_{base_name}" if prefix else base_name
+
+
+def _observable_specs_for_phase_mode(mode_key: str) -> list[tuple[str, tuple[str, ...], str]]:
+    specs = list(BASE_PHASE_OBSERVABLE_SPECS)
+    if mode_key == "tenpy_idmrg":
+        specs.append(("xi", ("observables", "xi"), "Correlation length xi"))
+    return specs
+
+
+def save_phase_diagrams_from_json(
+    json_path: str,
+    *,
+    output_folder: str | None = None,
+    prefix: str | None = None,
+    modes: list[str] | None = None,
+    continue_on_error: bool = True,
+) -> dict[str, str]:
+    """Save phase diagram and phase-observable PNGs from a run-summary JSON."""
+    data = _load_json_object(json_path)
+    phase_scan = _phase_scan_from_json_object(data)
+
+    target_folder = output_folder or os.path.dirname(os.path.abspath(json_path))
+    os.makedirs(target_folder, exist_ok=True)
+    filename_prefix = prefix or _default_phase_json_prefix(json_path, data)
+    requested_modes = set(modes or [])
+    saved: dict[str, str] = {}
+
+    def should_plot_mode(mode_key: str) -> bool:
+        return not requested_modes or mode_key in requested_modes
+
+    def handle_plot_error(label: str, exc: Exception) -> None:
+        if not continue_on_error:
+            raise exc
+        print(f"[phase-plot] skipped {label}: {exc}")
+
+    for mode_key, title in PHASE_DIAGRAM_TITLES:
+        if not should_plot_mode(mode_key):
+            continue
+        mode_data = phase_scan.get(mode_key)
+        if not isinstance(mode_data, dict):
+            continue
+        rows = list(mode_data.get("rows", []))
+        if not rows:
+            print(f"[phase-plot] skipped {mode_key}: no rows available")
+            continue
+        base_name = _phase_diagram_base_name(mode_key)
+        filepath = os.path.join(target_folder, _labeled_filename(filename_prefix, base_name))
+        try:
+            save_phase_diagram_plot(rows, filepath, title)
+        except Exception as exc:
+            handle_plot_error(f"{mode_key} phase diagram", exc)
+            continue
+        saved[f"{mode_key}_phase_diagram"] = filepath
+        print(f"[phase-plot] saved: {filepath}")
+
+    for mode_key, title_prefix in TENSOR_NETWORK_OBSERVABLE_TITLES:
+        if not should_plot_mode(mode_key):
+            continue
+        mode_data = phase_scan.get(mode_key)
+        if not isinstance(mode_data, dict):
+            continue
+        rows = list(mode_data.get("rows", []))
+        if not rows:
+            print(f"[phase-plot] skipped {mode_key} observables: no rows available")
+            continue
+        for observable_name, observable_path, colorbar_label in _observable_specs_for_phase_mode(mode_key):
+            base_name = f"{mode_key}_{observable_name}_phase_observable.png"
+            filepath = os.path.join(target_folder, _labeled_filename(filename_prefix, base_name))
+            title = f"{title_prefix} {colorbar_label}"
+            try:
+                save_phase_observable_heatmap(
+                    rows,
+                    filepath,
+                    observable_path,
+                    title,
+                    colorbar_label,
+                )
+            except Exception as exc:
+                handle_plot_error(f"{mode_key} {observable_name}", exc)
+                continue
+            saved[f"{mode_key}_{observable_name}"] = filepath
+            print(f"[phase-plot] saved: {filepath}")
+
+    if requested_modes:
+        known_modes = {key for key, _title in PHASE_DIAGRAM_TITLES}
+        missing_modes = sorted(requested_modes.difference(known_modes))
+        if missing_modes:
+            print(f"[phase-plot] warning: unknown mode(s): {', '.join(missing_modes)}")
+
+    return saved
+
+
+def _geometry_from_run_summary(summary: dict[str, Any]) -> GeometryData:
+    parameters = summary.get("parameters") or {}
+    geometry_summary = summary.get("geometry") or {}
+    lattice = parameters.get("lattice") or geometry_summary.get("lattice") or "honeycomb"
+    try:
+        length_x = int(parameters.get("length_x", geometry_summary["length_x"]))
+        length_y = int(parameters.get("length_y", geometry_summary["length_y"]))
+    except KeyError as exc:
+        raise KeyError(
+            "Run summary is missing length_x/length_y. Regenerate it with the current ylmodel_main.py."
+        ) from exc
+    circumference_x = bool(parameters.get("circumference_x", geometry_summary.get("circumference_x", False)))
+    circumference_y = bool(parameters.get("circumference_y", geometry_summary.get("circumference_y", True)))
+    return build_lattice_geometry(
+        str(lattice),
+        length_x=length_x,
+        length_y=length_y,
+        circumference_x=circumference_x,
+        circumference_y=circumference_y,
+    )
+
+
+def _pattern_payload_from_summary(summary: dict[str, Any], method: str) -> dict[str, Any]:
+    method_payload = summary.get(method)
+    if not isinstance(method_payload, dict):
+        raise KeyError(f"Run summary has no '{method}' section.")
+    patterns = method_payload.get("real_space_patterns")
+    if not isinstance(patterns, dict):
+        raise KeyError(
+            f"Run summary has no {method}.real_space_patterns data. "
+            "Run ylmodel_main.py with --calculate-real-space-patterns."
+        )
+    correlations = patterns.get("correlations")
+    if not isinstance(correlations, dict) or "S" not in correlations or "T" not in correlations:
+        raise KeyError(
+            f"{method}.real_space_patterns must contain spin 'S' and orbital 'T' correlation rows."
+        )
+    return patterns
+
+
+def _default_pattern_json_prefix(summary_json: str, method: str) -> str:
+    stem = os.path.splitext(os.path.basename(summary_json))[0]
+    suffix = "_run_summary"
+    if stem.endswith(suffix):
+        stem = stem[: -len(suffix)]
+    return f"{stem}_{method}"
+
+
+def save_patterns_from_summary(
+    summary_json: str,
+    *,
+    method: str = "dmrg",
+    output_folder: str | None = None,
+    prefix: str | None = None,
+) -> dict[str, str]:
+    """Save spin and orbital reference-site pattern diagrams from a run-summary JSON."""
+    summary = _load_json_object(summary_json)
+    geometry = _geometry_from_run_summary(summary)
+    patterns = _pattern_payload_from_summary(summary, method)
+    reference_site_idx = int(patterns["reference_site_idx"])
+    correlations = patterns["correlations"]
+
+    target_folder = output_folder or os.path.dirname(os.path.abspath(summary_json))
+    os.makedirs(target_folder, exist_ok=True)
+    filename_prefix = prefix or _default_pattern_json_prefix(summary_json, method)
+
+    spin_path = os.path.join(target_folder, f"{filename_prefix}_spin_real_space_pattern.png")
+    orbital_path = os.path.join(target_folder, f"{filename_prefix}_orbital_real_space_pattern.png")
+
+    save_real_space_pattern_diagram(
+        geometry=geometry,
+        correlation_array=np.asarray(correlations["S"], dtype=float),
+        reference_site_idx=reference_site_idx,
+        filepath=spin_path,
+        title=f"{method.upper()} spin reference-site pattern",
+        channel_label="C_S[j] = <S_ref . S_j>",
+    )
+    save_real_space_pattern_diagram(
+        geometry=geometry,
+        correlation_array=np.asarray(correlations["T"], dtype=float),
+        reference_site_idx=reference_site_idx,
+        filepath=orbital_path,
+        title=f"{method.upper()} orbital reference-site pattern",
+        channel_label="C_T[j] = <T_ref . T_j>",
+    )
+    return {"spin": spin_path, "orbital": orbital_path}
+
+
+def _build_plot_outputs_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Plotting utilities for Yao-Lee run summaries. All plotting entrypoints live here."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    phase_parser = subparsers.add_parser(
+        "phase-json",
+        help="Regenerate phase-scan diagrams from a *_run_summary.json or *_phase_scan_summary.json file.",
+    )
+    phase_parser.add_argument("json_path", help="Path to the saved run summary JSON.")
+    phase_parser.add_argument("--output-folder", default=None, help="Folder for generated PNG files.")
+    phase_parser.add_argument("--prefix", default=None, help="Output filename prefix. Defaults to run_output_prefix.")
+    phase_parser.add_argument(
+        "--mode",
+        action="append",
+        default=None,
+        help="Only plot one phase-scan mode. May be supplied multiple times.",
+    )
+    phase_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Stop at the first plot error instead of continuing with other figures.",
+    )
+
+    pattern_parser = subparsers.add_parser(
+        "real-space-json",
+        help="Regenerate reference-site real-space pattern diagrams from a run summary.",
+    )
+    pattern_parser.add_argument("summary_json", help="Path to a *_run_summary.json file.")
+    pattern_parser.add_argument("--method", choices=("dmrg", "ed"), default="dmrg", help="Summary method section to plot.")
+    pattern_parser.add_argument("--output-folder", default=None, help="Folder for generated PNG files.")
+    pattern_parser.add_argument("--prefix", default=None, help="Output filename prefix.")
+    return parser
+
+
+def main() -> None:
+    parser = _build_plot_outputs_parser()
+    args = parser.parse_args()
+    if args.command == "phase-json":
+        saved = save_phase_diagrams_from_json(
+            args.json_path,
+            output_folder=args.output_folder,
+            prefix=args.prefix,
+            modes=args.mode,
+            continue_on_error=not args.strict,
+        )
+        if not saved:
+            raise SystemExit("[phase-plot] no plots were generated.")
+        return
+    if args.command == "real-space-json":
+        saved = save_patterns_from_summary(
+            args.summary_json,
+            method=args.method,
+            output_folder=args.output_folder,
+            prefix=args.prefix,
+        )
+        print(f"[pattern] saved spin: {saved['spin']}")
+        print(f"[pattern] saved orbital: {saved['orbital']}")
+        return
+    parser.error(f"Unknown command '{args.command}'.")
+
+
+if __name__ == "__main__":
+    main()

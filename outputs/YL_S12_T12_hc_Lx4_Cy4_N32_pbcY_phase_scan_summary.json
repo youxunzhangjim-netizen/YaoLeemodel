@@ -1,0 +1,1402 @@
+{
+  "classifier_note": "Phase labels are finite-size, observable-based assignments from dominant spin/orbital structure factors plus bond-energy nematicity. They are saved with diagnostics for reproducibility and should be checked against larger clusters or denser grids before quoting thermodynamic boundaries.",
+  "classifier_thresholds": {
+    "classical_bond_nematicity": 0.08,
+    "classical_weak_order": 0.075,
+    "quantum_bond_nematicity": 0.1,
+    "quantum_weak_order": 0.035
+  },
+  "grid": {
+    "alpha_max": 2.25,
+    "alpha_min": 0.0,
+    "alpha_points": 17,
+    "alpha_values": [
+      0.0,
+      0.140625,
+      0.28125,
+      0.421875,
+      0.5625,
+      0.703125,
+      0.84375,
+      0.984375,
+      1.125,
+      1.265625,
+      1.40625,
+      1.546875,
+      1.6875,
+      1.828125,
+      1.96875,
+      2.109375,
+      2.25
+    ],
+    "beta_max": 0.27,
+    "beta_min": 0.0,
+    "beta_points": 13,
+    "beta_values": [
+      0.0,
+      0.022500000000000003,
+      0.045000000000000005,
+      0.0675,
+      0.09000000000000001,
+      0.11250000000000002,
+      0.135,
+      0.15750000000000003,
+      0.18000000000000002,
+      0.2025,
+      0.22500000000000003,
+      0.24750000000000003,
+      0.27
+    ]
+  },
+  "mode": "quantum_ed",
+  "quantum_ed": {
+    "completed_points": 0,
+    "failed_points": 0,
+    "rows": [
+      {
+        "alpha": 0.0,
+        "beta": 0.0,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.140625,
+        "beta": 0.0,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.28125,
+        "beta": 0.0,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.421875,
+        "beta": 0.0,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.5625,
+        "beta": 0.0,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.703125,
+        "beta": 0.0,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.84375,
+        "beta": 0.0,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.984375,
+        "beta": 0.0,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.125,
+        "beta": 0.0,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.265625,
+        "beta": 0.0,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.40625,
+        "beta": 0.0,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.546875,
+        "beta": 0.0,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.6875,
+        "beta": 0.0,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.828125,
+        "beta": 0.0,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.96875,
+        "beta": 0.0,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.109375,
+        "beta": 0.0,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.25,
+        "beta": 0.0,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.0,
+        "beta": 0.022500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.140625,
+        "beta": 0.022500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.28125,
+        "beta": 0.022500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.421875,
+        "beta": 0.022500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.5625,
+        "beta": 0.022500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.703125,
+        "beta": 0.022500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.84375,
+        "beta": 0.022500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.984375,
+        "beta": 0.022500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.125,
+        "beta": 0.022500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.265625,
+        "beta": 0.022500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.40625,
+        "beta": 0.022500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.546875,
+        "beta": 0.022500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.6875,
+        "beta": 0.022500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.828125,
+        "beta": 0.022500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.96875,
+        "beta": 0.022500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.109375,
+        "beta": 0.022500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.25,
+        "beta": 0.022500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.0,
+        "beta": 0.045000000000000005,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.140625,
+        "beta": 0.045000000000000005,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.28125,
+        "beta": 0.045000000000000005,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.421875,
+        "beta": 0.045000000000000005,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.5625,
+        "beta": 0.045000000000000005,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.703125,
+        "beta": 0.045000000000000005,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.84375,
+        "beta": 0.045000000000000005,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.984375,
+        "beta": 0.045000000000000005,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.125,
+        "beta": 0.045000000000000005,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.265625,
+        "beta": 0.045000000000000005,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.40625,
+        "beta": 0.045000000000000005,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.546875,
+        "beta": 0.045000000000000005,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.6875,
+        "beta": 0.045000000000000005,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.828125,
+        "beta": 0.045000000000000005,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.96875,
+        "beta": 0.045000000000000005,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.109375,
+        "beta": 0.045000000000000005,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.25,
+        "beta": 0.045000000000000005,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.0,
+        "beta": 0.0675,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.140625,
+        "beta": 0.0675,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.28125,
+        "beta": 0.0675,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.421875,
+        "beta": 0.0675,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.5625,
+        "beta": 0.0675,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.703125,
+        "beta": 0.0675,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.84375,
+        "beta": 0.0675,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.984375,
+        "beta": 0.0675,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.125,
+        "beta": 0.0675,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.265625,
+        "beta": 0.0675,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.40625,
+        "beta": 0.0675,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.546875,
+        "beta": 0.0675,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.6875,
+        "beta": 0.0675,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.828125,
+        "beta": 0.0675,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.96875,
+        "beta": 0.0675,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.109375,
+        "beta": 0.0675,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.25,
+        "beta": 0.0675,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.0,
+        "beta": 0.09000000000000001,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.140625,
+        "beta": 0.09000000000000001,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.28125,
+        "beta": 0.09000000000000001,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.421875,
+        "beta": 0.09000000000000001,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.5625,
+        "beta": 0.09000000000000001,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.703125,
+        "beta": 0.09000000000000001,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.84375,
+        "beta": 0.09000000000000001,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.984375,
+        "beta": 0.09000000000000001,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.125,
+        "beta": 0.09000000000000001,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.265625,
+        "beta": 0.09000000000000001,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.40625,
+        "beta": 0.09000000000000001,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.546875,
+        "beta": 0.09000000000000001,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.6875,
+        "beta": 0.09000000000000001,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.828125,
+        "beta": 0.09000000000000001,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.96875,
+        "beta": 0.09000000000000001,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.109375,
+        "beta": 0.09000000000000001,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.25,
+        "beta": 0.09000000000000001,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.0,
+        "beta": 0.11250000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.140625,
+        "beta": 0.11250000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.28125,
+        "beta": 0.11250000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.421875,
+        "beta": 0.11250000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.5625,
+        "beta": 0.11250000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.703125,
+        "beta": 0.11250000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.84375,
+        "beta": 0.11250000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.984375,
+        "beta": 0.11250000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.125,
+        "beta": 0.11250000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.265625,
+        "beta": 0.11250000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.40625,
+        "beta": 0.11250000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.546875,
+        "beta": 0.11250000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.6875,
+        "beta": 0.11250000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.828125,
+        "beta": 0.11250000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.96875,
+        "beta": 0.11250000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.109375,
+        "beta": 0.11250000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.25,
+        "beta": 0.11250000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.0,
+        "beta": 0.135,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.140625,
+        "beta": 0.135,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.28125,
+        "beta": 0.135,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.421875,
+        "beta": 0.135,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.5625,
+        "beta": 0.135,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.703125,
+        "beta": 0.135,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.84375,
+        "beta": 0.135,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.984375,
+        "beta": 0.135,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.125,
+        "beta": 0.135,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.265625,
+        "beta": 0.135,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.40625,
+        "beta": 0.135,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.546875,
+        "beta": 0.135,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.6875,
+        "beta": 0.135,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.828125,
+        "beta": 0.135,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.96875,
+        "beta": 0.135,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.109375,
+        "beta": 0.135,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.25,
+        "beta": 0.135,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.0,
+        "beta": 0.15750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.140625,
+        "beta": 0.15750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.28125,
+        "beta": 0.15750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.421875,
+        "beta": 0.15750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.5625,
+        "beta": 0.15750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.703125,
+        "beta": 0.15750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.84375,
+        "beta": 0.15750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.984375,
+        "beta": 0.15750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.125,
+        "beta": 0.15750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.265625,
+        "beta": 0.15750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.40625,
+        "beta": 0.15750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.546875,
+        "beta": 0.15750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.6875,
+        "beta": 0.15750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.828125,
+        "beta": 0.15750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.96875,
+        "beta": 0.15750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.109375,
+        "beta": 0.15750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.25,
+        "beta": 0.15750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.0,
+        "beta": 0.18000000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.140625,
+        "beta": 0.18000000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.28125,
+        "beta": 0.18000000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.421875,
+        "beta": 0.18000000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.5625,
+        "beta": 0.18000000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.703125,
+        "beta": 0.18000000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.84375,
+        "beta": 0.18000000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.984375,
+        "beta": 0.18000000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.125,
+        "beta": 0.18000000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.265625,
+        "beta": 0.18000000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.40625,
+        "beta": 0.18000000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.546875,
+        "beta": 0.18000000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.6875,
+        "beta": 0.18000000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.828125,
+        "beta": 0.18000000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.96875,
+        "beta": 0.18000000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.109375,
+        "beta": 0.18000000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.25,
+        "beta": 0.18000000000000002,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.0,
+        "beta": 0.2025,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.140625,
+        "beta": 0.2025,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.28125,
+        "beta": 0.2025,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.421875,
+        "beta": 0.2025,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.5625,
+        "beta": 0.2025,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.703125,
+        "beta": 0.2025,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.84375,
+        "beta": 0.2025,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.984375,
+        "beta": 0.2025,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.125,
+        "beta": 0.2025,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.265625,
+        "beta": 0.2025,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.40625,
+        "beta": 0.2025,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.546875,
+        "beta": 0.2025,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.6875,
+        "beta": 0.2025,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.828125,
+        "beta": 0.2025,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.96875,
+        "beta": 0.2025,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.109375,
+        "beta": 0.2025,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.25,
+        "beta": 0.2025,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.0,
+        "beta": 0.22500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.140625,
+        "beta": 0.22500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.28125,
+        "beta": 0.22500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.421875,
+        "beta": 0.22500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.5625,
+        "beta": 0.22500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.703125,
+        "beta": 0.22500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.84375,
+        "beta": 0.22500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.984375,
+        "beta": 0.22500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.125,
+        "beta": 0.22500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.265625,
+        "beta": 0.22500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.40625,
+        "beta": 0.22500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.546875,
+        "beta": 0.22500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.6875,
+        "beta": 0.22500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.828125,
+        "beta": 0.22500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.96875,
+        "beta": 0.22500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.109375,
+        "beta": 0.22500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.25,
+        "beta": 0.22500000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.0,
+        "beta": 0.24750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.140625,
+        "beta": 0.24750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.28125,
+        "beta": 0.24750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.421875,
+        "beta": 0.24750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.5625,
+        "beta": 0.24750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.703125,
+        "beta": 0.24750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.84375,
+        "beta": 0.24750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.984375,
+        "beta": 0.24750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.125,
+        "beta": 0.24750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.265625,
+        "beta": 0.24750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.40625,
+        "beta": 0.24750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.546875,
+        "beta": 0.24750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.6875,
+        "beta": 0.24750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.828125,
+        "beta": 0.24750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.96875,
+        "beta": 0.24750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.109375,
+        "beta": 0.24750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.25,
+        "beta": 0.24750000000000003,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.0,
+        "beta": 0.27,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.140625,
+        "beta": 0.27,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.28125,
+        "beta": 0.27,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.421875,
+        "beta": 0.27,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.5625,
+        "beta": 0.27,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.703125,
+        "beta": 0.27,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.84375,
+        "beta": 0.27,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 0.984375,
+        "beta": 0.27,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.125,
+        "beta": 0.27,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.265625,
+        "beta": 0.27,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.40625,
+        "beta": 0.27,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.546875,
+        "beta": 0.27,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.6875,
+        "beta": 0.27,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.828125,
+        "beta": 0.27,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 1.96875,
+        "beta": 0.27,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.109375,
+        "beta": 0.27,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      },
+      {
+        "alpha": 2.25,
+        "beta": 0.27,
+        "reason": "Quantum phase scan limited to 18 sites.",
+        "status": "skipped"
+      }
+    ],
+    "skipped_points": 221,
+    "status": "completed"
+  },
+  "solver_controls": {
+    "classical_final_step": 0.05,
+    "classical_final_temperature": 0.001,
+    "classical_initial_step": 0.8,
+    "classical_initial_temperature": 0.08,
+    "classical_restarts": 6,
+    "classical_sweeps": 320,
+    "quantum_ed_max_hilbert_dimension": 1000000,
+    "quantum_ed_max_sites": 18,
+    "quantum_ed_solver": "sparse",
+    "quantum_ed_sparse_maxiter": null,
+    "quantum_ed_sparse_tol": 0.0,
+    "quantum_ed_use_sz_conserved": true,
+    "random_seed": 1042
+  },
+  "status": "completed"
+}
