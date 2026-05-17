@@ -10,9 +10,12 @@ belongs in ``analysis.py``; PNG output code belongs in ``plot_outputs.py``.
 
 from __future__ import annotations
 
+import math
 import os
 import re
+import functools
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -20,12 +23,30 @@ from analysis import _make_progress_bar
 
 AXIS_OPTIONS = ("x", "y", "z")
 AXES = AXIS_OPTIONS
+QUIMB_IPEPS_METHOD_KEY = "quimb_ipeps"
+QUIMB_PEPS_METHOD_KEY = "quimb_peps"
+QUIMB_IPEPS_LATTICE_OPTIONS = ("honeycomb", "square")
+QUIMB_PEPS_LATTICE_OPTIONS = QUIMB_IPEPS_LATTICE_OPTIONS
+PHASE_SCAN_METHOD_DISPLAY_NAMES = {
+    "ed": "Quantum ED",
+    "dmrg": "finite DMRG",
+    "idmrg": "iDMRG",
+    "peps": "quimb PEPS",
+    "ipeps": "quimb iPEPS",
+    "quantum_ed": "Quantum ED",
+    "tenax_dmrg": "Tenax finite-DMRG",
+    "tenpy_dmrg": "TeNPy finite-DMRG",
+    "tenax_idmrg": "Tenax iDMRG",
+    "tenpy_idmrg": "TeNPy iDMRG",
+    QUIMB_PEPS_METHOD_KEY: "quimb PEPS",
+    QUIMB_IPEPS_METHOD_KEY: "quimb iPEPS",
+}
 SPIN_REP_VALUES = {"1/2": 0.5, "3/2": 1.5}
 # "1" is kept as a legacy alias and normalized to "0".
 ORBITAL_REP_VALUES = {"0": 0.0, "1": 0.0, "1/2": 0.5}
 SPIN_ONLY_MODEL_FAMILIES = ("heisenberg", "xy", "xxz", "xyz")
 U1_SYMMETRY_MODES = ("u1", "u1_sz", "u1_tz")
-SYMMETRY_MODE_OPTIONS = ("none", "auto") + U1_SYMMETRY_MODES + ("z2",)
+SYMMETRY_MODE_OPTIONS = ("none", "auto") + U1_SYMMETRY_MODES + ("z2", "u1_tz_z2", "tz_z2")
 U1_CHARGE_TZ_STRIDE = 4096
 SPIN_REP_DEFAULT = "1/2"
 ORBITAL_REP_DEFAULT = "1/2"
@@ -37,7 +58,7 @@ ORBITAL_REP = ORBITAL_REP_DEFAULT
 MODEL_FAMILY = MODEL_FAMILY_DEFAULT
 ISING_AXIS = ISING_AXIS_DEFAULT
 EXTERNAL_FIELD_TREATMENT_OPTIONS = ("off", "perturbation", "hamiltonian")
-EXTERNAL_FIELD_AXIS_OPTIONS = ("custom", "111")
+EXTERNAL_FIELD_AXIS_OPTIONS = ("custom", "111", "001")
 
 
 def build_spin_only_bond_terms(
@@ -97,6 +118,21 @@ def build_model_spec(
     model_family: str,
     ising_axis: str,
 ) -> ModelSpec:
+    return _build_model_spec_cached(
+        str(spin_rep).strip(),
+        str(orbital_rep).strip(),
+        str(model_family).strip().lower(),
+        str(ising_axis).strip().lower(),
+    )
+
+
+@functools.lru_cache(maxsize=32)
+def _build_model_spec_cached(
+    spin_rep: str,
+    orbital_rep: str,
+    model_family: str,
+    ising_axis: str,
+) -> ModelSpec:
     spin_text = str(spin_rep).strip()
     orbital_text = str(orbital_rep).strip()
     if spin_text not in SPIN_REP_VALUES:
@@ -148,6 +184,8 @@ def _normalize_symmetry_mode(mode: str | None) -> str:
     if text in ("u1_sz", "u1-spin", "u1_spin", "sz", "spin_u1", "u1s"):
         return "u1_sz"
     if text in ("u1_tz", "u1_tau", "u1_orbital", "tz", "tau_z", "orbital_u1", "u1t"):
+        return "u1_tz"
+    if text in ("u1_tz_z2", "u1-tz-z2", "tz_z2", "tz-z2"):
         return "u1_tz"
     if text in ("z2", "z_2", "z(2)", "parity"):
         return "z2"
@@ -372,7 +410,8 @@ def _validate_symmetry_conserving_terms(
             )
 
 
-def build_spin_operators(spin_value: float) -> Dict[str, np.ndarray]:
+@functools.lru_cache(maxsize=16)
+def _build_spin_operators_cached(spin_value: float) -> Tuple[Tuple[str, np.ndarray], ...]:
     two_s = int(round(2.0 * spin_value))
     dim = int(two_s + 1)
     m2_values = [two_s - 2 * index for index in range(dim)]  # stores 2*m
@@ -397,10 +436,23 @@ def build_spin_operators(spin_value: float) -> Dict[str, np.ndarray]:
     sy = -0.5j * (s_plus - s_minus)
     sz = np.diag([0.5 * m2 for m2 in m2_values]).astype(np.complex128)
     ident = np.eye(dim, dtype=np.complex128)
-    return {"Id": ident, "Sx": sx, "Sy": sy, "Sz": sz}
+    return tuple(
+        (name, op)
+        for name, op in {
+            "Id": ident,
+            "Sx": sx,
+            "Sy": sy,
+            "Sz": sz,
+        }.items()
+    )
 
 
-def build_site_ops(model_spec: ModelSpec) -> Dict[str, np.ndarray]:
+def build_spin_operators(spin_value: float) -> Dict[str, np.ndarray]:
+    return {name: op.copy() for name, op in _build_spin_operators_cached(float(spin_value))}
+
+
+@functools.lru_cache(maxsize=32)
+def _build_site_ops_cached(model_spec: ModelSpec) -> Tuple[Tuple[str, np.ndarray], ...]:
     spin_ops = build_spin_operators(model_spec.spin_value)
     orbital_ops = build_spin_operators(model_spec.orbital_value)
     ident_spin = spin_ops["Id"]
@@ -433,7 +485,11 @@ def build_site_ops(model_spec: ModelSpec) -> Dict[str, np.ndarray]:
     ops["STz"] = ops["SzTz"]
     ops["STp"] = ops["SpTp"]
     ops["STm"] = ops["SmTm"]
-    return ops
+    return tuple((name, op) for name, op in ops.items())
+
+
+def build_site_ops(model_spec: ModelSpec) -> Dict[str, np.ndarray]:
+    return {name: op.copy() for name, op in _build_site_ops_cached(model_spec)}
 
 
 def build_yao_lee_site_ops() -> Dict[str, np.ndarray]:
@@ -460,8 +516,9 @@ def model_terms_for_bond(
     """Legacy same-operator bond terms.
 
     New Hamiltonian builders should call ``two_site_operator_terms_for_bond`` so
-    U(1)-symmetric ladder-operator terms such as ``Sp_i Sm_j`` can be represented
-    exactly.  This helper is kept for spin-only benchmarks and old diagnostics.
+    multi-channel terms such as the yao_lee Eq. 7 spin-dot/orbital-dot products
+    can be represented exactly.  This helper is kept for spin-only benchmarks
+    and old diagnostics.
     """
     axis_gamma = str(gamma).lower()
     if axis_gamma not in AXES:
@@ -475,13 +532,6 @@ def model_terms_for_bond(
             )
         return build_spin_only_bond_terms(family, coupling_j=coupling_j, jx=jx, jy=jy, jz=jz)
 
-    # Requested behavior:
-    # orbital_rep == "1" means no orbital DOF, and Yao-Lee orbital-dependent
-    # terms reduce to spin-only Ising-like couplings.
-    if is_trivial_orbital(model_spec):
-        axis = model_spec.ising_axis
-        return [(coupling_j * (1.0 + beta), f"S{axis}")]
-
     if family == "ising_like":
         axis = model_spec.ising_axis
         return [
@@ -489,15 +539,12 @@ def model_terms_for_bond(
             (coupling_j * (1.0 - beta), f"T{axis}"),
             (coupling_j * alpha, f"ST{axis}"),
         ]
-    if family != "yao_lee":
-        raise ValueError(f"Unsupported model family '{model_spec.model_family}'.")
-
-    # Bond-dependent Yao-Lee-like channel.
-    return [
-        (coupling_j * (1.0 + beta), f"S{axis_gamma}"),
-        (coupling_j * (1.0 - beta), f"T{axis_gamma}"),
-        (coupling_j * alpha, f"ST{axis_gamma}"),
-    ]
+    if family == "yao_lee":
+        raise ValueError(
+            "model_terms_for_bond cannot represent the yao_lee Eq. 7 Hamiltonian; "
+            "use two_site_operator_terms_for_bond instead."
+        )
+    raise ValueError(f"Unsupported model family '{model_spec.model_family}'.")
 
 
 def _combine_spin_orbital_operator_names(spin_op: str, orbital_op: str) -> str:
@@ -519,6 +566,15 @@ def _spin_dot_two_site_terms(coefficient: complex) -> List[Tuple[complex, str, s
         (0.5 * coeff, "Sm", "Sp"),
         (coeff, "Sz", "Sz"),
     ]
+
+
+def _spin_axis_two_site_terms(gamma: str, coefficient: complex) -> List[Tuple[complex, str, str]]:
+    """Expansion of ``coefficient * S_i^gamma S_j^gamma``."""
+    axis = str(gamma).strip().lower()
+    if axis not in AXES:
+        raise ValueError(f"Unknown bond axis '{gamma}'.")
+    op_name = f"S{axis}"
+    return [(complex(coefficient), op_name, op_name)]
 
 
 def _orbital_axis_two_site_terms(
@@ -551,52 +607,107 @@ def _orbital_axis_two_site_terms(
     ]
 
 
+def _orbital_dot_two_site_terms(coefficient: complex) -> List[Tuple[complex, str, str]]:
+    """Expansion of ``coefficient * T_i.T_j`` in ladder-compatible operators."""
+    coeff = complex(coefficient)
+    return [
+        (0.5 * coeff, "Tp", "Tm"),
+        (0.5 * coeff, "Tm", "Tp"),
+        (coeff, "Tz", "Tz"),
+    ]
+
+
+def _scale_two_site_terms(
+    prefactor: complex,
+    terms: List[Tuple[complex, str, str]],
+) -> List[Tuple[complex, str, str]]:
+    scale = complex(prefactor)
+    return [
+        (scale * complex(coefficient), str(op_i), str(op_j))
+        for coefficient, op_i, op_j in terms
+        if not _is_zero_coefficient(scale * complex(coefficient))
+    ]
+
+
+def _multiply_spin_orbital_two_site_terms(
+    prefactor: complex,
+    spin_terms: List[Tuple[complex, str, str]],
+    orbital_terms: List[Tuple[complex, str, str]],
+) -> List[Tuple[complex, str, str]]:
+    """Multiply spin and orbital two-site factors into one-site product names."""
+    scale = complex(prefactor)
+    product_terms: List[Tuple[complex, str, str]] = []
+    for spin_coeff, spin_i, spin_j in spin_terms:
+        for orbital_coeff, orbital_i, orbital_j in orbital_terms:
+            coefficient = scale * complex(spin_coeff) * complex(orbital_coeff)
+            if _is_zero_coefficient(coefficient):
+                continue
+            product_terms.append(
+                (
+                    coefficient,
+                    _combine_spin_orbital_operator_names(str(spin_i), str(orbital_i)),
+                    _combine_spin_orbital_operator_names(str(spin_j), str(orbital_j)),
+                )
+            )
+    return product_terms
+
+
 def yao_lee_u1_two_site_terms_for_bond(
     gamma: str,
     alpha: float,
     beta: float,
     coupling_j: float,
 ) -> List[Tuple[complex, str, str]]:
-    """Canonical spin/orbital Yao-Lee bond terms preserving total spin Sz.
+    """Canonical two-site expansion of the Yao-Lee paper Eq. 7 Hamiltonian.
 
-    Formula:
-        J * [(1+beta) S_i.S_j
-             + (1-beta) T_i^gamma T_j^gamma
-             + alpha (S_i.S_j)(T_i^gamma T_j^gamma)]
+    We use the working convention requested for this implementation:
+    ``tilde(T)_i . tilde(T)_j == T_i . T_j``.  Thus for each gamma bond,
 
-    The spin part is written with ``Sp/Sm/Sz`` so every term has net spin-U(1)
-    charge zero.  The orbital part is unrestricted; ``Ty Ty`` is exactly
-    represented through the real ``Tp/Tm`` expansion.
+        H_ij = -J * [
+            alpha (S_i.S_j)(T_i.T_j)
+            - alpha beta (S_i.S_j)
+            - 2 (S_i^gamma S_j^gamma)(T_i.T_j)
+            + 2 beta (S_i^gamma S_j^gamma)
+            - beta (T_i.T_j)
+            + beta^2 I_i I_j
+        ].
     """
     axis = str(gamma).strip().lower()
     if axis not in AXES:
         raise ValueError(f"Unknown bond axis '{gamma}'.")
 
-    spin_terms = _spin_dot_two_site_terms(float(coupling_j) * (1.0 + float(beta)))
-    orbital_terms = _orbital_axis_two_site_terms(
-        axis,
-        float(coupling_j) * (1.0 - float(beta)),
-        real_ladder_y=True,
-    )
-    mixed_spin_terms = _spin_dot_two_site_terms(1.0)
-    mixed_orbital_terms = _orbital_axis_two_site_terms(axis, 1.0, real_ladder_y=True)
+    j_scale = float(coupling_j)
+    alpha_value = float(alpha)
+    beta_value = float(beta)
+    spin_dot_terms = _spin_dot_two_site_terms(1.0)
+    spin_gamma_terms = _spin_axis_two_site_terms(axis, 1.0)
+    orbital_dot_terms = _orbital_dot_two_site_terms(1.0)
 
     terms: List[Tuple[complex, str, str]] = []
-    terms.extend(spin_terms)
-    terms.extend(orbital_terms)
-    for spin_coeff, spin_i, spin_j in mixed_spin_terms:
-        for orbital_coeff, orbital_i, orbital_j in mixed_orbital_terms:
-            terms.append(
-                (
-                    complex(float(coupling_j) * float(alpha)) * spin_coeff * orbital_coeff,
-                    _combine_spin_orbital_operator_names(spin_i, orbital_i),
-                    _combine_spin_orbital_operator_names(spin_j, orbital_j),
-                )
-            )
+    terms.extend(
+        _multiply_spin_orbital_two_site_terms(
+            -j_scale * alpha_value,
+            spin_dot_terms,
+            orbital_dot_terms,
+        )
+    )
+    terms.extend(_scale_two_site_terms(j_scale * alpha_value * beta_value, spin_dot_terms))
+    terms.extend(
+        _multiply_spin_orbital_two_site_terms(
+            2.0 * j_scale,
+            spin_gamma_terms,
+            orbital_dot_terms,
+        )
+    )
+    terms.extend(_scale_two_site_terms(-2.0 * j_scale * beta_value, spin_gamma_terms))
+    terms.extend(_scale_two_site_terms(j_scale * beta_value, orbital_dot_terms))
+    constant = -j_scale * beta_value * beta_value
+    if not _is_zero_coefficient(constant):
+        terms.append((complex(constant), "Id", "Id"))
     return [
-        (complex(coeff), op_i, op_j)
-        for coeff, op_i, op_j in terms
-        if not _is_zero_coefficient(coeff)
+        (complex(coefficient), str(op_i), str(op_j))
+        for coefficient, op_i, op_j in terms
+        if not _is_zero_coefficient(coefficient)
     ]
 
 
@@ -613,11 +724,10 @@ def two_site_operator_terms_for_bond(
     """Return explicit two-site Hamiltonian terms ``(coeff, op_i, op_j)``.
 
     Unlike the legacy ``model_terms_for_bond`` helper, this supports different
-    one-site operators on the two sites, which is required for U(1)-symmetric
-    ladder-operator MPOs.
+    one-site operators on the two sites and multi-channel spin/orbital products.
     """
     family = str(model_spec.model_family).strip().lower()
-    if family == "yao_lee" and not is_trivial_orbital(model_spec):
+    if family == "yao_lee":
         return yao_lee_u1_two_site_terms_for_bond(gamma, alpha, beta, coupling_j)
     return [
         (complex(coefficient), str(op_name), str(op_name))
@@ -646,8 +756,44 @@ def auto_mpo_terms_for_bond(
     jx: float = 1.0,
     jy: float = 1.0,
     jz: float = 1.0,
+    symmetry_mode: str = "none",
+    strict_charge_conservation: bool = True,
 ) -> List[Tuple[Any, str, int, str, int]]:
-    """Return Tenax/AutoMPO-ready terms for one geometry bond."""
+    """Return Tenax/AutoMPO-ready terms for one geometry bond.
+
+    When a U(1) symmetry is requested, spin/orbital benchmark models are emitted
+    in a ladder-operator basis so conserving pairs such as ``SxSx + SySy`` are
+    recognized by the shared charge validator.  The full Yao-Lee expansion stays
+    explicit; the validator is then allowed to reject incompatible sectors such
+    as total ``Sz``.
+    """
+    mode = _normalize_symmetry_mode(symmetry_mode)
+    family = str(model_spec.model_family).strip().lower()
+    if _is_u1_symmetry_mode(mode) and family != "yao_lee":
+        bond_terms = model_terms_for_bond(
+            gamma,
+            model_spec,
+            alpha,
+            beta,
+            coupling_j,
+            jx=jx,
+            jy=jy,
+            jz=jz,
+        )
+        terms = auto_mpo_pair_terms_for_bond_terms(
+            bond_terms,
+            int(i),
+            int(j),
+            symmetry_mode=mode,
+            strict_charge_conservation=bool(strict_charge_conservation),
+        )
+        if int(i) <= int(j):
+            return list(terms)
+        return [
+            (coefficient, op_j, int(j), op_i, int(i))
+            for coefficient, op_i, _i, op_j, _j in terms
+        ]
+
     terms: List[Tuple[Any, str, int, str, int]] = []
     for coefficient, op_i, op_j in two_site_operator_terms_for_bond(
         gamma,
@@ -695,7 +841,9 @@ def _normalize_external_field_axis(axis: str | None) -> str:
         return "custom"
     if text in ("111", "1,1,1", "1 1 1"):
         return "111"
-    raise ValueError(f"Unsupported external_field_axis '{axis}'. Choose from: custom, 111.")
+    if text in ("001", "0,0,1", "0 0 1", "z", "hz"):
+        return "001"
+    raise ValueError(f"Unsupported external_field_axis '{axis}'. Choose from: custom, 111, 001.")
 
 
 def external_field_vector(
@@ -709,7 +857,20 @@ def external_field_vector(
     if axis_mode == "111":
         component = float(strength) / float(np.sqrt(3.0))
         return component, component, component
+    if axis_mode == "001":
+        return 0.0, 0.0, float(strength)
     return float(hx), float(hy), float(hz)
+
+
+def resolve_field_vector(
+    axis: str,
+    strength: float,
+    hx: float,
+    hy: float,
+    hz: float,
+) -> Tuple[float, float, float]:
+    """Compatibility wrapper for the shared external-field vector convention."""
+    return external_field_vector(axis=axis, strength=strength, hx=hx, hy=hy, hz=hz)
 
 
 def external_field_is_active(treatment: str, field_vector: Tuple[float, float, float]) -> bool:
@@ -734,26 +895,443 @@ def external_field_terms_for_model(
     return [(coefficient, op_name) for coefficient, op_name in terms if abs(float(coefficient)) > 1e-14]
 
 
+def _field_component_mask(field_vector: Tuple[float, float, float], tol: float) -> Dict[str, bool]:
+    hx, hy, hz = [float(component) for component in field_vector]
+    return {
+        "x": abs(hx) > float(tol),
+        "y": abs(hy) > float(tol),
+        "z": abs(hz) > float(tol),
+    }
+
+
+def _classify_field_vector(field_vector: Tuple[float, float, float], tol: float = 1.0e-14) -> str:
+    hx, hy, hz = [float(component) for component in field_vector]
+    mask = _field_component_mask((hx, hy, hz), tol)
+    active_axes = [axis for axis in ("x", "y", "z") if mask[axis]]
+    if len(active_axes) == 0:
+        return "none"
+    if len(active_axes) == 1:
+        return f"h{active_axes[0]}"
+    if (
+        len(active_axes) == 3
+        and abs(hx - hy) <= float(tol)
+        and abs(hy - hz) <= float(tol)
+    ):
+        return "h111"
+    return "generic"
+
+
+def classify_external_field(
+    external_field_treatment: str,
+    field_vector: Tuple[float, float, float],
+    tol: float = 1.0e-14,
+) -> Dict[str, Any]:
+    """Classify the field that is actually present in the Hamiltonian.
+
+    ``perturbation`` is deliberately not an inserted Hamiltonian field, so the
+    returned ``field_class`` is ``perturbation_only`` even when the annotated
+    vector would break spin-sector symmetries.
+    """
+    treatment = _normalize_external_field_treatment(external_field_treatment)
+    vector = tuple(float(component) for component in field_vector)
+    vector_class = _classify_field_vector(vector, tol=tol)
+    active = vector_class != "none"
+    inserted = bool(treatment == "hamiltonian" and active)
+    perturbation_only = bool(treatment == "perturbation" and active)
+    if treatment == "off" or not active:
+        field_class = "none"
+    elif perturbation_only:
+        field_class = "perturbation_only"
+    else:
+        field_class = vector_class
+    axis_generator = {
+        "hx": "Rx_pi",
+        "hy": "Ry_pi",
+        "hz": "Rz_pi",
+    }.get(vector_class)
+    return {
+        "treatment": treatment,
+        "field_vector": [float(component) for component in vector],
+        "field_component_tol": float(tol),
+        "vector_class": vector_class,
+        "field_class": field_class,
+        "active": bool(active),
+        "inserted_in_hamiltonian": bool(inserted),
+        "perturbation_only": bool(perturbation_only),
+        "single_axis_generator": axis_generator,
+        "nonzero_components": [
+            axis
+            for axis, present in _field_component_mask(vector, tol).items()
+            if present
+        ],
+    }
+
+
+def _is_yao_lee_spin_orbital_half(model_spec: ModelSpec) -> bool:
+    return (
+        str(model_spec.model_family).strip().lower() == "yao_lee"
+        and str(model_spec.orbital_rep).strip() == "1/2"
+    )
+
+
+def yao_lee_conserved_symmetries(
+    model_family: str,
+    orbital_rep: str,
+    external_field_treatment: str,
+    field_vector: Tuple[float, float, float],
+    tol: float = 1.0e-14,
+) -> Dict[str, Any]:
+    """Return model-aware Yao-Lee symmetry facts used by all backends.
+
+    The production block symmetry is total ``Tz``.  Total ``Sz`` is never a
+    valid Yao-Lee block because the spin sector has bond-dependent
+    ``S_i^gamma S_j^gamma`` terms.  S-sector D2 pi rotations are reported as
+    physical facts but marked unimplemented for Hilbert-space reduction.
+    """
+    family = str(model_family).strip().lower()
+    orbital = str(orbital_rep).strip()
+    field_info = classify_external_field(external_field_treatment, field_vector, tol=tol)
+    is_yao_lee = bool(family == "yao_lee" and orbital == "1/2")
+    if not is_yao_lee:
+        return {
+            "applies": False,
+            "field": field_info,
+            "conserved": {},
+            "notes": ["Non-Yao-Lee symmetry rules are left to the term-level precheck."],
+        }
+
+    field_class = str(field_info["field_class"])
+    if field_class in ("none", "perturbation_only"):
+        surviving_generators = ["Rz_pi", "Rx_pi", "Ry_pi"]
+    elif field_class in ("hx", "hy", "hz"):
+        surviving_generators = [field_info["single_axis_generator"]]
+    else:
+        surviving_generators = []
+
+    warnings: List[str] = []
+    if field_class == "perturbation_only":
+        warnings.append(
+            "The external field is recorded as a perturbation and is not inserted into the Hamiltonian; "
+            "symmetry reductions use the no-field Hamiltonian."
+        )
+        if field_info.get("vector_class") not in ("none", "hz", "hx", "hy"):
+            warnings.append(
+                "The annotated perturbation would break pure S-sector D2 Z2 rotations if inserted as a Hamiltonian term."
+            )
+    if field_class == "h111":
+        warnings.append(
+            "A [111] Hamiltonian field preserves only a combined spin-lattice C3 diagnostic; "
+            "pure S-sector Z2 blocks are not valid."
+        )
+
+    return {
+        "applies": True,
+        "field": field_info,
+        "conserved": {
+            "sz": False,
+            "tz": True,
+            "s_z2_physical_generators": [str(item) for item in surviving_generators if item is not None],
+            "s_z2_block_implemented": bool(field_class in ("none", "perturbation_only")),
+            "s_z2_backend_implemented_generators": (
+                ["spin_flip"] if field_class in ("none", "perturbation_only") else []
+            ),
+            "time_reversal_block": False,
+            "majorana_flux_block": False,
+            "pure_lattice_c3_block": False,
+        },
+        "safe_production_reductions": ["tz"],
+        "warnings": warnings,
+        "notes": [
+            "Total S^z is not conserved for the Yao-Lee spin sector.",
+            "Total T^z is conserved in the transformed orbital basis and is not broken by spin-only Zeeman fields.",
+            "No-field QuSpin ED can combine total Tz with its tested spin_flip Z2 block; "
+            "TeNPy/Tenax finite-DMRG still use total Tz only.",
+            "The sublattice transformation on T is a basis change, not a block-diagonal symmetry sector.",
+        ],
+    }
+
+
+def _normalize_reduction_tokens_for_model_helper(requested_reductions: Any) -> List[str]:
+    if requested_reductions is None:
+        raw_items: List[str] = ["auto"]
+    elif isinstance(requested_reductions, (list, tuple, set)):
+        raw_items = [str(item) for item in requested_reductions]
+    else:
+        raw_items = [
+            item.strip()
+            for item in str(requested_reductions).replace("+", ",").replace(";", ",").split(",")
+            if item.strip()
+        ]
+    if not raw_items:
+        raw_items = ["auto"]
+    aliases = {
+        "0": "none",
+        "false": "none",
+        "off": "none",
+        "dense": "none",
+        "full": "none",
+        "none": "none",
+        "auto": "auto",
+        "best": "auto",
+        "detect": "auto",
+        "u1": "u1",
+        "u1_tz_z2": ("tz", "z2"),
+        "u1-tz-z2": ("tz", "z2"),
+        "u1tz_z2": ("tz", "z2"),
+        "tz_z2": ("tz", "z2"),
+        "tz-z2": ("tz", "z2"),
+        "tzz2": ("tz", "z2"),
+        "u1_sz": "sz",
+        "u1-sz": "sz",
+        "u1sz": "sz",
+        "spin": "sz",
+        "spin_z": "sz",
+        "s_z": "sz",
+        "sz": "sz",
+        "u1_tz": "tz",
+        "u1-tz": "tz",
+        "u1tz": "tz",
+        "tau": "tz",
+        "tau_z": "tz",
+        "t_z": "tz",
+        "tz": "tz",
+        "parity": "z2",
+        "z2": "z2",
+    }
+    normalized: List[str] = []
+    for raw in raw_items:
+        key = str(raw).strip().lower()
+        mapped = aliases.get(key)
+        if mapped is None:
+            raise ValueError(f"Unsupported symmetry reduction '{raw}'.")
+        if isinstance(mapped, (tuple, list)):
+            for item in mapped:
+                if str(item) not in normalized:
+                    normalized.append(str(item))
+        elif mapped == "u1":
+            for item in ("sz", "tz"):
+                if item not in normalized:
+                    normalized.append(item)
+        elif mapped in ("auto", "none"):
+            return [mapped]
+        elif mapped not in normalized:
+            normalized.append(mapped)
+    order = {"sz": 0, "tz": 1, "z2": 2}
+    return sorted(normalized or ["none"], key=lambda item: order.get(item, 99))
+
+
+def normalize_requested_symmetry_reductions(
+    requested_reductions: Any,
+    model_spec: ModelSpec,
+    external_field_treatment: str,
+    field_vector: Tuple[float, float, float],
+    backend: str = "auto",
+    strict: bool = True,
+    allow_dense_fallback: bool = True,
+    *,
+    requested_from_default: bool = False,
+    target_sz2: int = 0,
+    target_tz2: int = 0,
+    z2_target_parity: int = 0,
+    field_component_tol: float = 1.0e-14,
+) -> Dict[str, Any]:
+    """Resolve shared symmetry reductions using model-aware physics rules."""
+    requested = _normalize_reduction_tokens_for_model_helper(requested_reductions)
+    field_info = classify_external_field(
+        external_field_treatment,
+        field_vector,
+        tol=float(field_component_tol),
+    )
+    warnings: List[str] = []
+    errors: List[str] = []
+    dropped: List[str] = []
+    safe: List[str] = []
+    z2_generator: str | None = None
+    backend_name = str(backend).strip().lower()
+
+    if _is_yao_lee_spin_orbital_half(model_spec):
+        facts = yao_lee_conserved_symmetries(
+            model_spec.model_family,
+            model_spec.orbital_rep,
+            external_field_treatment,
+            field_vector,
+            tol=float(field_component_tol),
+        )
+        warnings.extend(str(item) for item in facts.get("warnings", []))
+        effective_request = list(requested)
+        if bool(requested_from_default) and set(effective_request) == {"sz", "z2"}:
+            effective_request = ["auto"]
+            warnings.append(
+                "Default SYMMETRY_REDUCTIONS=('sz','z2') is unsafe for the Yao-Lee model; "
+                "using model-aware auto selection instead."
+            )
+        if "auto" in effective_request:
+            effective_request = ["tz"]
+        if "none" in effective_request:
+            effective_request = []
+
+        if "sz" in effective_request:
+            dropped.append("sz")
+            errors.append("Total S^z is not conserved for the Yao-Lee model; rejecting sz.")
+        if "tz" in effective_request:
+            safe.append("tz")
+        if "z2" in effective_request:
+            physical_generators = list((facts.get("conserved") or {}).get("s_z2_physical_generators", []))
+            implemented_generators = list(
+                (facts.get("conserved") or {}).get("s_z2_backend_implemented_generators", [])
+            )
+            if "spin_flip" in implemented_generators:
+                safe.append("z2")
+                z2_generator = "spin_flip"
+                warnings.append(
+                    "No-field Yao-Lee spin-flip Z2 is accepted for the tested QuSpin ED zblock path. "
+                    "Finite DMRG/iDMRG backends may still run Tz-only because they do not use this Z2 block."
+                )
+            elif physical_generators:
+                dropped.append("z2")
+                z2_generator = str(physical_generators[0])
+                errors.append(
+                    "S-sector Z2 was requested, but the field-compatible "
+                    f"pi-rotation generator {z2_generator} is not implemented in the active Hilbert-space blocks; dropping z2."
+                )
+            else:
+                dropped.append("z2")
+                errors.append(
+                    f"S-sector Z2 is not a valid unitary block for field_class={field_info['field_class']}; dropping z2."
+                )
+        if not safe and "none" not in requested:
+            warnings.append("No requested Yao-Lee reduction survived; using dense/no-symmetry blocks.")
+    else:
+        facts = {
+            "applies": False,
+            "field": field_info,
+            "notes": ["Term-level precheck decides non-Yao-Lee/spin-only symmetry safety."],
+        }
+        if "auto" in requested:
+            safe = ["auto"]
+        elif "none" in requested:
+            safe = []
+        else:
+            safe = [item for item in requested if item in ("sz", "tz", "z2")]
+
+    if errors and (bool(strict) and not bool(allow_dense_fallback)):
+        fatal_errors = list(errors)
+    else:
+        fatal_errors = []
+        for item in errors:
+            warnings.append(item)
+
+    if not safe:
+        safe_reductions = ["none"]
+    else:
+        order = {"sz": 0, "tz": 1, "z2": 2, "auto": -1}
+        safe_reductions = sorted(dict.fromkeys(safe), key=lambda item: order.get(item, 99))
+
+    z2_is_implemented = bool("z2" in safe_reductions and z2_generator is not None)
+    if "z2" in safe_reductions and not z2_is_implemented:
+        safe_reductions = [item for item in safe_reductions if item != "z2"] or ["none"]
+    accepted_reductions = [] if safe_reductions == ["none"] else list(safe_reductions)
+    backend_support_status = {
+        "backend": backend_name,
+        "tz": {
+            "requested": "tz" in requested,
+            "accepted": "tz" in accepted_reductions,
+            "reason": (
+                "Total Tz is conserved for spin-orbital Yao-Lee; backend must implement a Tz charge block."
+                if _is_yao_lee_spin_orbital_half(model_spec) and "tz" in accepted_reductions
+                else None
+            ),
+        },
+        "sz": {
+            "requested": "sz" in requested,
+            "accepted": "sz" in accepted_reductions,
+            "reason": (
+                None
+                if "sz" in accepted_reductions
+                else (
+                    "Total Sz is not conserved for spin-orbital Yao-Lee."
+                    if _is_yao_lee_spin_orbital_half(model_spec)
+                    else None
+                )
+            ),
+        },
+        "z2": {
+            "requested": "z2" in requested,
+            "accepted": bool(z2_is_implemented),
+            "generator": z2_generator if z2_is_implemented else None,
+            "reason": (
+                f"S-sector Z2 generator {z2_generator} selected."
+                if z2_is_implemented
+                else "No tested backend block for the field-compatible S-sector pi rotation is enabled."
+            ),
+        },
+    }
+
+    return {
+        "requested_reductions": list(requested),
+        "requested_from_default": bool(requested_from_default),
+        "safe_reductions": list(safe_reductions),
+        "accepted_reductions": list(accepted_reductions),
+        "effective_reductions": [] if safe_reductions == ["none"] else list(safe_reductions),
+        "dropped_reductions": list(dict.fromkeys(dropped)),
+        "use_tau_z_block": "tz" in safe_reductions,
+        "use_sz_block": "sz" in safe_reductions,
+        "use_z2_block": bool(z2_is_implemented),
+        "z2_generator": z2_generator,
+        "backend_support_status": backend_support_status,
+        "field_class": str(field_info["field_class"]),
+        "field": field_info,
+        "backend": backend_name,
+        "target_sz2": int(target_sz2),
+        "target_tz2": int(target_tz2),
+        "z2_target_parity": int(z2_target_parity) % 2,
+        "warnings": list(dict.fromkeys(warnings)),
+        "errors": fatal_errors,
+        "nonfatal_errors": [] if fatal_errors else list(dict.fromkeys(errors)),
+        "yao_lee_rules": facts,
+        "logic_version": "model_aware_tz_safe_v1",
+    }
+
+
 def validate_external_field_symmetry_compatibility(
     field_terms: List[Tuple[float, str]],
     symmetry_mode: str,
+    *,
+    model_family: str | None = None,
+    external_field_treatment: str = "hamiltonian",
+    z2_generator: str | None = None,
 ) -> None:
     mode = _normalize_symmetry_mode(symmetry_mode)
     if mode in ("none", "auto") or len(field_terms) == 0:
         return
+    if _normalize_external_field_treatment(external_field_treatment) == "perturbation":
+        return
     if mode == "u1_tz":
         return
+    if mode in ("u1", "u1_sz") and str(model_family or "").strip().lower() == "yao_lee":
+        raise ValueError("Total S^z is not conserved for the Yao-Lee model; do not use an Sz block.")
     breaking_terms = [op_name for _, op_name in field_terms if op_name in ("Sx", "Sy")]
-    if breaking_terms:
+    if mode in ("u1", "u1_sz") and breaking_terms:
         raise ValueError(
-            "An external field with hx/hy components breaks the strict U1/Z2 sectors used by this script. "
+            "An external spin field with hx/hy components breaks total S^z. "
             "Use external_field_treatment=perturbation to annotate it without changing the symmetric solve, "
             "or set symmetry_mode=none when external_field_treatment=hamiltonian."
         )
+    if mode == "z2":
+        ops = {str(op_name) for _, op_name in field_terms if abs(float(_)) > 1.0e-14}
+        generator = str(z2_generator or "").strip()
+        if generator == "Rz_pi" and ops.intersection({"Sx", "Sy"}):
+            raise ValueError("Rz_pi spin Z2 survives only for fields with hx=hy=0.")
+        if generator == "Rx_pi" and ops.intersection({"Sy", "Sz"}):
+            raise ValueError("Rx_pi spin Z2 survives only for fields with hy=hz=0.")
+        if generator == "Ry_pi" and ops.intersection({"Sx", "Sz"}):
+            raise ValueError("Ry_pi spin Z2 survives only for fields with hx=hz=0.")
+        if generator not in ("Rx_pi", "Ry_pi", "Rz_pi"):
+            raise ValueError("Requested Z2 reduction has no tested field-compatible generator.")
 
 
 def _external_field_float_filename_token(value: float) -> str:
-    text = f"{float(value):.6g}".replace("-", "m").replace("+", "")
+    text = f"{float(value):.3f}".replace("-", "m").replace("+", "")
     return text.replace(".", "p")
 
 
@@ -764,6 +1342,65 @@ def _safe_external_field_token(text: str) -> str:
     return token.strip("_") or "run"
 
 
+def _external_field_magnitude_and_direction(
+    field_vector: Tuple[float, float, float],
+) -> Tuple[float, Tuple[float, float, float]]:
+    hx, hy, hz = [float(value) for value in field_vector]
+    magnitude = float(np.sqrt(hx * hx + hy * hy + hz * hz))
+    if magnitude <= 1e-14:
+        return 0.0, (0.0, 0.0, 0.0)
+    return magnitude, (hx / magnitude, hy / magnitude, hz / magnitude)
+
+
+def _external_field_integer_axis(
+    axis: str,
+    field_vector: Tuple[float, float, float],
+    *,
+    tol: float = 1e-12,
+    max_denominator: int = 12,
+) -> Tuple[int, int, int]:
+    """Represent the field direction as a compact integer axis triplet."""
+    axis_mode = _normalize_external_field_axis(axis)
+    if axis_mode == "111":
+        return 1, 1, 1
+    if axis_mode == "001":
+        return 0, 0, 1
+    vector = [float(value) for value in field_vector]
+    nonzero = [abs(value) for value in vector if abs(value) > tol]
+    if not nonzero:
+        return 0, 0, 0
+    scale = min(nonzero)
+    fractions = [
+        Fraction(0)
+        if abs(value) <= tol
+        else Fraction(value / scale).limit_denominator(max_denominator)
+        for value in vector
+    ]
+    denominator_lcm = math.lcm(*[fraction.denominator for fraction in fractions])
+    integers = [
+        int(fraction.numerator * denominator_lcm // fraction.denominator)
+        for fraction in fractions
+    ]
+    common = 0
+    for value in integers:
+        common = math.gcd(common, abs(int(value)))
+    if common > 1:
+        integers = [int(value // common) for value in integers]
+    return int(integers[0]), int(integers[1]), int(integers[2])
+
+
+def _external_field_axis_display(axis: str, field_vector: Tuple[float, float, float]) -> str:
+    hx_axis, hy_axis, hz_axis = _external_field_integer_axis(axis, field_vector)
+    return f"[{hx_axis},{hy_axis},{hz_axis}]"
+
+
+def _external_field_axis_filename_token(axis: str, field_vector: Tuple[float, float, float]) -> str:
+    def token(value: int) -> str:
+        return f"m{abs(value)}" if int(value) < 0 else str(int(value))
+
+    return "".join(token(value) for value in _external_field_integer_axis(axis, field_vector))
+
+
 def external_field_filename_label(
     treatment: str,
     axis: str,
@@ -771,20 +1408,10 @@ def external_field_filename_label(
 ) -> str | None:
     if not external_field_is_active(treatment, field_vector):
         return None
-    hx, hy, hz = field_vector
-    axis_mode = _normalize_external_field_axis(axis)
-    if axis_mode == "111":
-        magnitude = float(np.sqrt(hx * hx + hy * hy + hz * hz))
-        return _safe_external_field_token(
-            f"H111_{_external_field_float_filename_token(magnitude)}_{treatment}"
-        )
-    return _safe_external_field_token(
-        "Hxyz_"
-        f"hx{_external_field_float_filename_token(hx)}_"
-        f"hy{_external_field_float_filename_token(hy)}_"
-        f"hz{_external_field_float_filename_token(hz)}_"
-        f"{treatment}"
-    )
+    magnitude, _direction = _external_field_magnitude_and_direction(field_vector)
+    magnitude_token = _external_field_float_filename_token(magnitude)
+    axis_token = _external_field_axis_filename_token(axis, field_vector)
+    return _safe_external_field_token(f"H{magnitude_token}axis{axis_token}")
 
 
 def external_field_display_label(
@@ -794,9 +1421,9 @@ def external_field_display_label(
 ) -> str | None:
     if not external_field_is_active(treatment, field_vector):
         return None
-    hx, hy, hz = field_vector
-    axis_text = "[111]" if _normalize_external_field_axis(axis) == "111" else "custom"
-    return f"Hz field {treatment}, axis={axis_text}, H=({hx:.4g}, {hy:.4g}, {hz:.4g})"
+    field_strength, _direction = _external_field_magnitude_and_direction(field_vector)
+    axis_text = _external_field_axis_display(axis, field_vector)
+    return f"|H|={field_strength:.3f}, axis={axis_text}"
 
 
 def external_field_construction_summary(
@@ -819,7 +1446,8 @@ def external_field_construction_summary(
         "sigma_factor": float(sigma_factor),
         "formula": (
             "H_Z = field_sign * mu_B * sigma_factor * sum_i "
-            "(hx*Sx_i + hy*Sy_i + hz*Sz_i); orbital Zeeman coupling is omitted because eg L=0."
+            "(hx*Sx_i + hy*Sy_i + hz*Sz_i), with S normalized as sigma/2; "
+            "orbital Zeeman coupling is omitted because eg L=0."
         ),
         "model_insertion": (
             "not inserted; recorded as perturbation only"
@@ -1036,6 +1664,8 @@ def _auto_mpo_terms_for_symmetry_check(
                 jx=jx,
                 jy=jy,
                 jz=jz,
+                symmetry_mode=mode,
+                strict_charge_conservation=True,
             )
             terms.extend(bond_auto_terms)
         except Exception as exc:
@@ -1044,7 +1674,7 @@ def _auto_mpo_terms_for_symmetry_check(
                 {
                     "kind": "bond_term_conversion_failed",
                     "bond": {"i": int(bond.i), "j": int(bond.j), "gamma": str(bond.gamma)},
-                    "formula": "canonical Sz-conserving Yao-Lee expansion"
+                    "formula": "Yao-Lee Eq. 7 spin-orbital expansion"
                     if str(model_spec.model_family) == "yao_lee"
                     else "legacy same-operator two-site expansion",
                     "error": str(exc),
@@ -1905,6 +2535,19 @@ def lattice_display_name(lattice: str) -> str:
         "triangular": "Triangular",
     }
     return mapping.get(lattice.lower(), lattice.title())
+
+
+def quimb_ipeps_supports_lattice(lattice: str) -> bool:
+    return str(lattice).strip().lower() in QUIMB_IPEPS_LATTICE_OPTIONS
+
+
+def quimb_peps_supports_lattice(lattice: str) -> bool:
+    return str(lattice).strip().lower() in QUIMB_PEPS_LATTICE_OPTIONS
+
+
+def phase_scan_method_display_name(method_key: str) -> str:
+    key = str(method_key).strip()
+    return PHASE_SCAN_METHOD_DISPLAY_NAMES.get(key, key.replace("_", " ").title())
 
 
 def _safe_filename_token(text: str) -> str:

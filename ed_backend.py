@@ -7,7 +7,9 @@ bitwise total-Sz=0 spin/orbital sparse ED path.
 
 from __future__ import annotations
 
+import functools
 import math
+import time
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -15,7 +17,7 @@ import scipy.sparse as sparse
 import scipy.sparse.linalg as sparse_linalg
 from scipy.sparse.linalg import ArpackNoConvergence
 
-from analysis import _end_stage, _make_progress_bar, _start_stage, resolve_low_energy_spectrum
+from analysis import _end_stage, _make_progress_bar, _start_stage, profile_stage, resolve_low_energy_spectrum
 from models import (
     GeometryData,
     ISING_AXIS,
@@ -24,6 +26,7 @@ from models import (
     SPIN_REP,
     ModelSpec,
     all_high_symmetry_structure_factors,
+    analyze_hamiltonian_symmetries,
     build_model_spec,
     build_site_ops,
     honeycomb_plaquette_flux_operators,
@@ -44,11 +47,94 @@ ED_EIGSH_MIN_NCV = 20
 ED_EIGSH_NCV_MULTIPLIER = 4
 ED_EIGSH_RANDOM_SEED = 24681357
 
+# Hard caps for the in-repo standard_projector ED path.  These protect long
+# phase scans from accidentally materializing large projectors or C3 sectors as
+# dense arrays.  Single selected-point runs can override them explicitly.
+MAX_PROJECTOR_PARENT_DIM = 2_000_000
+MAX_PROJECTOR_NNZ = 50_000_000
+MAX_DENSE_PROJECTOR_ENTRIES = 8_000_000
+MAX_DENSE_PROJECTOR_MB = 512.0
+MAX_EXPLICIT_C3_PARENT_DIM = 2_500
+MAX_EXPLICIT_C3_DIM = 2_500
+MAX_PHASE_SCAN_C3_SECONDS_PER_POINT = 30.0
+
+
+def _dense_memory_estimate_mb(entries: int, dtype: Any = np.complex128) -> float:
+    return float(int(entries) * np.dtype(dtype).itemsize / (1024.0 ** 2))
+
+
+def _dense_allocation_diagnostics(
+    *,
+    label: str,
+    entries: int,
+    dtype: Any = np.complex128,
+    max_dense_entries: int = MAX_DENSE_PROJECTOR_ENTRIES,
+    max_dense_mb: float = MAX_DENSE_PROJECTOR_MB,
+) -> Dict[str, Any]:
+    entry_count = int(entries)
+    dtype_obj = np.dtype(dtype)
+    estimate_mb = _dense_memory_estimate_mb(entry_count, dtype_obj)
+    entries_ok = entry_count <= int(max_dense_entries)
+    mb_ok = estimate_mb <= float(max_dense_mb)
+    reason = None
+    if not entries_ok:
+        reason = (
+            f"{label} would allocate {entry_count:,} dense entries, exceeding "
+            f"MAX_DENSE_PROJECTOR_ENTRIES={int(max_dense_entries):,}."
+        )
+    elif not mb_ok:
+        reason = (
+            f"{label} would allocate {estimate_mb:.3f} MiB as {dtype_obj}, exceeding "
+            f"MAX_DENSE_PROJECTOR_MB={float(max_dense_mb):.3f}."
+        )
+    return {
+        "label": str(label),
+        "entries": entry_count,
+        "dtype": str(dtype_obj),
+        "dtype_itemsize": int(dtype_obj.itemsize),
+        "memory_estimate_MB": float(estimate_mb),
+        "max_dense_entries": int(max_dense_entries),
+        "max_dense_projector_MB": float(max_dense_mb),
+        "allowed": bool(entries_ok and mb_ok),
+        "reason": reason,
+    }
+
+
+def _raise_dense_memory_error(diagnostics: Dict[str, Any]) -> None:
+    reason = diagnostics.get("reason") or "Dense projector allocation exceeds configured memory caps."
+    raise MemoryError(f"[projector-ed] {reason}")
+
+
+def _max_recorded_memory_estimate_mb(payload: Any) -> float | None:
+    values: List[float] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            if item.get("memory_estimate_MB") is not None:
+                try:
+                    values.append(float(item["memory_estimate_MB"]))
+                except Exception:
+                    pass
+            for value in item.values():
+                visit(value)
+        elif isinstance(item, (list, tuple)):
+            for value in item:
+                visit(value)
+
+    visit(payload)
+    return float(max(values)) if values else None
+
 def kron_all(op_list: List[sparse.spmatrix]) -> sparse.spmatrix:
     out = op_list[0]
     for op in op_list[1:]:
         out = sparse.kron(out, op, format="csr")
     return out
+
+
+@functools.lru_cache(maxsize=32)
+def _global_operator_cache_for_model_cached(model_spec: ModelSpec) -> Tuple[Tuple[str, sparse.spmatrix], ...]:
+    ops = build_site_ops(model_spec)
+    return tuple((name, sparse.csr_matrix(mat)) for name, mat in ops.items())
 
 
 def build_global_operator_cache() -> Dict[str, sparse.spmatrix]:
@@ -58,13 +144,11 @@ def build_global_operator_cache() -> Dict[str, sparse.spmatrix]:
         model_family=MODEL_FAMILY,
         ising_axis=ISING_AXIS,
     )
-    ops = build_site_ops(default_spec)
-    return {name: sparse.csr_matrix(mat) for name, mat in ops.items()}
+    return build_global_operator_cache_for_model(default_spec)
 
 
 def build_global_operator_cache_for_model(model_spec: ModelSpec) -> Dict[str, sparse.spmatrix]:
-    ops = build_site_ops(model_spec)
-    return {name: sparse.csr_matrix(mat) for name, mat in ops.items()}
+    return {name: mat.copy() for name, mat in _global_operator_cache_for_model_cached(model_spec)}
 
 
 def build_exact_hamiltonian(
@@ -246,7 +330,7 @@ def _run_lowest_eigsh(
     """Run ARPACK with the sparse-matrix settings needed for ED workloads."""
     if show_progress:
         print(f"[{label}] preparing sparse matrix")
-    hamiltonian_csr = hamiltonian.tocsr()
+    hamiltonian_csr = hamiltonian if sparse.isspmatrix_csr(hamiltonian) else hamiltonian.tocsr()
     hamiltonian_csr.sum_duplicates()
     hamiltonian_csr.eliminate_zeros()
 
@@ -326,18 +410,19 @@ def run_small_cluster_exact_spectrum(
     sparse_maxiter: int | None = None,
 ) -> Tuple[Dict[str, Any], np.ndarray]:
     stage_start = _start_stage("ED diagonalization", show_progress)
-    hamiltonian = build_exact_hamiltonian(
-        geometry,
-        model_spec,
-        alpha,
-        beta,
-        coupling_j,
-        jx=jx,
-        jy=jy,
-        jz=jz,
-        external_field_terms=external_field_terms,
-        show_progress=show_progress,
-    )
+    with profile_stage("ED Hamiltonian construction"):
+        hamiltonian = build_exact_hamiltonian(
+            geometry,
+            model_spec,
+            alpha,
+            beta,
+            coupling_j,
+            jx=jx,
+            jy=jy,
+            jz=jz,
+            external_field_terms=external_field_terms,
+            show_progress=show_progress,
+        )
     hilbert_dim = int(hamiltonian.shape[0])
     requested_count = max(1, int(eigenstate_count))
     solver_requested = _normalize_ed_solver(solver)
@@ -374,23 +459,24 @@ def run_small_cluster_exact_spectrum(
         or (solver_note is not None and hilbert_dim <= 1)
         or (solver_requested == "auto" and solve_count >= hilbert_dim - 1)
     )
-    if use_dense:
-        dense_hamiltonian = hamiltonian.toarray()
-        eigenvalues, eigenvectors = np.linalg.eigh(dense_hamiltonian)
-        eigenvalues = eigenvalues[:solve_count]
-        eigenvectors = eigenvectors[:, :solve_count]
-        solver_mode = "dense"
-        eigsh_info: Dict[str, Any] = {}
-    else:
-        eigenvalues, eigenvectors, eigsh_info = _run_lowest_eigsh(
-            hamiltonian,
-            eigenstate_count=solve_count,
-            sparse_tol=sparse_tol,
-            sparse_maxiter=sparse_maxiter,
-            show_progress=show_progress,
-            label="ed",
-        )
-        solver_mode = "sparse"
+    with profile_stage("diagonalization"):
+        if use_dense:
+            dense_hamiltonian = hamiltonian.toarray()
+            eigenvalues, eigenvectors = np.linalg.eigh(dense_hamiltonian)
+            eigenvalues = eigenvalues[:solve_count]
+            eigenvectors = eigenvectors[:, :solve_count]
+            solver_mode = "dense"
+            eigsh_info: Dict[str, Any] = {}
+        else:
+            eigenvalues, eigenvectors, eigsh_info = _run_lowest_eigsh(
+                hamiltonian,
+                eigenstate_count=solve_count,
+                sparse_tol=sparse_tol,
+                sparse_maxiter=sparse_maxiter,
+                show_progress=show_progress,
+                label="ed",
+            )
+            solver_mode = "sparse"
     order = np.argsort(np.real(eigenvalues))
     eigenvalues = np.asarray(np.real(eigenvalues[order]), dtype=float)
     eigenvectors = np.asarray(eigenvectors[:, order], dtype=np.complex128)
@@ -709,15 +795,24 @@ def bond_energy_components_from_correlations(
     if str(model_spec.model_family).strip().lower() == "yao_lee" and not is_trivial_orbital(model_spec):
         axis = str(gamma).strip().lower()
         spin_dot = sum(complex(correlations[f"S{spin_axis}_S{spin_axis}"][i, j]) for spin_axis in ("x", "y", "z"))
-        orbital_gamma = complex(correlations[f"T{axis}_T{axis}"][i, j])
-        mixed_gamma = sum(
-            complex(correlations[f"S{spin_axis}T{axis}_S{spin_axis}T{axis}"][i, j])
+        spin_gamma = complex(correlations[f"S{axis}_S{axis}"][i, j])
+        orbital_dot = sum(complex(correlations[f"T{orbital_axis}_T{orbital_axis}"][i, j]) for orbital_axis in ("x", "y", "z"))
+        mixed_dot_dot = sum(
+            complex(correlations[f"S{spin_axis}T{orbital_axis}_S{spin_axis}T{orbital_axis}"][i, j])
             for spin_axis in ("x", "y", "z")
+            for orbital_axis in ("x", "y", "z")
+        )
+        mixed_gamma_dot = sum(
+            complex(correlations[f"S{axis}T{orbital_axis}_S{axis}T{orbital_axis}"][i, j])
+            for orbital_axis in ("x", "y", "z")
         )
         physical_components = [
-            ("S", "Sdot", "dot", float(coupling_j) * (1.0 + float(beta)), spin_dot),
-            ("T", f"T{axis}", axis, float(coupling_j) * (1.0 - float(beta)), orbital_gamma),
-            ("ST", f"SdotT{axis}", axis, float(coupling_j) * float(alpha), mixed_gamma),
+            ("ST", "SdotTdot", "dot", -float(coupling_j) * float(alpha), mixed_dot_dot),
+            ("S", "Sdot", "dot", float(coupling_j) * float(alpha) * float(beta), spin_dot),
+            ("ST", f"S{axis}Tdot", axis, 2.0 * float(coupling_j), mixed_gamma_dot),
+            ("S", f"S{axis}", axis, -2.0 * float(coupling_j) * float(beta), spin_gamma),
+            ("T", "Tdot", "dot", float(coupling_j) * float(beta), orbital_dot),
+            ("constant", "Id", "identity", -float(coupling_j) * float(beta) * float(beta), 1.0 + 0.0j),
         ]
         for channel, operator, component_axis, coeff, correlation_value in physical_components:
             energy_value = coeff * correlation_value
@@ -1281,8 +1376,7 @@ def run_finite_temperature_ed(
 # ----------------------------------------------------------------------
 
 BITWISE_ED_FORMULA = (
-    "H = J sum_<ij>_gamma [(1+beta) S_i.S_j + (1-beta) T_i^gamma T_j^gamma "
-    "+ alpha (S_i.S_j)(T_i^gamma T_j^gamma)]"
+    "Disabled for yao_lee Eq. 7 because S_i^gamma S_j^gamma x/y terms do not conserve total Sz."
 )
 BITWISE_ED_NOTE = (
     "Many-body states are represented only as (spin_state, orbital_state), "
@@ -1312,12 +1406,212 @@ def estimate_sz_conserved_dimension(n_sites: int, target_sz2: int = 0) -> int:
     return int(math.comb(n, target_up_spins) * (1 << n))
 
 
+def estimate_spin_orbital_u1_dimension(
+    n_sites: int,
+    *,
+    use_sz_block: bool = False,
+    target_sz2: int = 0,
+    use_tau_z_block: bool = False,
+    target_tz2: int = 0,
+) -> int:
+    """Return the spin-orbital bit-basis dimension after Sz/Tz U(1) filters."""
+    n = int(n_sites)
+    if n < 0:
+        raise ValueError("n_sites must be non-negative.")
+    spin_dim = 1 << n
+    orbital_dim = 1 << n
+    if bool(use_sz_block):
+        nup_spin = _spin_half_nup_from_total_sz2(n, int(target_sz2))
+        spin_dim = 0 if nup_spin < 0 else int(math.comb(n, nup_spin))
+    if bool(use_tau_z_block):
+        nup_orbital = _spin_half_nup_from_total_sz2(n, int(target_tz2))
+        orbital_dim = 0 if nup_orbital < 0 else int(math.comb(n, nup_orbital))
+    return int(spin_dim * orbital_dim)
+
+
+def build_spin_orbital_u1_basis(
+    N: int,
+    *,
+    use_sz_block: bool = False,
+    target_sz2: int = 0,
+    use_tau_z_block: bool = False,
+    target_tz2: int = 0,
+) -> Tuple[List[Tuple[int, int]], Dict[Tuple[int, int], int]]:
+    """Build a bit basis with optional total-Sz and total-Tz spin-1/2 sectors."""
+    basis_tuple, basis_map = _build_spin_orbital_u1_basis_cached(
+        int(N),
+        bool(use_sz_block),
+        int(target_sz2),
+        bool(use_tau_z_block),
+        int(target_tz2),
+    )
+    return list(basis_tuple), dict(basis_map)
+
+
+@functools.lru_cache(maxsize=64)
+def _build_spin_orbital_u1_basis_cached(
+    N: int,
+    use_sz_block: bool,
+    target_sz2: int,
+    use_tau_z_block: bool,
+    target_tz2: int,
+) -> Tuple[Tuple[Tuple[int, int], ...], Dict[Tuple[int, int], int]]:
+    """Cached immutable-ish basis payload for repeated scan points."""
+    n_sites = int(N)
+    if n_sites < 0:
+        raise ValueError("N must be non-negative.")
+    spin_limit = 1 << n_sites
+    orbital_limit = 1 << n_sites
+    if bool(use_sz_block):
+        spin_nup = _spin_half_nup_from_total_sz2(n_sites, int(target_sz2))
+        if spin_nup < 0:
+            raise ValueError(f"Total 2*Sz={int(target_sz2)} is unreachable for {n_sites} spin-1/2 sites.")
+        spin_basis = [state for state in range(spin_limit) if int(state).bit_count() == spin_nup]
+    else:
+        spin_basis = list(range(spin_limit))
+    if bool(use_tau_z_block):
+        orbital_nup = _spin_half_nup_from_total_sz2(n_sites, int(target_tz2))
+        if orbital_nup < 0:
+            raise ValueError(f"Total 2*Tz={int(target_tz2)} is unreachable for {n_sites} orbital-1/2 sites.")
+        orbital_basis = [state for state in range(orbital_limit) if int(state).bit_count() == orbital_nup]
+    else:
+        orbital_basis = list(range(orbital_limit))
+
+    basis_list: List[Tuple[int, int]] = []
+    basis_map: Dict[Tuple[int, int], int] = {}
+    for spin_state in spin_basis:
+        for orbital_state in orbital_basis:
+            key = (int(spin_state), int(orbital_state))
+            basis_map[key] = len(basis_list)
+            basis_list.append(key)
+    return tuple(basis_list), basis_map
+
+
+def _validate_ed_u1_block_request(
+    geometry: GeometryData,
+    model_spec: ModelSpec,
+    alpha: float,
+    beta: float,
+    coupling_j: float,
+    *,
+    jx: float,
+    jy: float,
+    jz: float,
+    external_field_terms: List[Tuple[float, str]] | None,
+    use_sz_block: bool,
+    target_sz2: int,
+    use_tau_z_block: bool,
+    target_tz2: int,
+) -> Dict[str, Any] | None:
+    if bool(use_sz_block) and bool(use_tau_z_block):
+        requested_mode = "u1"
+    elif bool(use_sz_block):
+        requested_mode = "u1_sz"
+    elif bool(use_tau_z_block):
+        requested_mode = "u1_tz"
+    else:
+        return None
+
+    report = analyze_hamiltonian_symmetries(
+        geometry=geometry,
+        model_spec=model_spec,
+        alpha=alpha,
+        beta=beta,
+        coupling_j=coupling_j,
+        jx=jx,
+        jy=jy,
+        jz=jz,
+        external_field_terms=list(external_field_terms or []),
+        requested_symmetry_mode=requested_mode,
+        u1_target_total_sz2=int(target_sz2),
+        u1_target_total_tz2=int(target_tz2),
+    )
+    mode_report = report.get(requested_mode, {})
+    target_sector = mode_report.get("target_sector", {}) if isinstance(mode_report, dict) else {}
+    conserved = bool(isinstance(mode_report, dict) and mode_report.get("conserved", False))
+    reachable = bool(isinstance(target_sector, dict) and target_sector.get("reachable", False))
+    if conserved and reachable:
+        return report
+
+    first_issue = None
+    if isinstance(mode_report, dict):
+        issues = mode_report.get("issues", [])
+        if isinstance(issues, list) and issues:
+            first_issue = issues[0]
+    raise ValueError(
+        f"Requested ED symmetry block {requested_mode} is not valid for "
+        f"model_family={model_spec.model_family}: conserved={conserved}, "
+        f"target_reachable={reachable}. First validator issue: {first_issue}"
+    )
+
+
 def _bit_is_up(state: int, site: int) -> bool:
     return bool((int(state) >> int(site)) & 1)
 
 
 def _z_value_from_bit(state: int, site: int) -> float:
     return 0.5 if _bit_is_up(state, site) else -0.5
+
+
+def _local_index_from_spin_orbital_bits(spin_up: bool, orbital_up: bool) -> int:
+    # build_site_ops uses spin/orbital matrix order |up>, |down>; bits use 1=up, 0=down.
+    spin_index = 0 if bool(spin_up) else 1
+    orbital_index = 0 if bool(orbital_up) else 1
+    return int(2 * spin_index + orbital_index)
+
+
+def _spin_orbital_bits_from_local_index(local_index: int) -> Tuple[bool, bool]:
+    spin_index = int(local_index) // 2
+    orbital_index = int(local_index) % 2
+    return bool(spin_index == 0), bool(orbital_index == 0)
+
+
+def _set_bit_value(state: int, site: int, is_up: bool) -> int:
+    mask = 1 << int(site)
+    return int(state | mask) if bool(is_up) else int(state & ~mask)
+
+
+def _apply_local_matrix_to_bit_state(
+    spin_state: int,
+    orbital_state: int,
+    site: int,
+    operator: sparse.spmatrix,
+) -> List[Tuple[int, int, complex]]:
+    matrix = operator.toarray() if sparse.issparse(operator) else np.asarray(operator)
+    spin_up = _bit_is_up(spin_state, site)
+    orbital_up = _bit_is_up(orbital_state, site)
+    col = _local_index_from_spin_orbital_bits(spin_up, orbital_up)
+    out: List[Tuple[int, int, complex]] = []
+    for row in range(int(matrix.shape[0])):
+        coeff = complex(matrix[row, col])
+        if abs(coeff) <= 1.0e-14:
+            continue
+        next_spin_up, next_orbital_up = _spin_orbital_bits_from_local_index(row)
+        next_spin = _set_bit_value(spin_state, site, next_spin_up)
+        next_orbital = _set_bit_value(orbital_state, site, next_orbital_up)
+        out.append((int(next_spin), int(next_orbital), coeff))
+    return out
+
+
+def _apply_two_local_matrices_to_bit_state(
+    spin_state: int,
+    orbital_state: int,
+    i: int,
+    op_i: sparse.spmatrix,
+    j: int,
+    op_j: sparse.spmatrix,
+) -> List[Tuple[int, int, complex]]:
+    first_actions = _apply_local_matrix_to_bit_state(spin_state, orbital_state, i, op_i)
+    out: List[Tuple[int, int, complex]] = []
+    for spin_mid, orbital_mid, coeff_i in first_actions:
+        for spin_out, orbital_out, coeff_j in _apply_local_matrix_to_bit_state(
+            spin_mid,
+            orbital_mid,
+            j,
+            op_j,
+        ):
+            out.append((int(spin_out), int(orbital_out), complex(coeff_i * coeff_j)))
+    return out
 
 
 def build_sz_conserved_basis(
@@ -1497,6 +1791,1874 @@ def _two_site_bitwise_operator_actions(
     return out
 
 
+def build_sparse_hamiltonian_spin_orbital_u1(
+    N: int,
+    geometry: GeometryData,
+    model_spec: ModelSpec,
+    alpha: float,
+    beta: float,
+    basis_list: List[Tuple[int, int]],
+    basis_map: Dict[Tuple[int, int], int],
+    *,
+    coupling_j: float = 1.0,
+    jx: float = 1.0,
+    jy: float = 1.0,
+    jz: float = 1.0,
+    external_field_terms: List[Tuple[float, str]] | None = None,
+    show_progress: bool = True,
+) -> sparse.csr_matrix:
+    """Build a sparse ED Hamiltonian in the supplied spin/orbital U(1) bit basis."""
+    n_sites = int(N)
+    if n_sites != int(geometry.number_of_sites):
+        raise ValueError(
+            f"N={n_sites} does not match geometry.number_of_sites={int(geometry.number_of_sites)}."
+        )
+    if model_spec.spin_rep != "1/2" or model_spec.orbital_rep != "1/2":
+        raise ValueError("spin_orbital_u1 sparse ED currently supports spin_rep=1/2 and orbital_rep=1/2.")
+    op_cache = build_global_operator_cache_for_model(model_spec)
+    dim = int(len(basis_list))
+    hamiltonian = sparse.lil_matrix((dim, dim), dtype=np.complex128)
+    field_terms = list(external_field_terms or [])
+    total_columns = int(dim)
+    progress_bar = _make_progress_bar(
+        enabled=show_progress,
+        total=total_columns,
+        desc="U1-ED H columns",
+        unit="state",
+        leave=False,
+    )
+    bond_terms: List[Tuple[int, int, List[Tuple[complex, str, str]]]] = []
+    for bond in geometry.bond_list:
+        bond_terms.append(
+            (
+                int(bond.i),
+                int(bond.j),
+                list(
+                    two_site_operator_terms_for_bond(
+                        str(bond.gamma).lower(),
+                        model_spec,
+                        alpha,
+                        beta,
+                        coupling_j,
+                        jx=jx,
+                        jy=jy,
+                        jz=jz,
+                    )
+                ),
+            )
+        )
+    for col, (spin_state_raw, orbital_state_raw) in enumerate(basis_list):
+        spin_state = int(spin_state_raw)
+        orbital_state = int(orbital_state_raw)
+        for i, j, terms in bond_terms:
+            for coeff, op_i_name, op_j_name in terms:
+                op_i = op_cache[str(op_i_name)]
+                op_j = op_cache[str(op_j_name)]
+                for next_spin, next_orbital, matrix_element in _apply_two_local_matrices_to_bit_state(
+                    spin_state,
+                    orbital_state,
+                    i,
+                    op_i,
+                    j,
+                    op_j,
+                ):
+                    row = basis_map.get((int(next_spin), int(next_orbital)))
+                    if row is not None:
+                        hamiltonian[row, col] += complex(coeff) * matrix_element
+        for site in range(n_sites):
+            for coefficient, op_name in field_terms:
+                for next_spin, next_orbital, matrix_element in _apply_local_matrix_to_bit_state(
+                    spin_state,
+                    orbital_state,
+                    site,
+                    op_cache[str(op_name)],
+                ):
+                    row = basis_map.get((int(next_spin), int(next_orbital)))
+                    if row is not None:
+                        hamiltonian[row, col] += float(coefficient) * matrix_element
+        if progress_bar is not None:
+            progress_bar.update(1)
+    if progress_bar is not None:
+        progress_bar.close()
+    return hamiltonian.tocsr()
+
+
+def run_spin_orbital_u1_exact_spectrum(
+    geometry: GeometryData,
+    model_spec: ModelSpec,
+    alpha: float,
+    beta: float,
+    *,
+    coupling_j: float = 1.0,
+    eigenstate_count: int = 3,
+    check_ground_state_degeneracy: bool = True,
+    jx: float = 1.0,
+    jy: float = 1.0,
+    jz: float = 1.0,
+    external_field_terms: List[Tuple[float, str]] | None = None,
+    show_progress: bool = True,
+    ground_manifold_abs_tol: float = 1e-12,
+    ground_manifold_rel_tol: float = 1e-12,
+    sparse_tol: float = 0.0,
+    sparse_maxiter: int | None = None,
+    use_sz_block: bool = False,
+    target_sz2: int = 0,
+    use_tau_z_block: bool = True,
+    target_tz2: int = 0,
+) -> Tuple[Dict[str, Any], np.ndarray, List[Tuple[int, int]], Dict[Tuple[int, int], int]]:
+    """Diagonalize a sparse spin/orbital U(1)-restricted ED Hamiltonian."""
+    n_sites = int(geometry.number_of_sites)
+    symmetry_validation_report = _validate_ed_u1_block_request(
+        geometry,
+        model_spec,
+        alpha,
+        beta,
+        coupling_j,
+        jx=jx,
+        jy=jy,
+        jz=jz,
+        external_field_terms=external_field_terms,
+        use_sz_block=bool(use_sz_block),
+        target_sz2=int(target_sz2),
+        use_tau_z_block=bool(use_tau_z_block),
+        target_tz2=int(target_tz2),
+    )
+    stage_start = _start_stage("spin-orbital U1 ED", show_progress)
+    with profile_stage("ED basis construction"):
+        basis_list, basis_map = build_spin_orbital_u1_basis(
+            n_sites,
+            use_sz_block=bool(use_sz_block),
+            target_sz2=int(target_sz2),
+            use_tau_z_block=bool(use_tau_z_block),
+            target_tz2=int(target_tz2),
+        )
+    with profile_stage("ED Hamiltonian construction"):
+        hamiltonian = build_sparse_hamiltonian_spin_orbital_u1(
+            n_sites,
+            geometry,
+            model_spec,
+            alpha,
+            beta,
+            basis_list,
+            basis_map,
+            coupling_j=coupling_j,
+            jx=jx,
+            jy=jy,
+            jz=jz,
+            external_field_terms=external_field_terms,
+            show_progress=show_progress,
+        )
+    dim = int(hamiltonian.shape[0])
+    if dim <= 0:
+        raise ValueError("Empty spin-orbital U1 ED basis.")
+    requested_count = max(1, int(eigenstate_count))
+    with profile_stage("diagonalization"):
+        if dim == 1:
+            eigenvalues = np.asarray([complex(hamiltonian[0, 0])], dtype=np.complex128)
+            eigenvectors = np.ones((1, 1), dtype=np.complex128)
+            solver_mode = "u1_reduced_dense_dim1"
+            solve_count = 1
+            degeneracy_padding = 0
+            eigsh_info: Dict[str, Any] = {}
+        else:
+            solve_count, degeneracy_padding = _padded_eigsh_count(
+                requested_count,
+                dim,
+                check_ground_state_degeneracy=bool(check_ground_state_degeneracy),
+            )
+            if show_progress:
+                print(
+                    "[u1-ed] basis ready: "
+                    f"dim={dim}, nnz={hamiltonian.nnz}, k={solve_count}, "
+                    f"Sz_block={bool(use_sz_block)}, Tz_block={bool(use_tau_z_block)}"
+                )
+            eigenvalues, eigenvectors, eigsh_info = _run_lowest_eigsh(
+                hamiltonian,
+                eigenstate_count=solve_count,
+                sparse_tol=sparse_tol,
+                sparse_maxiter=sparse_maxiter,
+                show_progress=show_progress,
+                label="u1-ed",
+            )
+            solver_mode = "spin_orbital_u1_sparse"
+    order = np.argsort(np.real(eigenvalues))
+    eigenvalues = np.asarray(np.real(eigenvalues[order]), dtype=float)
+    eigenvectors = np.asarray(eigenvectors[:, order], dtype=np.complex128)
+    _end_stage("spin-orbital U1 ED", stage_start, show_progress)
+    low_energy_resolution = resolve_low_energy_spectrum(
+        eigenvalues,
+        check_ground_state_degeneracy=bool(check_ground_state_degeneracy),
+        hilbert_dim=dim,
+        degeneracy_tolerance_abs=float(ground_manifold_abs_tol),
+        degeneracy_tolerance_rel=float(ground_manifold_rel_tol),
+    )
+    spectrum: Dict[str, Any] = {
+        "solver_mode": solver_mode,
+        "solver_requested": "spin_orbital_u1_sparse",
+        "basis_type": "bitwise_spin_orbital_u1_block",
+        "use_sz_block": bool(use_sz_block),
+        "target_sz2": int(target_sz2),
+        "use_tau_z_block": bool(use_tau_z_block),
+        "target_tz2": int(target_tz2),
+        "symmetry_validation": symmetry_validation_report,
+        "hilbert_dim": dim,
+        "full_spin_orbital_hilbert_dim": int(4 ** n_sites),
+        "number_of_sites": n_sites,
+        "eigenstates_requested": requested_count,
+        "eigenstates_returned": int(eigenvalues.size),
+        "eigenstates_degeneracy_padding": int(degeneracy_padding),
+        "energies": [float(value) for value in eigenvalues],
+        "ground_state_energy": float(low_energy_resolution["ground_state_energy"]),
+        "sparse_tol": float(eigsh_info.get("eigsh_tol_effective", sparse_tol)),
+        "sparse_tol_requested": float(sparse_tol),
+        "sparse_maxiter": eigsh_info.get("eigsh_maxiter"),
+        "eigsh": eigsh_info if solver_mode == "spin_orbital_u1_sparse" else None,
+        **low_energy_resolution,
+    }
+    return spectrum, eigenvectors, basis_list, basis_map
+
+
+def _spin_pi_z_eigenvalue_from_spin_bits(spin_state: int) -> int:
+    """Diagonal spin-pi-z parity used by the projected ED path.
+
+    The convention requested for the Yao-Lee spin basis is
+    Pz = (-1) ** N_up_spin, with spin bits using 1=up.
+    """
+    return 1 if (int(spin_state).bit_count() % 2 == 0) else -1
+
+
+def build_spin_pi_z_operator_in_spin_orbital_u1_basis(
+    basis_list: List[Tuple[int, int]],
+) -> sparse.csr_matrix:
+    """Return Pz=(-1)^Nup_spin inside the supplied spin-orbital U1 basis."""
+    operator = _build_spin_pi_z_operator_cached(
+        tuple((int(spin_state), int(orbital_state)) for spin_state, orbital_state in basis_list)
+    )
+    return operator.copy()
+
+
+@functools.lru_cache(maxsize=64)
+def _build_spin_pi_z_operator_cached(
+    basis_list: Tuple[Tuple[int, int], ...],
+) -> sparse.csr_matrix:
+    dim = int(len(basis_list))
+    diagonal = np.asarray(
+        [_spin_pi_z_eigenvalue_from_spin_bits(spin_state) for spin_state, _ in basis_list],
+        dtype=np.complex128,
+    )
+    return sparse.diags(diagonal, offsets=0, shape=(dim, dim), format="csr")
+
+
+def _geometry_translation_cache_key(
+    geometry: GeometryData,
+    direction: str,
+) -> Tuple[Any, ...]:
+    axis = str(direction).strip().lower()
+    if axis not in ("x", "y"):
+        raise ValueError(f"Unsupported translation direction '{direction}'.")
+    n_sites = int(geometry.number_of_sites)
+    cell_indices = tuple(
+        (int(cell[0]), int(cell[1]))
+        for cell in list(getattr(geometry, "cell_indices", []))
+    )
+    sublattice_indices = tuple(int(value) for value in list(getattr(geometry, "sublattice_indices", [])))
+    if len(cell_indices) != n_sites or len(sublattice_indices) != n_sites:
+        raise ValueError("Geometry does not expose complete cell/sublattice labels for fused-site translation.")
+    return (
+        axis,
+        n_sites,
+        int(getattr(geometry, "length_x", 0) or 0),
+        int(getattr(geometry, "length_y", 0) or 0),
+        bool(getattr(geometry, "circumference_x", False)),
+        bool(getattr(geometry, "circumference_y", False)),
+        cell_indices,
+        sublattice_indices,
+    )
+
+
+def _site_translation_permutation(geometry: GeometryData, direction: str) -> Tuple[List[int], int]:
+    """Map each physical site to its translated site for a periodic cell shift."""
+    permutation, order = _site_translation_permutation_cached(_geometry_translation_cache_key(geometry, direction))
+    return list(permutation), int(order)
+
+
+@functools.lru_cache(maxsize=64)
+def _site_translation_permutation_cached(cache_key: Tuple[Any, ...]) -> Tuple[Tuple[int, ...], int]:
+    axis = str(cache_key[0])
+    n_sites = int(cache_key[1])
+    length_x = int(cache_key[2])
+    length_y = int(cache_key[3])
+    circumference_x = bool(cache_key[4])
+    circumference_y = bool(cache_key[5])
+    cell_indices = tuple(cache_key[6])
+    sublattice_indices = tuple(cache_key[7])
+
+    if length_x <= 0:
+        length_x = 1 + max(int(cell[0]) for cell in cell_indices)
+    if length_y <= 0:
+        length_y = 1 + max(int(cell[1]) for cell in cell_indices)
+    length_x = int(length_x)
+    length_y = int(length_y)
+    if length_x <= 0 or length_y <= 0:
+        raise ValueError("Invalid geometry lengths for translation projector.")
+    if axis == "x" and not circumference_x:
+        raise ValueError("Translation-x projector requires periodic x boundary conditions.")
+    if axis == "y" and not circumference_y:
+        raise ValueError("Translation-y projector requires periodic y boundary conditions.")
+
+    site_by_label: Dict[Tuple[int, int, int], int] = {}
+    for site, (cell, sublattice) in enumerate(zip(cell_indices, sublattice_indices)):
+        key = (int(cell[0]), int(cell[1]), int(sublattice))
+        if key in site_by_label:
+            raise ValueError(f"Duplicate fused site label {key}; cannot build translation projector.")
+        site_by_label[key] = int(site)
+
+    permutation = [0] * n_sites
+    for site, (cell, sublattice) in enumerate(zip(cell_indices, sublattice_indices)):
+        x_cell = int(cell[0])
+        y_cell = int(cell[1])
+        sub = int(sublattice)
+        if axis == "x":
+            target_key = ((x_cell + 1) % length_x, y_cell, sub)
+            order = length_x
+        else:
+            target_key = (x_cell, (y_cell + 1) % length_y, sub)
+            order = length_y
+        if target_key not in site_by_label:
+            raise ValueError(f"Translated fused site {target_key} is missing from the geometry.")
+        permutation[int(site)] = int(site_by_label[target_key])
+    return tuple(permutation), int(order)
+
+
+def _permute_bits_by_site_map(state: int, site_permutation: List[int]) -> int:
+    """Apply a physical-site permutation to a bitstring.
+
+    ``site_permutation[old_site] = new_site``. The translated bit at
+    ``new_site`` is copied from ``old_site``.
+    """
+    out = 0
+    raw_state = int(state)
+    for old_site, new_site in enumerate(site_permutation):
+        if (raw_state >> int(old_site)) & 1:
+            out |= 1 << int(new_site)
+    return int(out)
+
+
+def _translation_index_permutation_in_spin_orbital_u1_basis(
+    geometry: GeometryData,
+    basis_list: List[Tuple[int, int]],
+    basis_map: Dict[Tuple[int, int], int],
+    direction: str,
+) -> Tuple[np.ndarray, int]:
+    site_permutation, order = _site_translation_permutation(geometry, direction)
+    index_permutation = np.empty(int(len(basis_list)), dtype=np.int64)
+    for col, (spin_state, orbital_state) in enumerate(basis_list):
+        translated_key = (
+            _permute_bits_by_site_map(int(spin_state), site_permutation),
+            _permute_bits_by_site_map(int(orbital_state), site_permutation),
+        )
+        row = basis_map.get(translated_key)
+        if row is None:
+            raise ValueError(
+                "Fused translation left the selected Tz basis. "
+                "This indicates an inconsistent orbital Tz sector or geometry map."
+            )
+        index_permutation[int(col)] = int(row)
+    return index_permutation, int(order)
+
+
+def build_fused_translation_operator_in_spin_orbital_u1_basis(
+    geometry: GeometryData,
+    basis_list: List[Tuple[int, int]],
+    basis_map: Dict[Tuple[int, int], int],
+    direction: str,
+) -> Tuple[sparse.csr_matrix, int, np.ndarray]:
+    """Return a combined spin+orbital translation operator in the Tz basis."""
+    if any(basis_map.get((int(spin_state), int(orbital_state))) != idx for idx, (spin_state, orbital_state) in enumerate(basis_list)):
+        index_permutation, order = _translation_index_permutation_in_spin_orbital_u1_basis(
+            geometry,
+            basis_list,
+            basis_map,
+            direction,
+        )
+        dim = int(len(basis_list))
+        columns = np.arange(dim, dtype=np.int64)
+        data = np.ones(dim, dtype=np.complex128)
+        operator = sparse.csr_matrix((data, (index_permutation, columns)), shape=(dim, dim))
+        return operator, int(order), index_permutation
+    operator, order, index_permutation = _build_fused_translation_operator_cached(
+        _geometry_translation_cache_key(geometry, direction),
+        tuple((int(spin_state), int(orbital_state)) for spin_state, orbital_state in basis_list),
+    )
+    return operator.copy(), int(order), index_permutation.copy()
+
+
+@functools.lru_cache(maxsize=64)
+def _build_fused_translation_operator_cached(
+    geometry_key: Tuple[Any, ...],
+    basis_list: Tuple[Tuple[int, int], ...],
+) -> Tuple[sparse.csr_matrix, int, np.ndarray]:
+    site_permutation, order = _site_translation_permutation_cached(geometry_key)
+    basis_map = {key: index for index, key in enumerate(basis_list)}
+    dim = int(len(basis_list))
+    index_permutation = np.empty(dim, dtype=np.int64)
+    for col, (spin_state, orbital_state) in enumerate(basis_list):
+        translated_key = (
+            _permute_bits_by_site_map(int(spin_state), site_permutation),
+            _permute_bits_by_site_map(int(orbital_state), site_permutation),
+        )
+        row = basis_map.get(translated_key)
+        if row is None:
+            raise ValueError(
+                "Fused translation left the selected Tz basis. "
+                "This indicates an inconsistent orbital Tz sector or geometry map."
+            )
+        index_permutation[int(col)] = int(row)
+    columns = np.arange(dim, dtype=np.int64)
+    data = np.ones(dim, dtype=np.complex128)
+    operator = sparse.csr_matrix((data, (index_permutation, columns)), shape=(dim, dim))
+    return operator, int(order), index_permutation
+
+
+def _sparse_relative_commutator_norm(left: sparse.spmatrix, right: sparse.spmatrix) -> float:
+    commutator = (left @ right) - (right @ left)
+    numerator = float(sparse_linalg.norm(commutator))
+    denominator = max(1.0, float(sparse_linalg.norm(left)) * float(sparse_linalg.norm(right)))
+    return float(numerator / denominator)
+
+
+def _projected_column_space_from_orbits(
+    basis_list: List[Tuple[int, int]],
+    *,
+    use_spin_pi_z: bool,
+    z2_target_parity: int,
+    translation_powers: List[Tuple[int, int, np.ndarray, complex]],
+    projector_tol: float,
+) -> Tuple[sparse.csc_matrix, Dict[str, Any]]:
+    """Build candidate projector columns from parity-filtered translation orbits."""
+    translation_key = _translation_powers_cache_key(translation_powers)
+    q_candidates, metadata = _projected_column_space_from_orbits_cached(
+        tuple((int(spin_state), int(orbital_state)) for spin_state, orbital_state in basis_list),
+        bool(use_spin_pi_z),
+        int(z2_target_parity),
+        translation_key,
+        float(projector_tol),
+    )
+    return q_candidates.copy(), dict(metadata)
+
+
+def _translation_powers_cache_key(
+    translation_powers: List[Tuple[int, int, np.ndarray, complex]],
+) -> Tuple[Tuple[int, int, Tuple[int, ...], float, float], ...]:
+    return tuple(
+        (
+            int(nx),
+            int(ny),
+            tuple(int(value) for value in np.asarray(image, dtype=np.int64).tolist()),
+            float(np.real(phase)),
+            float(np.imag(phase)),
+        )
+        for nx, ny, image, phase in translation_powers
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _projected_column_space_from_orbits_cached(
+    basis_list: Tuple[Tuple[int, int], ...],
+    use_spin_pi_z: bool,
+    z2_target_parity: int,
+    translation_key: Tuple[Tuple[int, int, Tuple[int, ...], float, float], ...],
+    projector_tol: float,
+) -> Tuple[sparse.csc_matrix, Dict[str, Any]]:
+    dim = int(len(basis_list))
+    translation_powers = [
+        (int(nx), int(ny), np.asarray(image, dtype=np.int64), complex(real_phase, imag_phase))
+        for nx, ny, image, real_phase, imag_phase in translation_key
+    ]
+    target_pz = 1 if int(z2_target_parity) % 2 == 0 else -1
+    parity_values = np.asarray(
+        [_spin_pi_z_eigenvalue_from_spin_bits(spin_state) for spin_state, _ in basis_list],
+        dtype=np.int8,
+    )
+    visited = np.zeros(dim, dtype=bool)
+    rows: List[int] = []
+    cols: List[int] = []
+    data: List[complex] = []
+    kept_columns = 0
+    skipped_by_parity = 0
+    skipped_null_orbits = 0
+    orbit_count = 0
+
+    for representative in range(dim):
+        if bool(visited[representative]):
+            continue
+        orbit_indices = {int(image[representative]) for _, _, image, _ in translation_powers}
+        for index in orbit_indices:
+            visited[int(index)] = True
+        orbit_count += 1
+        if bool(use_spin_pi_z) and int(parity_values[representative]) != int(target_pz):
+            skipped_by_parity += 1
+            continue
+
+        coefficients: Dict[int, complex] = {}
+        for _, _, image, phase in translation_powers:
+            row = int(image[representative])
+            coefficients[row] = coefficients.get(row, 0.0 + 0.0j) + complex(phase)
+        norm = math.sqrt(sum(abs(value) ** 2 for value in coefficients.values()))
+        if norm <= float(projector_tol):
+            skipped_null_orbits += 1
+            continue
+        for row, value in coefficients.items():
+            amplitude = complex(value) / norm
+            if abs(amplitude) > float(projector_tol):
+                rows.append(int(row))
+                cols.append(int(kept_columns))
+                data.append(amplitude)
+        kept_columns += 1
+
+    q_candidates = sparse.csc_matrix(
+        (np.asarray(data, dtype=np.complex128), (np.asarray(rows, dtype=np.int64), np.asarray(cols, dtype=np.int64))),
+        shape=(dim, kept_columns),
+        dtype=np.complex128,
+    )
+    metadata = {
+        "candidate_columns": int(kept_columns),
+        "translation_orbits": int(orbit_count),
+        "skipped_orbits_by_spin_pi_z": int(skipped_by_parity),
+        "skipped_null_momentum_orbits": int(skipped_null_orbits),
+        "z2_target_eigenvalue": int(target_pz) if bool(use_spin_pi_z) else None,
+    }
+    return q_candidates, metadata
+
+
+def _copy_projector_matrix(matrix: sparse.spmatrix | np.ndarray) -> sparse.spmatrix | np.ndarray:
+    return matrix.copy() if sparse.issparse(matrix) else np.array(matrix, copy=True)
+
+
+def _projector_basis_from_orbits(
+    basis_list: List[Tuple[int, int]],
+    *,
+    use_spin_pi_z: bool,
+    z2_target_parity: int,
+    translation_powers: List[Tuple[int, int, np.ndarray, complex]],
+    projector_tol: float,
+    dense_svd_entry_cap: int,
+    dense_svd_mb_cap: float,
+) -> Tuple[sparse.csc_matrix, sparse.spmatrix | np.ndarray, Dict[str, Any], Dict[str, Any]]:
+    basis_key = tuple((int(spin_state), int(orbital_state)) for spin_state, orbital_state in basis_list)
+    (
+        q_candidates,
+        q_matrix,
+        projector_metadata,
+        orthonormalization_metadata,
+    ) = _projector_basis_from_orbits_cached(
+        basis_key,
+        bool(use_spin_pi_z),
+        int(z2_target_parity),
+        _translation_powers_cache_key(translation_powers),
+        float(projector_tol),
+        int(dense_svd_entry_cap),
+        float(dense_svd_mb_cap),
+    )
+    return (
+        q_candidates.copy(),
+        _copy_projector_matrix(q_matrix),
+        dict(projector_metadata),
+        dict(orthonormalization_metadata),
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _projector_basis_from_orbits_cached(
+    basis_list: Tuple[Tuple[int, int], ...],
+    use_spin_pi_z: bool,
+    z2_target_parity: int,
+    translation_key: Tuple[Tuple[int, int, Tuple[int, ...], float, float], ...],
+    projector_tol: float,
+    dense_svd_entry_cap: int,
+    dense_svd_mb_cap: float,
+) -> Tuple[sparse.csc_matrix, sparse.spmatrix | np.ndarray, Dict[str, Any], Dict[str, Any]]:
+    q_candidates, projector_metadata = _projected_column_space_from_orbits_cached(
+        basis_list,
+        bool(use_spin_pi_z),
+        int(z2_target_parity),
+        translation_key,
+        float(projector_tol),
+    )
+    q_matrix, orthonormalization_metadata = _orthonormalize_projector_columns(
+        q_candidates,
+        tol=float(projector_tol),
+        dense_svd_entry_cap=int(dense_svd_entry_cap),
+        dense_svd_mb_cap=float(dense_svd_mb_cap),
+    )
+    return q_candidates, q_matrix, projector_metadata, orthonormalization_metadata
+
+
+def _matrix_storage_diagnostics(matrix: sparse.spmatrix | np.ndarray | None) -> Dict[str, Any]:
+    if matrix is None:
+        return {"available": False}
+    if sparse.issparse(matrix):
+        mat = matrix
+        return {
+            "available": True,
+            "format": str(mat.getformat()),
+            "shape": [int(mat.shape[0]), int(mat.shape[1])],
+            "nnz": int(mat.nnz),
+            "estimated_bytes": int(mat.data.nbytes + mat.indices.nbytes + mat.indptr.nbytes),
+            "dense_entries": int(mat.shape[0]) * int(mat.shape[1]),
+        }
+    arr = np.asarray(matrix)
+    return {
+        "available": True,
+        "format": "dense",
+        "shape": [int(arr.shape[0]), int(arr.shape[1])],
+        "nnz": None,
+        "estimated_bytes": int(arr.nbytes),
+        "dense_entries": int(arr.size),
+    }
+
+
+def _check_projector_matrix_caps(
+    matrix: sparse.spmatrix | np.ndarray,
+    *,
+    label: str,
+    max_nnz: int,
+    max_dense_entries: int,
+    max_dense_mb: float = MAX_DENSE_PROJECTOR_MB,
+) -> None:
+    diagnostics = _matrix_storage_diagnostics(matrix)
+    dense_entries = int(diagnostics.get("dense_entries", 0))
+    if sparse.issparse(matrix):
+        nnz = int(diagnostics.get("nnz", 0))
+        if nnz > int(max_nnz):
+            raise MemoryError(
+                f"[projector-ed] {label} has nnz={nnz:,}, exceeding MAX_PROJECTOR_NNZ={int(max_nnz):,}."
+            )
+        return
+    dense_guard = _dense_allocation_diagnostics(
+        label=label,
+        entries=dense_entries,
+        dtype=getattr(matrix, "dtype", np.complex128),
+        max_dense_entries=int(max_dense_entries),
+        max_dense_mb=float(max_dense_mb),
+    )
+    if not bool(dense_guard["allowed"]):
+        _raise_dense_memory_error(dense_guard)
+
+
+def _orthonormalize_projector_columns(
+    q_candidates: sparse.spmatrix | np.ndarray,
+    *,
+    tol: float,
+    dense_svd_entry_cap: int = MAX_DENSE_PROJECTOR_ENTRIES,
+    dense_svd_mb_cap: float = MAX_DENSE_PROJECTOR_MB,
+    force_svd: bool = False,
+) -> Tuple[sparse.spmatrix | np.ndarray, Dict[str, Any]]:
+    """Orthonormalize projector columns when small; otherwise keep exact orbit columns.
+
+    Translation orbit columns built by ``_projected_column_space_from_orbits`` are
+    already orthonormal after per-orbit normalization.  For small projected
+    spaces we still run SVD as a direct numerical check and cleanup.
+    """
+    rows, columns = q_candidates.shape
+    if int(columns) <= 0:
+        raise ValueError("Requested projectors produced an empty ED subspace.")
+    entry_count = int(rows) * int(columns)
+    dense_guard = _dense_allocation_diagnostics(
+        label="projector candidate SVD",
+        entries=entry_count,
+        dtype=getattr(q_candidates, "dtype", np.complex128),
+        max_dense_entries=int(dense_svd_entry_cap),
+        max_dense_mb=float(dense_svd_mb_cap),
+    )
+    if force_svd or bool(dense_guard["allowed"]):
+        if force_svd and not bool(dense_guard["allowed"]):
+            _raise_dense_memory_error(dense_guard)
+        dense = q_candidates.toarray() if sparse.issparse(q_candidates) else np.asarray(q_candidates)
+        u_matrix, singular_values, _ = np.linalg.svd(dense, full_matrices=False)
+        max_singular = float(np.max(singular_values)) if singular_values.size else 0.0
+        keep = singular_values > max(float(tol), float(tol) * max_singular)
+        if not np.any(keep):
+            raise ValueError("Projector SVD removed every candidate column.")
+        q_matrix = np.asarray(u_matrix[:, keep], dtype=np.complex128)
+        metadata = {
+            "orthonormalization": "svd",
+            "singular_values_kept": int(np.count_nonzero(keep)),
+            "singular_values_total": int(singular_values.size),
+            "smallest_kept_singular_value": float(np.min(singular_values[keep])),
+            "largest_singular_value": max_singular,
+            "dense_svd_entry_cap": int(dense_svd_entry_cap),
+            "dense_svd_mb_cap": float(dense_svd_mb_cap),
+            "candidate_dense_entries": int(entry_count),
+            "memory_estimate_MB": float(dense_guard["memory_estimate_MB"]),
+            "dense_memory_guard": dense_guard,
+            "projector_strategy": "dense_small_safe",
+            "candidate_storage": _matrix_storage_diagnostics(q_candidates),
+        }
+        return q_matrix, metadata
+
+    metadata = {
+        "orthonormalization": "orbit_normalization",
+        "singular_values_kept": int(columns),
+        "singular_values_total": None,
+        "dense_svd_entry_cap": int(dense_svd_entry_cap),
+        "dense_svd_mb_cap": float(dense_svd_mb_cap),
+        "candidate_dense_entries": int(entry_count),
+        "memory_estimate_MB": float(dense_guard["memory_estimate_MB"]),
+        "dense_memory_guard": dense_guard,
+        "projector_strategy": "sparse",
+        "candidate_storage": _matrix_storage_diagnostics(q_candidates),
+        "note": (
+            "Projector columns are disjoint normalized translation-orbit columns; "
+            "dense SVD was skipped to avoid materializing a very large matrix."
+        ),
+    }
+    return q_candidates, metadata
+
+
+def _honeycomb_bond_axis_lookup(geometry: GeometryData) -> Dict[Tuple[int, int], str]:
+    lookup: Dict[Tuple[int, int], str] = {}
+    for bond in geometry.bond_list:
+        i = int(bond.i)
+        j = int(bond.j)
+        lookup[(min(i, j), max(i, j))] = str(bond.gamma).strip().lower()
+    return lookup
+
+
+def _permutation_has_order(site_permutation: List[int], order: int) -> bool:
+    n_sites = int(len(site_permutation))
+    image = list(range(n_sites))
+    for _ in range(int(order)):
+        image = [int(site_permutation[int(site)]) for site in image]
+    return all(int(image[site]) == int(site) for site in range(n_sites))
+
+
+def _matrix_mod_order_three(matrix: Tuple[Tuple[int, int], Tuple[int, int]], modulus: int) -> bool:
+    m = np.asarray(matrix, dtype=int)
+    identity = np.eye(2, dtype=int)
+    m_mod = np.mod(m, int(modulus))
+    if np.array_equal(m_mod, identity % int(modulus)):
+        return False
+    cube = np.mod(m_mod @ m_mod @ m_mod, int(modulus))
+    return bool(np.array_equal(cube, identity % int(modulus)))
+
+
+def _candidate_order_three_cell_matrices(length: int) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
+    values = (-1, 0, 1)
+    candidates: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
+    for a in values:
+        for b in values:
+            for c in values:
+                for d in values:
+                    matrix = ((int(a), int(b)), (int(c), int(d)))
+                    if _matrix_mod_order_three(matrix, int(length)):
+                        if matrix not in candidates:
+                            candidates.append(matrix)
+    return candidates
+
+
+def _find_honeycomb_combined_c3_site_permutation(
+    geometry: GeometryData,
+) -> Tuple[List[int], Dict[str, Any]]:
+    """Find a 120-degree honeycomb site rotation compatible with the bond labels."""
+    n_sites = int(geometry.number_of_sites)
+    length_x = int(getattr(geometry, "length_x", 0) or 0)
+    length_y = int(getattr(geometry, "length_y", 0) or 0)
+    if length_x <= 0 or length_y <= 0 or length_x != length_y:
+        raise ValueError("Combined C3 requires a honeycomb torus with length_x=length_y.")
+    if not (bool(getattr(geometry, "circumference_x", False)) and bool(getattr(geometry, "circumference_y", False))):
+        raise ValueError("Combined C3 requires periodic x and y boundaries.")
+    cell_indices = list(getattr(geometry, "cell_indices", []))
+    sublattice_indices = list(getattr(geometry, "sublattice_indices", []))
+    if len(cell_indices) != n_sites or len(sublattice_indices) != n_sites:
+        raise ValueError("Geometry does not expose complete cell/sublattice labels for combined C3.")
+
+    length = int(length_x)
+    site_by_label: Dict[Tuple[int, int, int], int] = {}
+    for site, (cell, sublattice) in enumerate(zip(cell_indices, sublattice_indices)):
+        key = (int(cell[0]) % length, int(cell[1]) % length, int(sublattice))
+        if key in site_by_label:
+            raise ValueError(f"Duplicate honeycomb site label {key}; cannot build C3.")
+        site_by_label[key] = int(site)
+
+    bond_lookup = _honeycomb_bond_axis_lookup(geometry)
+    allowed_axis_cycles = (
+        {"x": "y", "y": "z", "z": "x"},
+        {"x": "z", "z": "y", "y": "x"},
+    )
+    matrices = _candidate_order_three_cell_matrices(length)
+    offsets = [(x, y) for x in range(length) for y in range(length)]
+    for matrix in matrices:
+        m00, m01 = matrix[0]
+        m10, m11 = matrix[1]
+        for flip_sublattice in (False, True):
+            for offset_a in offsets:
+                for offset_b in offsets:
+                    offsets_by_sub = {0: offset_a, 1: offset_b}
+                    permutation = [0] * n_sites
+                    ok = True
+                    for site, (cell, sublattice) in enumerate(zip(cell_indices, sublattice_indices)):
+                        x_cell = int(cell[0]) % length
+                        y_cell = int(cell[1]) % length
+                        sub = int(sublattice)
+                        target_sub = 1 - sub if flip_sublattice else sub
+                        offset = offsets_by_sub[sub]
+                        target_x = (m00 * x_cell + m01 * y_cell + int(offset[0])) % length
+                        target_y = (m10 * x_cell + m11 * y_cell + int(offset[1])) % length
+                        target_key = (int(target_x), int(target_y), int(target_sub))
+                        target_site = site_by_label.get(target_key)
+                        if target_site is None:
+                            ok = False
+                            break
+                        permutation[int(site)] = int(target_site)
+                    if not ok or len(set(permutation)) != n_sites:
+                        continue
+                    if not _permutation_has_order(permutation, 3):
+                        continue
+
+                    axis_map: Dict[str, str] = {}
+                    for bond in geometry.bond_list:
+                        mapped_pair = (int(permutation[int(bond.i)]), int(permutation[int(bond.j)]))
+                        mapped_axis = bond_lookup.get((min(mapped_pair), max(mapped_pair)))
+                        if mapped_axis is None:
+                            ok = False
+                            break
+                        source_axis = str(bond.gamma).strip().lower()
+                        previous = axis_map.get(source_axis)
+                        if previous is not None and previous != mapped_axis:
+                            ok = False
+                            break
+                        axis_map[source_axis] = mapped_axis
+                    if not ok:
+                        continue
+                    if axis_map not in allowed_axis_cycles:
+                        continue
+                    return permutation, {
+                        "cell_matrix": [[int(m00), int(m01)], [int(m10), int(m11)]],
+                        "flip_sublattice": bool(flip_sublattice),
+                        "offset_by_sublattice": {
+                            "0": [int(offset_a[0]), int(offset_a[1])],
+                            "1": [int(offset_b[0]), int(offset_b[1])],
+                        },
+                        "bond_axis_cycle": dict(axis_map),
+                        "order": 3,
+                    }
+
+    raise ValueError("No honeycomb order-three site rotation compatible with the x/y/z bond labels was found.")
+
+
+def _spin_half_c3_rotation_matrix() -> np.ndarray:
+    """Local U_C3=exp[-i(2*pi/3)(Sx+Sy+Sz)/sqrt(3)] for S=sigma/2."""
+    theta = 2.0 * math.pi / 3.0
+    sigma_x = np.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
+    sigma_y = np.asarray([[0.0, -1.0j], [1.0j, 0.0]], dtype=np.complex128)
+    sigma_z = np.asarray([[1.0, 0.0], [0.0, -1.0]], dtype=np.complex128)
+    n_dot_sigma = (sigma_x + sigma_y + sigma_z) / math.sqrt(3.0)
+    return (
+        math.cos(theta / 2.0) * np.eye(2, dtype=np.complex128)
+        - 1.0j * math.sin(theta / 2.0) * n_dot_sigma
+    )
+
+
+def _apply_local_spin_rotation_and_site_permutation(
+    spin_state: int,
+    site_permutation: List[int],
+    local_spin_rotation: np.ndarray,
+    *,
+    amplitude_tol: float = 1e-14,
+) -> List[Tuple[int, complex]]:
+    states: List[Tuple[int, complex]] = [(0, 1.0 + 0.0j)]
+    raw_state = int(spin_state)
+    for old_site, new_site in enumerate(site_permutation):
+        input_is_up = bool((raw_state >> int(old_site)) & 1)
+        input_index = 0 if input_is_up else 1
+        next_states: List[Tuple[int, complex]] = []
+        for partial_state, partial_coeff in states:
+            for output_index, output_is_up in ((0, True), (1, False)):
+                coeff = complex(local_spin_rotation[int(output_index), int(input_index)])
+                if abs(coeff) <= float(amplitude_tol):
+                    continue
+                next_state = int(partial_state)
+                if bool(output_is_up):
+                    next_state |= 1 << int(new_site)
+                next_states.append((next_state, complex(partial_coeff) * coeff))
+        states = next_states
+    return states
+
+
+def build_combined_c3_operator_in_spin_orbital_u1_basis(
+    geometry: GeometryData,
+    basis_list: List[Tuple[int, int]],
+    basis_map: Dict[Tuple[int, int], int],
+    *,
+    amplitude_tol: float = 1e-14,
+    show_progress: bool = False,
+) -> Tuple[sparse.csr_matrix, Dict[str, Any]]:
+    """Build combined honeycomb C3 in the Tz basis.
+
+    The orbital state is only site-rotated.  No local orbital pseudospin
+    rotation is applied, so total Tz remains a good first reduction.
+    """
+    site_permutation, metadata = _find_honeycomb_combined_c3_site_permutation(geometry)
+    local_spin_rotation = _spin_half_c3_rotation_matrix()
+    dim = int(len(basis_list))
+    rows: List[int] = []
+    cols: List[int] = []
+    data: List[complex] = []
+    progress_bar = _make_progress_bar(
+        enabled=show_progress,
+        total=dim,
+        desc="C3 operator",
+        unit="state",
+        leave=False,
+    )
+    for col, (spin_state, orbital_state) in enumerate(basis_list):
+        rotated_orbital = _permute_bits_by_site_map(int(orbital_state), site_permutation)
+        spin_outputs = _apply_local_spin_rotation_and_site_permutation(
+            int(spin_state),
+            site_permutation,
+            local_spin_rotation,
+            amplitude_tol=float(amplitude_tol),
+        )
+        for rotated_spin, coeff in spin_outputs:
+            row = basis_map.get((int(rotated_spin), int(rotated_orbital)))
+            if row is None:
+                raise ValueError("Combined C3 left the selected Tz basis; orbital site rotation should preserve Tz.")
+            if abs(coeff) > float(amplitude_tol):
+                rows.append(int(row))
+                cols.append(int(col))
+                data.append(complex(coeff))
+        if progress_bar is not None:
+            progress_bar.update(1)
+    if progress_bar is not None:
+        progress_bar.close()
+    operator = sparse.csr_matrix(
+        (np.asarray(data, dtype=np.complex128), (np.asarray(rows, dtype=np.int64), np.asarray(cols, dtype=np.int64))),
+        shape=(dim, dim),
+    )
+    metadata["spin_rotation"] = "exp[-i(2*pi/3)*(Sx+Sy+Sz)/sqrt(3)], S=sigma/2"
+    metadata["orbital_rotation"] = "site permutation only; no local orbital pseudospin rotation"
+    metadata["nnz"] = int(operator.nnz)
+    return operator, metadata
+
+
+def _solve_projected_hamiltonian(
+    hamiltonian: sparse.spmatrix,
+    q_matrix: sparse.spmatrix | np.ndarray,
+    *,
+    requested_count: int,
+    check_ground_state_degeneracy: bool,
+    sparse_tol: float,
+    sparse_maxiter: int | None,
+    show_progress: bool,
+    label: str,
+    max_dense_entries: int = MAX_DENSE_PROJECTOR_ENTRIES,
+    max_dense_mb: float = MAX_DENSE_PROJECTOR_MB,
+    strict_projector_memory: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, str, int, Dict[str, Any], Dict[str, float], Dict[str, Any]]:
+    timing: Dict[str, float] = {}
+    memory: Dict[str, Any] = {
+        "q_matrix": _matrix_storage_diagnostics(q_matrix),
+    }
+    reduced_dim = int(q_matrix.shape[1])
+    if reduced_dim <= 0:
+        raise ValueError("Cannot diagonalize an empty projected ED sector.")
+    project_start = time.perf_counter()
+    with profile_stage("standard projector construction"):
+        if sparse.issparse(q_matrix):
+            hamiltonian_csr = hamiltonian if sparse.isspmatrix_csr(hamiltonian) else hamiltonian.tocsr()
+            q_sparse = q_matrix if sparse.isspmatrix_csc(q_matrix) else q_matrix.tocsc()
+            h_red = (q_sparse.getH() @ hamiltonian_csr @ q_sparse).tocsr()
+            h_red = ((h_red + h_red.getH()) * 0.5).tocsr()
+        else:
+            hamiltonian_csr = hamiltonian if sparse.isspmatrix_csr(hamiltonian) else hamiltonian.tocsr()
+            h_red = np.asarray(q_matrix.conj().T @ (hamiltonian_csr @ q_matrix), dtype=np.complex128)
+            h_red = 0.5 * (h_red + h_red.conj().T)
+    timing["project_or_build_Hred"] = float(time.perf_counter() - project_start)
+    memory["h_red"] = _matrix_storage_diagnostics(h_red)
+    if reduced_dim == 1:
+        eigenvalues = np.asarray([complex(h_red[0, 0]) if sparse.issparse(h_red) else complex(h_red[0, 0])])
+        eigenvectors = np.ones((1, 1), dtype=np.complex128)
+        timing["diagonalize"] = 0.0
+        return eigenvalues, eigenvectors, "spin_orbital_tz_projector_dense_dim1", 0, {}, timing, memory
+
+    solve_count, degeneracy_padding = _padded_eigsh_count(
+        int(requested_count),
+        reduced_dim,
+        check_ground_state_degeneracy=bool(check_ground_state_degeneracy),
+    )
+    if solve_count >= reduced_dim - 1:
+        dense_entries = int(reduced_dim) * int(reduced_dim)
+        dense_guard = _dense_allocation_diagnostics(
+            label=f"{label} dense projected Hamiltonian diagonalization",
+            entries=dense_entries,
+            dtype=np.complex128,
+            max_dense_entries=int(max_dense_entries),
+            max_dense_mb=float(max_dense_mb),
+        )
+        memory["dense_diagonalization"] = dense_guard
+        if not bool(dense_guard["allowed"]):
+            memory["dense_diagonalization_skipped_reason"] = dense_guard.get("reason")
+            if bool(strict_projector_memory):
+                _raise_dense_memory_error(dense_guard)
+            if reduced_dim <= 2:
+                _raise_dense_memory_error(dense_guard)
+            solve_count = max(1, min(int(requested_count), reduced_dim - 2))
+        else:
+            diag_start = time.perf_counter()
+            with profile_stage("diagonalization"):
+                dense_h = h_red.toarray() if sparse.issparse(h_red) else np.asarray(h_red)
+                eigenvalues, eigenvectors = np.linalg.eigh(dense_h)
+            timing["diagonalize"] = float(time.perf_counter() - diag_start)
+            return (
+                eigenvalues,
+                eigenvectors,
+                "spin_orbital_tz_projector_dense",
+                int(degeneracy_padding),
+                {},
+                timing,
+                memory,
+            )
+
+    sparse_h = h_red if sparse.issparse(h_red) else sparse.csr_matrix(h_red)
+    diag_start = time.perf_counter()
+    with profile_stage("diagonalization"):
+        eigenvalues, eigenvectors, eigsh_info = _run_lowest_eigsh(
+            sparse_h,
+            eigenstate_count=solve_count,
+            sparse_tol=sparse_tol,
+            sparse_maxiter=sparse_maxiter,
+            show_progress=show_progress,
+            label=label,
+        )
+    timing["diagonalize"] = float(time.perf_counter() - diag_start)
+    return (
+        eigenvalues,
+        eigenvectors,
+        "spin_orbital_tz_projector_sparse",
+        int(degeneracy_padding),
+        eigsh_info,
+        timing,
+        memory,
+    )
+
+
+def run_spin_orbital_projected_exact_spectrum(
+    geometry: GeometryData,
+    model_spec: ModelSpec,
+    alpha: float,
+    beta: float,
+    *,
+    coupling_j: float = 1.0,
+    eigenstate_count: int = 3,
+    check_ground_state_degeneracy: bool = True,
+    jx: float = 1.0,
+    jy: float = 1.0,
+    jz: float = 1.0,
+    external_field_terms: List[Tuple[float, str]] | None = None,
+    show_progress: bool = True,
+    ground_manifold_abs_tol: float = 1e-12,
+    ground_manifold_rel_tol: float = 1e-12,
+    sparse_tol: float = 0.0,
+    sparse_maxiter: int | None = None,
+    target_tz2: int = 0,
+    use_spin_pi_z: bool = False,
+    z2_target_parity: int = 0,
+    use_translation_x: bool = False,
+    use_translation_y: bool = False,
+    momentum_x: int = 0,
+    momentum_y: int = 0,
+    use_combined_c3: bool = False,
+    c3_q_blocks: str | int = "0",
+    projector_tol: float = 1e-10,
+    commutator_tol: float = 1e-8,
+    strict_projector_memory: bool = True,
+    allow_drop_c3_on_memory: bool = False,
+    max_projector_parent_dim: int = MAX_PROJECTOR_PARENT_DIM,
+    max_projector_nnz: int = MAX_PROJECTOR_NNZ,
+    max_dense_projector_entries: int = MAX_DENSE_PROJECTOR_ENTRIES,
+    max_dense_projector_mb: float = MAX_DENSE_PROJECTOR_MB,
+    max_explicit_c3_parent_dim: int = MAX_EXPLICIT_C3_PARENT_DIM,
+    max_explicit_c3_dim: int = MAX_EXPLICIT_C3_DIM,
+    phase_scan_c3_seconds_per_point: float | None = MAX_PHASE_SCAN_C3_SECONDS_PER_POINT,
+) -> Tuple[Dict[str, Any], np.ndarray, List[Tuple[int, int]], Dict[Tuple[int, int], int]]:
+    """Diagonalize Yao-Lee ED after Tz, spin-pi-z, and fused-translation projectors.
+
+    Total Tz is always applied first via ``build_spin_orbital_u1_basis``.  The
+    returned eigenvectors are expanded back into that Tz basis, so existing ED
+    observable routines can be reused without reinterpretation.
+    """
+    if str(model_spec.model_family) != "yao_lee":
+        raise ValueError("Projector ED path is currently implemented for model_family='yao_lee'.")
+    if model_spec.spin_rep != "1/2" or model_spec.orbital_rep != "1/2":
+        raise ValueError("Projector ED path requires spin_rep=1/2 and orbital_rep=1/2.")
+
+    n_sites = int(geometry.number_of_sites)
+    timing_seconds: Dict[str, float] = {}
+    memory_diagnostics: Dict[str, Any] = {
+        "caps": {
+            "MAX_PROJECTOR_PARENT_DIM": int(max_projector_parent_dim),
+            "MAX_PROJECTOR_NNZ": int(max_projector_nnz),
+            "MAX_DENSE_PROJECTOR_ENTRIES": int(max_dense_projector_entries),
+            "MAX_DENSE_PROJECTOR_MB": float(max_dense_projector_mb),
+            "MAX_EXPLICIT_C3_PARENT_DIM": int(max_explicit_c3_parent_dim),
+            "MAX_EXPLICIT_C3_DIM": int(max_explicit_c3_dim),
+            "MAX_PHASE_SCAN_C3_SECONDS_PER_POINT": (
+                float(phase_scan_c3_seconds_per_point)
+                if phase_scan_c3_seconds_per_point is not None
+                else None
+            ),
+        }
+    }
+    runtime_dropped_symmetries: List[Dict[str, Any]] = []
+    runtime_drop_reasons: Dict[str, str] = {}
+    projector_strategy = "sparse"
+    projector_total_start = time.perf_counter()
+    symmetry_validation_report = _validate_ed_u1_block_request(
+        geometry,
+        model_spec,
+        alpha,
+        beta,
+        coupling_j,
+        jx=jx,
+        jy=jy,
+        jz=jz,
+        external_field_terms=external_field_terms,
+        use_sz_block=False,
+        target_sz2=0,
+        use_tau_z_block=True,
+        target_tz2=int(target_tz2),
+    )
+    stage_start = _start_stage("spin-orbital projector ED", show_progress)
+    t0 = time.perf_counter()
+    with profile_stage("ED basis construction"):
+        basis_list, basis_map = build_spin_orbital_u1_basis(
+            n_sites,
+            use_sz_block=False,
+            target_sz2=0,
+            use_tau_z_block=True,
+            target_tz2=int(target_tz2),
+        )
+    timing_seconds["build_Tz_basis"] = float(time.perf_counter() - t0)
+    if len(basis_list) > int(max_projector_parent_dim):
+        raise MemoryError(
+            f"[projector-ed] Tz parent basis dimension {len(basis_list):,} exceeds "
+            f"MAX_PROJECTOR_PARENT_DIM={int(max_projector_parent_dim):,}."
+        )
+    t0 = time.perf_counter()
+    with profile_stage("ED Hamiltonian construction"):
+        hamiltonian = build_sparse_hamiltonian_spin_orbital_u1(
+            n_sites,
+            geometry,
+            model_spec,
+            alpha,
+            beta,
+            basis_list,
+            basis_map,
+            coupling_j=coupling_j,
+            jx=jx,
+            jy=jy,
+            jz=jz,
+            external_field_terms=external_field_terms,
+            show_progress=show_progress,
+        )
+    timing_seconds["build_parent_H"] = float(time.perf_counter() - t0)
+    u1_dim = int(hamiltonian.shape[0])
+    if u1_dim <= 0:
+        raise ValueError("Empty Tz basis in projector ED path.")
+    if u1_dim > int(max_projector_parent_dim):
+        raise MemoryError(
+            f"[projector-ed] Tz parent Hamiltonian dimension {u1_dim:,} exceeds "
+            f"MAX_PROJECTOR_PARENT_DIM={int(max_projector_parent_dim):,}."
+        )
+    if int(hamiltonian.nnz) > int(max_projector_nnz):
+        raise MemoryError(
+            f"[projector-ed] Tz parent Hamiltonian nnz={int(hamiltonian.nnz):,} exceeds "
+            f"MAX_PROJECTOR_NNZ={int(max_projector_nnz):,}."
+        )
+    memory_diagnostics["parent_hamiltonian"] = _matrix_storage_diagnostics(hamiltonian)
+
+    identity_image = np.arange(u1_dim, dtype=np.int64)
+    translation_powers: List[Tuple[int, int, np.ndarray, complex]] = [(0, 0, identity_image, 1.0 + 0.0j)]
+    translation_directions: List[str] = []
+    momentum_blocks: Dict[str, int] = {}
+    symmetry_operators: Dict[str, sparse.csr_matrix] = {}
+    commutator_norms: Dict[str, float] = {}
+    projector_warnings: List[str] = []
+    c3_dropped_by_memory = False
+
+    def _c3_memory_policy(message: str) -> bool:
+        nonlocal c3_dropped_by_memory, projector_strategy
+        if bool(strict_projector_memory) or not bool(allow_drop_c3_on_memory):
+            raise MemoryError(message)
+        c3_dropped_by_memory = True
+        projector_strategy = "dropped_by_memory_cap"
+        drop_reason = f"{message} Dropping combined C3 and continuing with Tz/translation/Z2."
+        runtime_drop_reasons["combined_c3"] = drop_reason
+        if not any(item.get("name") == "combined_c3" for item in runtime_dropped_symmetries):
+            runtime_dropped_symmetries.append(
+                {
+                    "name": "combined_c3",
+                    "reason": drop_reason,
+                    "category": "memory_cap",
+                }
+            )
+        projector_warnings.append(drop_reason)
+        return False
+
+    tx_powers: List[np.ndarray] = [identity_image]
+    ty_powers: List[np.ndarray] = [identity_image]
+    tx_order = 1
+    ty_order = 1
+
+    orbit_start = time.perf_counter()
+    with profile_stage("standard projector construction"):
+        if bool(use_spin_pi_z):
+            pz_operator = build_spin_pi_z_operator_in_spin_orbital_u1_basis(basis_list)
+            symmetry_operators["spin_pi_z"] = pz_operator
+            commutator_norms["H_spin_pi_z"] = _sparse_relative_commutator_norm(hamiltonian, pz_operator)
+            if commutator_norms["H_spin_pi_z"] > float(commutator_tol):
+                raise ValueError(
+                    "Requested spin_pi_z projector does not commute with the Hamiltonian: "
+                    f"relative_commutator_norm={commutator_norms['H_spin_pi_z']:.3e}."
+                )
+
+    with profile_stage("translation projector/orbit construction"):
+        if bool(use_translation_x):
+            tx_operator, tx_order, tx_perm = build_fused_translation_operator_in_spin_orbital_u1_basis(
+                geometry,
+                basis_list,
+                basis_map,
+                "x",
+            )
+            symmetry_operators["translation_x"] = tx_operator
+            translation_directions.append("x")
+            momentum_blocks["x"] = int(momentum_x) % int(tx_order)
+            commutator_norms["H_Tx"] = _sparse_relative_commutator_norm(hamiltonian, tx_operator)
+            if commutator_norms["H_Tx"] > float(commutator_tol):
+                raise ValueError(
+                    "Requested fused Tx projector does not commute with the Hamiltonian: "
+                    f"relative_commutator_norm={commutator_norms['H_Tx']:.3e}."
+                )
+            tx_powers = [identity_image]
+            for _ in range(1, int(tx_order)):
+                tx_powers.append(tx_perm[tx_powers[-1]])
+
+        if bool(use_translation_y):
+            ty_operator, ty_order, ty_perm = build_fused_translation_operator_in_spin_orbital_u1_basis(
+                geometry,
+                basis_list,
+                basis_map,
+                "y",
+            )
+            symmetry_operators["translation_y"] = ty_operator
+            translation_directions.append("y")
+            momentum_blocks["y"] = int(momentum_y) % int(ty_order)
+            commutator_norms["H_Ty"] = _sparse_relative_commutator_norm(hamiltonian, ty_operator)
+            if commutator_norms["H_Ty"] > float(commutator_tol):
+                raise ValueError(
+                    "Requested fused Ty projector does not commute with the Hamiltonian: "
+                    f"relative_commutator_norm={commutator_norms['H_Ty']:.3e}."
+                )
+            ty_powers = [identity_image]
+            for _ in range(1, int(ty_order)):
+                ty_powers.append(ty_perm[ty_powers[-1]])
+
+    if "translation_x" in symmetry_operators and "translation_y" in symmetry_operators:
+        commutator_norms["Tx_Ty"] = _sparse_relative_commutator_norm(
+            symmetry_operators["translation_x"],
+            symmetry_operators["translation_y"],
+        )
+
+    if bool(use_translation_x) or bool(use_translation_y):
+        translation_powers = []
+        for nx in range(int(tx_order)):
+            phase_x = np.exp(-2.0j * np.pi * (int(momentum_blocks.get("x", 0)) * nx) / float(tx_order))
+            for ny in range(int(ty_order)):
+                phase_y = np.exp(-2.0j * np.pi * (int(momentum_blocks.get("y", 0)) * ny) / float(ty_order))
+                image = ty_powers[ny][tx_powers[nx]]
+                translation_powers.append((int(nx), int(ny), image, complex(phase_x * phase_y)))
+
+    c3_operator: sparse.csr_matrix | None = None
+    c3_metadata: Dict[str, Any] | None = None
+    c3_q_text = str(c3_q_blocks).strip().lower()
+    c3_q_values: List[int] = []
+    if bool(use_combined_c3):
+        c3_start = time.perf_counter()
+        if (bool(use_translation_x) and int(momentum_blocks.get("x", 0)) != 0) or (
+            bool(use_translation_y) and int(momentum_blocks.get("y", 0)) != 0
+        ):
+            raise ValueError(
+                "Combined C3 projector is currently enabled only in C3-invariant momentum sectors; "
+                "use kx=0 and ky=0 with translation projectors."
+            )
+        if c3_q_text == "all":
+            c3_q_values = [0, 1, 2]
+        else:
+            try:
+                c3_q_values = [int(c3_q_text) % 3]
+            except ValueError as exc:
+                raise ValueError("c3_q_blocks must be one of: all, 0, 1, 2.") from exc
+        if int(u1_dim) > int(max_explicit_c3_parent_dim):
+            use_combined_c3 = _c3_memory_policy(
+                f"[projector-ed] Combined C3 parent dimension {int(u1_dim):,} exceeds "
+                f"MAX_EXPLICIT_C3_PARENT_DIM={int(max_explicit_c3_parent_dim):,}."
+            )
+        estimated_c3_operator_nnz_upper = int(u1_dim) * (1 << int(n_sites))
+        memory_diagnostics["c3_operator_estimate"] = {
+            "upper_bound_nnz": int(estimated_c3_operator_nnz_upper),
+            "parent_dim": int(u1_dim),
+            "spin_rotation_outputs_per_basis_state_upper_bound": int(1 << int(n_sites)),
+        }
+        if bool(use_combined_c3) and estimated_c3_operator_nnz_upper > int(max_projector_nnz):
+            use_combined_c3 = _c3_memory_policy(
+                f"[projector-ed] Combined C3 operator upper-bound nnz={estimated_c3_operator_nnz_upper:,} exceeds "
+                f"MAX_PROJECTOR_NNZ={int(max_projector_nnz):,} before construction."
+            )
+        if not bool(use_combined_c3):
+            c3_q_values = []
+            c3_metadata = {
+                "available": False,
+                "dropped_by_memory_guard": True,
+                "reason": runtime_drop_reasons.get("combined_c3", "estimated C3 operator exceeds memory caps"),
+            }
+            timing_seconds["build_C3"] = float(time.perf_counter() - c3_start)
+        if bool(use_combined_c3):
+            with profile_stage("C3 operator/projector construction"):
+                c3_operator, c3_metadata = build_combined_c3_operator_in_spin_orbital_u1_basis(
+                    geometry,
+                    basis_list,
+                    basis_map,
+                    amplitude_tol=float(projector_tol) * 1.0e-4,
+                    show_progress=show_progress,
+                )
+            memory_diagnostics["c3_operator"] = _matrix_storage_diagnostics(c3_operator)
+            if int(c3_operator.nnz) > int(max_projector_nnz):
+                use_combined_c3 = _c3_memory_policy(
+                    f"[projector-ed] Combined C3 operator nnz={int(c3_operator.nnz):,} exceeds "
+                    f"MAX_PROJECTOR_NNZ={int(max_projector_nnz):,}."
+                )
+            if bool(use_combined_c3):
+                timing_seconds["build_C3"] = float(time.perf_counter() - c3_start)
+            else:
+                timing_seconds["build_C3"] = float(time.perf_counter() - c3_start)
+                c3_operator = None
+                c3_metadata = {
+                    "available": False,
+                    "dropped_by_memory_guard": True,
+                    "reason": runtime_drop_reasons.get("combined_c3", "C3 dropped by memory guard"),
+                }
+                c3_q_values = []
+
+    if bool(use_combined_c3):
+        assert c3_operator is not None
+        symmetry_operators["combined_c3"] = c3_operator
+        commutator_norms["H_C3"] = _sparse_relative_commutator_norm(hamiltonian, c3_operator)
+        c3_cubed = (c3_operator @ c3_operator @ c3_operator).tocsr()
+        commutator_norms["C3_cubed_minus_identity"] = float(
+            sparse_linalg.norm(c3_cubed - sparse.identity(u1_dim, dtype=np.complex128, format="csr"))
+            / max(1.0, math.sqrt(float(u1_dim)))
+        )
+        if commutator_norms["H_C3"] > float(commutator_tol):
+            raise ValueError(
+                "Requested combined C3 projector does not commute with the Hamiltonian: "
+                f"relative_commutator_norm={commutator_norms['H_C3']:.3e}."
+            )
+        if commutator_norms["C3_cubed_minus_identity"] > max(float(commutator_tol), 1e-7):
+            raise ValueError(
+                "Constructed combined C3 operator is not order three in the selected Tz basis: "
+                f"norm={commutator_norms['C3_cubed_minus_identity']:.3e}."
+            )
+
+    with profile_stage("translation projector/orbit construction"):
+        (
+            q_candidates,
+            q_matrix,
+            projector_metadata,
+            orthonormalization_metadata,
+        ) = _projector_basis_from_orbits(
+            basis_list,
+            use_spin_pi_z=bool(use_spin_pi_z),
+            z2_target_parity=int(z2_target_parity),
+            translation_powers=translation_powers,
+            projector_tol=float(projector_tol),
+            dense_svd_entry_cap=int(max_dense_projector_entries),
+            dense_svd_mb_cap=float(max_dense_projector_mb),
+        )
+        _check_projector_matrix_caps(
+            q_candidates,
+            label="translation/Z2 projector candidate matrix",
+            max_nnz=int(max_projector_nnz),
+            max_dense_entries=int(max_dense_projector_entries),
+            max_dense_mb=float(max_dense_projector_mb),
+        )
+        memory_diagnostics["q_candidates"] = _matrix_storage_diagnostics(q_candidates)
+        _check_projector_matrix_caps(
+            q_matrix,
+            label="translation/Z2 projector basis",
+            max_nnz=int(max_projector_nnz),
+            max_dense_entries=int(max_dense_projector_entries),
+            max_dense_mb=float(max_dense_projector_mb),
+        )
+        memory_diagnostics["q_matrix"] = _matrix_storage_diagnostics(q_matrix)
+    if str(orthonormalization_metadata.get("projector_strategy", "")) == "dense_small_safe":
+        projector_strategy = "dense_small_safe"
+    timing_seconds["build_orbits"] = float(time.perf_counter() - orbit_start)
+    base_reduced_dim = int(q_matrix.shape[1])
+    if show_progress:
+        print(
+            "[projector-ed] basis ready: "
+            f"Tz_dim={u1_dim}, reduced_dim={base_reduced_dim}, nnz={hamiltonian.nnz}, "
+            f"spin_pi_z={bool(use_spin_pi_z)}, translations={translation_directions}, "
+            f"momenta={momentum_blocks}, combined_c3={bool(use_combined_c3)}"
+        )
+
+    requested_count = max(1, int(eigenstate_count))
+    c3_sector_results: Dict[str, Dict[str, Any]] = {}
+    selected_c3_q: int | None = None
+    selected_q_matrix: sparse.spmatrix | np.ndarray = q_matrix
+    selected_orthonormalization = orthonormalization_metadata
+    selected_projector_metadata = projector_metadata
+
+    if bool(use_combined_c3):
+        assert c3_operator is not None
+        q_for_c3 = q_matrix if sparse.issparse(q_matrix) else sparse.csc_matrix(q_matrix)
+        try:
+            _check_projector_matrix_caps(
+                q_for_c3,
+                label="C3 base projector input",
+                max_nnz=int(max_projector_nnz),
+                max_dense_entries=int(max_dense_projector_entries),
+                max_dense_mb=float(max_dense_projector_mb),
+            )
+        except MemoryError as exc:
+            use_combined_c3 = _c3_memory_policy(str(exc))
+        if not bool(use_combined_c3):
+            q_for_c3 = sparse.csc_matrix((u1_dim, 0), dtype=np.complex128)
+        c3_base_build_start = time.perf_counter()
+        c3_base = (q_for_c3.getH() @ c3_operator @ q_for_c3).tocsc()
+        h_base_for_embedded = (q_for_c3.getH() @ hamiltonian @ q_for_c3).tocsr()
+        timing_seconds["build_C3_base"] = float(time.perf_counter() - c3_base_build_start)
+        memory_diagnostics["c3_base_operator"] = _matrix_storage_diagnostics(c3_base)
+        memory_diagnostics["c3_base_hamiltonian"] = _matrix_storage_diagnostics(h_base_for_embedded)
+        if int(c3_base.nnz) > int(max_projector_nnz):
+            use_combined_c3 = _c3_memory_policy(
+                f"[projector-ed] C3 operator in the projected base has nnz={int(c3_base.nnz):,}, "
+                f"exceeding MAX_PROJECTOR_NNZ={int(max_projector_nnz):,}."
+            )
+        if int(h_base_for_embedded.nnz) > int(max_projector_nnz):
+            use_combined_c3 = _c3_memory_policy(
+                f"[projector-ed] Embedded projected Hamiltonian for C3 has nnz={int(h_base_for_embedded.nnz):,}, "
+                f"exceeding MAX_PROJECTOR_NNZ={int(max_projector_nnz):,}."
+            )
+        base_dim = int(q_matrix.shape[1])
+        if bool(use_combined_c3):
+            c3_base_squared = (c3_base @ c3_base).tocsc()
+            if int(c3_base_squared.nnz) > int(max_projector_nnz):
+                use_combined_c3 = _c3_memory_policy(
+                    f"[projector-ed] C3 squared in the projected base has nnz={int(c3_base_squared.nnz):,}, "
+                    f"exceeding MAX_PROJECTOR_NNZ={int(max_projector_nnz):,}."
+                )
+        if not bool(use_combined_c3):
+            c3_q_values = []
+        identity_base = sparse.identity(base_dim, dtype=np.complex128, format="csc")
+        explicit_c3_dense_guard = _dense_allocation_diagnostics(
+            label="explicit C3 q-sector basis",
+            entries=int(base_dim) * int(base_dim),
+            dtype=np.complex128,
+            max_dense_entries=int(max_dense_projector_entries),
+            max_dense_mb=float(max_dense_projector_mb),
+        )
+        memory_diagnostics["explicit_c3_basis_estimate"] = {
+            **explicit_c3_dense_guard,
+            "base_dimension": int(base_dim),
+            "parent_dimension": int(u1_dim),
+            "max_explicit_c3_parent_dimension": int(max_explicit_c3_parent_dim),
+            "max_explicit_c3_dimension": int(max_explicit_c3_dim),
+        }
+        explicit_c3_basis = bool(
+            use_combined_c3
+            and u1_dim <= int(max_explicit_c3_parent_dim)
+            and base_dim <= int(max_explicit_c3_dim)
+            and bool(explicit_c3_dense_guard["allowed"])
+        )
+        if bool(use_combined_c3) and not explicit_c3_basis:
+            explicit_skip_reason = explicit_c3_dense_guard.get("reason")
+            if int(u1_dim) > int(max_explicit_c3_parent_dim):
+                explicit_skip_reason = (
+                    f"parent_dimension={int(u1_dim):,} exceeds "
+                    f"MAX_EXPLICIT_C3_PARENT_DIM={int(max_explicit_c3_parent_dim):,}"
+                )
+            elif int(base_dim) > int(max_explicit_c3_dim):
+                explicit_skip_reason = (
+                    f"base_dimension={int(base_dim):,} exceeds "
+                    f"MAX_EXPLICIT_C3_DIM={int(max_explicit_c3_dim):,}"
+                )
+            projector_warnings.append(
+                "Combined C3 sector was solved with an embedded projector in the existing "
+                f"{base_dim}-dimensional translation/Tz basis; explicit q-sector SVD basis was skipped"
+                + (f" because {explicit_skip_reason}." if explicit_skip_reason else ".")
+            )
+        omega = np.exp(2.0j * np.pi / 3.0)
+        best_energy: float | None = None
+        best_payload: Tuple[np.ndarray, np.ndarray, str, int, Dict[str, Any], sparse.spmatrix | np.ndarray, Dict[str, Any], Dict[str, Any], int] | None = None
+        for q_value in c3_q_values:
+            c3_sector_start = time.perf_counter()
+            c3_projector_base = (
+                identity_base
+                + (omega ** (-int(q_value))) * c3_base
+                + (omega ** (-2 * int(q_value))) * c3_base_squared
+            ) * (1.0 / 3.0)
+            c3_projector_base = c3_projector_base.tocsc()
+            if int(c3_projector_base.nnz) > int(max_projector_nnz):
+                use_combined_c3 = _c3_memory_policy(
+                    f"[projector-ed] C3 q={int(q_value)} projector has nnz={int(c3_projector_base.nnz):,}, "
+                    f"exceeding MAX_PROJECTOR_NNZ={int(max_projector_nnz):,}."
+                )
+                if not bool(use_combined_c3):
+                    break
+            sector_dimension_estimate = int(round(float(np.real(c3_projector_base.diagonal().sum()))))
+            if explicit_c3_basis:
+                sector_basis_in_base, sector_orthonormalization = _orthonormalize_projector_columns(
+                    c3_projector_base,
+                    tol=float(projector_tol),
+                    dense_svd_entry_cap=int(max_dense_projector_entries),
+                    dense_svd_mb_cap=float(max_dense_projector_mb),
+                    force_svd=False,
+                )
+                _check_projector_matrix_caps(
+                    sector_basis_in_base,
+                    label=f"C3 q={int(q_value)} explicit q-sector basis",
+                    max_nnz=int(max_projector_nnz),
+                    max_dense_entries=int(max_dense_projector_entries),
+                    max_dense_mb=float(max_dense_projector_mb),
+                )
+                full_projector_dense_guard = _dense_allocation_diagnostics(
+                    label=f"C3 q={int(q_value)} full projector basis",
+                    entries=int(q_matrix.shape[0]) * int(sector_basis_in_base.shape[1]),
+                    dtype=np.complex128,
+                    max_dense_entries=int(max_dense_projector_entries),
+                    max_dense_mb=float(max_dense_projector_mb),
+                )
+                memory_diagnostics.setdefault("c3_full_projector_estimates", {})[str(int(q_value))] = full_projector_dense_guard
+                if not bool(full_projector_dense_guard["allowed"]):
+                    use_combined_c3 = _c3_memory_policy(str(full_projector_dense_guard.get("reason")))
+                    if not bool(use_combined_c3):
+                        break
+                sector_q_matrix = q_matrix @ sector_basis_in_base
+                try:
+                    _check_projector_matrix_caps(
+                        sector_q_matrix,
+                        label=f"C3 q={int(q_value)} full projector basis",
+                        max_nnz=int(max_projector_nnz),
+                        max_dense_entries=int(max_dense_projector_entries),
+                        max_dense_mb=float(max_dense_projector_mb),
+                    )
+                except MemoryError as exc:
+                    use_combined_c3 = _c3_memory_policy(str(exc))
+                    if not bool(use_combined_c3):
+                        break
+                (
+                    sector_values,
+                    sector_vectors,
+                    sector_solver_mode,
+                    sector_padding,
+                    sector_eigsh_info,
+                    sector_timing,
+                    sector_memory,
+                ) = _solve_projected_hamiltonian(
+                    hamiltonian,
+                    sector_q_matrix,
+                    requested_count=requested_count,
+                    check_ground_state_degeneracy=bool(check_ground_state_degeneracy),
+                    sparse_tol=sparse_tol,
+                    sparse_maxiter=sparse_maxiter,
+                    show_progress=show_progress,
+                    label=f"projector-ed-c3-q{int(q_value)}",
+                    max_dense_entries=int(max_dense_projector_entries),
+                    max_dense_mb=float(max_dense_projector_mb),
+                    strict_projector_memory=bool(strict_projector_memory),
+                )
+                sector_solver_basis = "explicit_c3_q_basis"
+            else:
+                c3_projector_csr = c3_projector_base.tocsr()
+                sector_project_start = time.perf_counter()
+                with profile_stage("C3 operator/projector construction"):
+                    h_sector = (c3_projector_csr.getH() @ h_base_for_embedded @ c3_projector_csr).tocsr()
+                    h_sector = ((h_sector + h_sector.getH()) * 0.5).tocsr()
+                sector_timing = {"project_or_build_Hred": float(time.perf_counter() - sector_project_start)}
+                sector_memory = {
+                    "c3_projector": _matrix_storage_diagnostics(c3_projector_csr),
+                    "h_sector": _matrix_storage_diagnostics(h_sector),
+                }
+                if int(h_sector.nnz) > int(max_projector_nnz):
+                    use_combined_c3 = _c3_memory_policy(
+                        f"[projector-ed] C3 q={int(q_value)} embedded Hamiltonian has nnz={int(h_sector.nnz):,}, "
+                        f"exceeding MAX_PROJECTOR_NNZ={int(max_projector_nnz):,}."
+                    )
+                    if not bool(use_combined_c3):
+                        break
+                if base_dim == 1:
+                    sector_values = np.asarray([complex(h_sector[0, 0]) if sparse.issparse(h_sector) else complex(h_sector[0, 0])])
+                    sector_vectors = np.ones((1, 1), dtype=np.complex128)
+                    sector_solver_mode = "spin_orbital_tz_c3_embedded_dense_dim1"
+                    sector_padding = 0
+                    sector_eigsh_info = {}
+                    sector_timing["diagonalize"] = 0.0
+                else:
+                    sector_solve_count, sector_padding = _padded_eigsh_count(
+                        requested_count,
+                        base_dim,
+                        check_ground_state_degeneracy=bool(check_ground_state_degeneracy),
+                    )
+                    if sector_solve_count >= base_dim - 1:
+                        dense_entries = int(base_dim) * int(base_dim)
+                        dense_guard = _dense_allocation_diagnostics(
+                            label=f"projector-ed-c3-q{int(q_value)} embedded dense Hamiltonian diagonalization",
+                            entries=dense_entries,
+                            dtype=np.complex128,
+                            max_dense_entries=int(max_dense_projector_entries),
+                            max_dense_mb=float(max_dense_projector_mb),
+                        )
+                        sector_memory["dense_diagonalization"] = dense_guard
+                        if bool(dense_guard["allowed"]):
+                            diag_start = time.perf_counter()
+                            with profile_stage("diagonalization"):
+                                dense_h_sector = h_sector.toarray()
+                                sector_values, sector_vectors = np.linalg.eigh(dense_h_sector)
+                            sector_timing["diagonalize"] = float(time.perf_counter() - diag_start)
+                            sector_solver_mode = "spin_orbital_tz_c3_embedded_dense"
+                            sector_eigsh_info = {}
+                        else:
+                            sector_memory["dense_diagonalization_skipped_reason"] = dense_guard.get("reason")
+                            if bool(strict_projector_memory):
+                                _raise_dense_memory_error(dense_guard)
+                            sector_solve_count = max(1, min(requested_count, base_dim - 2))
+                            diag_start = time.perf_counter()
+                            with profile_stage("diagonalization"):
+                                sector_values, sector_vectors, sector_eigsh_info = _run_lowest_eigsh(
+                                    h_sector,
+                                    eigenstate_count=sector_solve_count,
+                                    sparse_tol=sparse_tol,
+                                    sparse_maxiter=sparse_maxiter,
+                                    show_progress=show_progress,
+                                    label=f"projector-ed-c3-q{int(q_value)}",
+                                )
+                            sector_timing["diagonalize"] = float(time.perf_counter() - diag_start)
+                            sector_solver_mode = "spin_orbital_tz_c3_embedded_sparse"
+                    else:
+                        sparse_h_sector = h_sector
+                        diag_start = time.perf_counter()
+                        with profile_stage("diagonalization"):
+                            sector_values, sector_vectors, sector_eigsh_info = _run_lowest_eigsh(
+                                sparse_h_sector,
+                                eigenstate_count=sector_solve_count,
+                                sparse_tol=sparse_tol,
+                                sparse_maxiter=sparse_maxiter,
+                                show_progress=show_progress,
+                                label=f"projector-ed-c3-q{int(q_value)}",
+                            )
+                        sector_timing["diagonalize"] = float(time.perf_counter() - diag_start)
+                        sector_solver_mode = "spin_orbital_tz_c3_embedded_sparse"
+                sector_vectors = np.asarray(c3_projector_csr @ sector_vectors, dtype=np.complex128)
+                for column in range(int(sector_vectors.shape[1])):
+                    norm = float(np.linalg.norm(sector_vectors[:, column]))
+                    if norm > 0.0:
+                        sector_vectors[:, column] /= norm
+                sector_q_matrix = q_matrix
+                sector_orthonormalization = {
+                    "orthonormalization": "embedded_c3_projector",
+                    "explicit_c3_basis": False,
+                    "projector_rank_estimate": int(sector_dimension_estimate),
+                }
+                sector_solver_basis = "embedded_c3_projector_in_base"
+            sector_order = np.argsort(np.real(sector_values))
+            sector_values = np.asarray(np.real(sector_values[sector_order]), dtype=float)
+            sector_vectors = np.asarray(sector_vectors[:, sector_order], dtype=np.complex128)
+            sector_energy = float(sector_values[0])
+            sector_metadata = {
+                "q": int(q_value),
+                "energy": sector_energy,
+                "energies": [float(value) for value in sector_values],
+                "reduced_dimension": int(sector_dimension_estimate),
+                "solver_dimension": int(sector_q_matrix.shape[1]),
+                "solver_mode": sector_solver_mode,
+                "solver_basis": sector_solver_basis,
+                "orthonormalization": sector_orthonormalization,
+                "timing_seconds": {
+                    **sector_timing,
+                    "total_c3_sector": float(time.perf_counter() - c3_sector_start),
+                },
+                "memory_diagnostics": sector_memory,
+                "eigsh": sector_eigsh_info if "sparse" in sector_solver_mode else None,
+            }
+            c3_sector_results[str(int(q_value))] = sector_metadata
+            if best_energy is None or sector_energy < best_energy:
+                best_energy = sector_energy
+                best_payload = (
+                    sector_values,
+                    sector_vectors,
+                    sector_solver_mode,
+                    sector_padding,
+                    sector_eigsh_info,
+                    sector_q_matrix,
+                    sector_orthonormalization,
+                    {
+                        **projector_metadata,
+                        "combined_c3_q": int(q_value),
+                        "combined_c3_sector_dimension": int(sector_dimension_estimate),
+                        "combined_c3_solver_basis": sector_solver_basis,
+                    },
+                    int(q_value),
+                )
+        if best_payload is None:
+            if bool(c3_dropped_by_memory):
+                use_combined_c3 = False
+            else:
+                raise ValueError("Combined C3 projectors produced no non-empty q sectors.")
+        if best_payload is not None:
+            (
+                eigenvalues,
+                reduced_eigenvectors,
+                solver_mode,
+                degeneracy_padding,
+                eigsh_info,
+                selected_q_matrix,
+                selected_orthonormalization,
+                selected_projector_metadata,
+                selected_c3_q,
+            ) = best_payload
+            selected_sector_timing = c3_sector_results.get(str(int(selected_c3_q)), {}).get("timing_seconds", {})
+            if isinstance(selected_sector_timing, dict):
+                if "project_or_build_Hred" in selected_sector_timing:
+                    timing_seconds["project_or_build_Hred"] = float(selected_sector_timing["project_or_build_Hred"])
+                if "diagonalize" in selected_sector_timing:
+                    timing_seconds["diagonalize"] = float(selected_sector_timing["diagonalize"])
+                if "total_c3_sector" in selected_sector_timing:
+                    timing_seconds["selected_C3_sector_total"] = float(selected_sector_timing["total_c3_sector"])
+
+    if not bool(use_combined_c3):
+        (
+            eigenvalues,
+            reduced_eigenvectors,
+            solver_mode,
+            degeneracy_padding,
+            eigsh_info,
+            projected_timing,
+            projected_memory,
+        ) = _solve_projected_hamiltonian(
+            hamiltonian,
+            q_matrix,
+            requested_count=requested_count,
+            check_ground_state_degeneracy=bool(check_ground_state_degeneracy),
+            sparse_tol=sparse_tol,
+            sparse_maxiter=sparse_maxiter,
+            show_progress=show_progress,
+            label="projector-ed",
+            max_dense_entries=int(max_dense_projector_entries),
+            max_dense_mb=float(max_dense_projector_mb),
+            strict_projector_memory=bool(strict_projector_memory),
+        )
+        timing_seconds.update(projected_timing)
+        memory_diagnostics["projected_solve"] = projected_memory
+        order = np.argsort(np.real(eigenvalues))
+        eigenvalues = np.asarray(np.real(eigenvalues[order]), dtype=float)
+        reduced_eigenvectors = np.asarray(reduced_eigenvectors[:, order], dtype=np.complex128)
+
+    solver_dim = int(selected_q_matrix.shape[1])
+    reduced_dim = int(selected_projector_metadata.get("combined_c3_sector_dimension", solver_dim))
+    if sparse.issparse(selected_q_matrix):
+        expanded_eigenvectors = np.asarray(selected_q_matrix @ reduced_eigenvectors, dtype=np.complex128)
+    else:
+        expanded_eigenvectors = np.asarray(selected_q_matrix @ reduced_eigenvectors, dtype=np.complex128)
+    _end_stage("spin-orbital projector ED", stage_start, show_progress)
+    timing_seconds["total_standard_projector_ed"] = float(time.perf_counter() - projector_total_start)
+    if (
+        bool(use_combined_c3)
+        and not bool(strict_projector_memory)
+        and phase_scan_c3_seconds_per_point is not None
+        and float(phase_scan_c3_seconds_per_point) > 0.0
+        and float(timing_seconds.get("selected_C3_sector_total", timing_seconds.get("build_C3", 0.0)))
+        > float(phase_scan_c3_seconds_per_point)
+    ):
+        projector_warnings.append(
+            "[projector-ed] Combined C3 work took "
+            f"{float(timing_seconds.get('selected_C3_sector_total', timing_seconds.get('build_C3', 0.0))):.3f}s, "
+            f"above MAX_PHASE_SCAN_C3_SECONDS_PER_POINT={float(phase_scan_c3_seconds_per_point):.3f}s."
+        )
+    if bool(c3_dropped_by_memory):
+        projector_strategy = "dropped_by_memory_cap"
+    elif "dense" in str(solver_mode) or str(selected_orthonormalization.get("projector_strategy", "")) == "dense_small_safe":
+        projector_strategy = "dense_small_safe"
+    else:
+        projector_strategy = "sparse"
+    memory_estimate_mb = _max_recorded_memory_estimate_mb(memory_diagnostics)
+
+    low_energy_resolution = resolve_low_energy_spectrum(
+        eigenvalues,
+        check_ground_state_degeneracy=bool(check_ground_state_degeneracy),
+        hilbert_dim=reduced_dim,
+        degeneracy_tolerance_abs=float(ground_manifold_abs_tol),
+        degeneracy_tolerance_rel=float(ground_manifold_rel_tol),
+    )
+    spectrum: Dict[str, Any] = {
+        "solver_mode": solver_mode,
+        "solver_requested": "spin_orbital_tz_projector",
+        "basis_type": "bitwise_spin_orbital_tz_projector_block",
+        "use_sz_block": False,
+        "target_sz2": None,
+        "use_tau_z_block": True,
+        "target_tz2": int(target_tz2),
+        "use_z2_block": bool(use_spin_pi_z),
+        "z2_kind": "spin_pi_z" if bool(use_spin_pi_z) else None,
+        "z2_parity": int(z2_target_parity) if bool(use_spin_pi_z) else None,
+        "translation_directions": list(translation_directions),
+        "use_translation_x_block": bool(use_translation_x),
+        "use_translation_y_block": bool(use_translation_y),
+        "momentum_blocks": dict(momentum_blocks),
+        "momentum_x_block": int(momentum_blocks.get("x", 0)) if bool(use_translation_x) else None,
+        "momentum_y_block": int(momentum_blocks.get("y", 0)) if bool(use_translation_y) else None,
+        "use_c3_block": bool(use_combined_c3),
+        "c3_q_blocks_requested": str(c3_q_blocks),
+        "selected_c3_q": selected_c3_q,
+        "c3_sector_energies": c3_sector_results,
+        "combined_c3": c3_metadata,
+        "u1_basis_dimension": int(u1_dim),
+        "projector_reduced_dimension": int(reduced_dim),
+        "reduced_dimension": int(reduced_dim),
+        "projector_solver_dimension": int(solver_dim),
+        "hilbert_dim": int(reduced_dim),
+        "full_spin_orbital_hilbert_dim": int(4 ** n_sites),
+        "number_of_sites": n_sites,
+        "vectors_are_expanded_to_u1_basis": True,
+        "symmetry_validation": symmetry_validation_report,
+        "projector_metadata": selected_projector_metadata,
+        "projector_strategy": str(projector_strategy),
+        "memory_estimate_MB": memory_estimate_mb,
+        "dropped_symmetries": list(runtime_dropped_symmetries),
+        "drop_reasons": dict(runtime_drop_reasons),
+        "orthonormalization": selected_orthonormalization,
+        "commutator_norms": commutator_norms,
+        "timing_seconds": timing_seconds,
+        "memory_diagnostics": memory_diagnostics,
+        "strict_projector_memory": bool(strict_projector_memory),
+        "allow_drop_c3_on_memory": bool(allow_drop_c3_on_memory),
+        "c3_dropped_by_memory_guard": bool(c3_dropped_by_memory),
+        "warnings": projector_warnings,
+        "eigenstates_requested": requested_count,
+        "eigenstates_returned": int(eigenvalues.size),
+        "eigenstates_degeneracy_padding": int(degeneracy_padding),
+        "energies": [float(value) for value in eigenvalues],
+        "ground_state_energy": float(low_energy_resolution["ground_state_energy"]),
+        "sparse_tol": float(eigsh_info.get("eigsh_tol_effective", sparse_tol)),
+        "sparse_tol_requested": float(sparse_tol),
+        "sparse_maxiter": eigsh_info.get("eigsh_maxiter"),
+        "eigsh": eigsh_info if "sparse" in solver_mode else None,
+        **low_energy_resolution,
+    }
+    return spectrum, expanded_eigenvectors, basis_list, basis_map
+
+
 def build_sparse_hamiltonian_sz_conserved(
     N: int,
     geometry: GeometryData,
@@ -1511,26 +3673,10 @@ def build_sparse_hamiltonian_sz_conserved(
 ) -> sparse.csr_matrix:
     """Build the sparse Hamiltonian in the strict total-Sz=0 basis.
 
-    The implemented spin/orbital form is recorded in ``BITWISE_ED_FORMULA``.
-    It uses spin-isotropic ``S_i.S_j`` terms, so total spin Sz is conserved,
-    and bond-dependent orbital ``T_i^gamma T_j^gamma`` terms, so orbital Tz is
-    not conserved.
-
-    Bitwise off-diagonal template for S_i^+ S_j^- T_i^z T_j^z:
-
-        mask_i = 1 << i
-        mask_j = 1 << j
-        if (S & mask_i) == 0 and (S & mask_j) != 0:
-            new_S = S ^ (mask_i | mask_j)
-            new_O = O
-            tau_z_i = 0.5 if (O & mask_i) else -0.5
-            tau_z_j = 0.5 if (O & mask_j) else -0.5
-            row = basis_map.get((new_S, new_O))
-            if row is not None:
-                H[row, col] += coeff * tau_z_i * tau_z_j
-
-    No dense ``4**N`` Hamiltonian is allocated by this function.
+    The current yao_lee Hamiltonian is the Eq. 7 form and is not compatible
+    with a strict total-Sz block, so the driver disables this path.
     """
+    raise ValueError(BITWISE_ED_FORMULA)
     n_sites = int(N)
     if n_sites != int(geometry.number_of_sites):
         raise ValueError(
@@ -1647,49 +3793,52 @@ def run_sz_conserved_exact_spectrum(
     """Diagonalize the bitwise fixed-total-Sz sparse Hamiltonian with ARPACK eigsh."""
     n_sites = int(geometry.number_of_sites)
     stage_start = _start_stage("Sz-conserved ED", show_progress)
-    basis_list, basis_map = build_sz_conserved_basis(n_sites, target_sz2=target_sz2)
-    hamiltonian = build_sparse_hamiltonian_sz_conserved(
-        n_sites,
-        geometry,
-        alpha,
-        beta,
-        basis_list,
-        basis_map,
-        coupling_j=coupling_j,
-        external_field_terms=external_field_terms,
-        show_progress=show_progress,
-    )
+    with profile_stage("ED basis construction"):
+        basis_list, basis_map = build_sz_conserved_basis(n_sites, target_sz2=target_sz2)
+    with profile_stage("ED Hamiltonian construction"):
+        hamiltonian = build_sparse_hamiltonian_sz_conserved(
+            n_sites,
+            geometry,
+            alpha,
+            beta,
+            basis_list,
+            basis_map,
+            coupling_j=coupling_j,
+            external_field_terms=external_field_terms,
+            show_progress=show_progress,
+        )
     dim = int(hamiltonian.shape[0])
     if dim <= 0:
         raise ValueError("Empty Sz-conserved ED basis.")
     requested_count = max(1, int(eigenstate_count))
-    if dim == 1:
-        eigenvalues = np.asarray([complex(hamiltonian[0, 0])], dtype=np.complex128)
-        eigenvectors = np.ones((1, 1), dtype=np.complex128)
-        solver_mode = "reduced_dense_dim1"
-        solve_count = 1
-        degeneracy_padding = 0
-        eigsh_info: Dict[str, Any] = {}
-    else:
-        solve_count, degeneracy_padding = _padded_eigsh_count(
-            requested_count,
-            dim,
-            check_ground_state_degeneracy=bool(check_ground_state_degeneracy),
-        )
-        if show_progress:
-            print(
-                "[sz-ed] basis ready: "
-                f"dim={dim}, nnz={hamiltonian.nnz}, k={solve_count}"
+    with profile_stage("diagonalization"):
+        if dim == 1:
+            eigenvalues = np.asarray([complex(hamiltonian[0, 0])], dtype=np.complex128)
+            eigenvectors = np.ones((1, 1), dtype=np.complex128)
+            solver_mode = "reduced_dense_dim1"
+            solve_count = 1
+            degeneracy_padding = 0
+            eigsh_info: Dict[str, Any] = {}
+        else:
+            solve_count, degeneracy_padding = _padded_eigsh_count(
+                requested_count,
+                dim,
+                check_ground_state_degeneracy=bool(check_ground_state_degeneracy),
             )
-        eigenvalues, eigenvectors, eigsh_info = _run_lowest_eigsh(
-            hamiltonian,
-            eigenstate_count=solve_count,
-            sparse_tol=sparse_tol,
-            sparse_maxiter=sparse_maxiter,
-            show_progress=show_progress,
-            label="sz-ed",
-        )
-        solver_mode = "sz_conserved_sparse"
+            if show_progress:
+                print(
+                    "[sz-ed] basis ready: "
+                    f"dim={dim}, nnz={hamiltonian.nnz}, k={solve_count}"
+                )
+            eigenvalues, eigenvectors, eigsh_info = _run_lowest_eigsh(
+                hamiltonian,
+                eigenstate_count=solve_count,
+                sparse_tol=sparse_tol,
+                sparse_maxiter=sparse_maxiter,
+                show_progress=show_progress,
+                label="sz-ed",
+            )
+            solver_mode = "sz_conserved_sparse"
 
     order = np.argsort(np.real(eigenvalues))
     eigenvalues = np.asarray(np.real(eigenvalues[order]), dtype=float)
@@ -1910,6 +4059,23 @@ def compute_all_plaquette_fluxes_sz_conserved(
     return {int(index): float(value) for index, value in flux_map.items()}
 
 
+def plaquette_flux_from_spin_orbital_u1_ed_state(
+    geometry: GeometryData,
+    state: np.ndarray,
+    basis_list: List[Tuple[int, int]],
+    basis_map: Dict[Tuple[int, int], int],
+    plaquette_center_idx: int | None = None,
+) -> Dict[str, Any]:
+    """Plaquette flux in the generic spin/orbital U(1) bit basis."""
+    return plaquette_flux_from_sz_conserved_ed_state(
+        geometry,
+        state,
+        basis_list,
+        basis_map,
+        plaquette_center_idx=plaquette_center_idx,
+    )
+
+
 def collect_correlation_matrices_from_sz_conserved_ed(
     geometry: GeometryData,
     state: np.ndarray,
@@ -1980,6 +4146,23 @@ def collect_correlation_matrices_from_sz_conserved_ed(
     return correlations
 
 
+def collect_correlation_matrices_from_spin_orbital_u1_ed(
+    geometry: GeometryData,
+    state: np.ndarray,
+    basis_list: List[Tuple[int, int]],
+    basis_map: Dict[Tuple[int, int], int],
+    show_progress: bool = True,
+) -> Dict[str, np.ndarray]:
+    """Collect correlations in the generic spin/orbital U(1) bit basis."""
+    return collect_correlation_matrices_from_sz_conserved_ed(
+        geometry,
+        state,
+        basis_list,
+        basis_map,
+        show_progress=show_progress,
+    )
+
+
 def build_sz_conserved_scalar_correlations(correlations: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     """Build scalar S, T, and mixed ST correlations from reduced-basis data."""
     scalar = {
@@ -1994,6 +4177,11 @@ def build_sz_conserved_scalar_correlations(correlations: Dict[str, np.ndarray]) 
         for spin_axis in ("x", "y", "z"):
             scalar["ST"] = scalar["ST"] + correlations[f"S{spin_axis}T{orbital_axis}_S{spin_axis}T{orbital_axis}"]
     return scalar
+
+
+def build_spin_orbital_u1_scalar_correlations(correlations: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """Build scalar correlations from generic spin/orbital U(1) ED data."""
+    return build_sz_conserved_scalar_correlations(correlations)
 
 
 def all_bond_energies_sz_conserved(
@@ -2014,43 +4202,70 @@ def all_bond_energies_sz_conserved(
         unit="bond",
         leave=False,
     )
-    spin_coeff = float(coupling_j) * (1.0 + float(beta))
-    orbital_coeff = float(coupling_j) * (1.0 - float(beta))
-    mixed_coeff = float(coupling_j) * float(alpha)
     for bond in geometry.bond_list:
         i = int(bond.i)
         j = int(bond.j)
         gamma = str(bond.gamma).lower()
         spin_dot = sum(complex(correlations[f"S{axis}_S{axis}"][i, j]) for axis in ("x", "y", "z"))
-        orbital_gamma = complex(correlations[f"T{gamma}_T{gamma}"][i, j])
-        mixed_gamma = sum(
-            complex(correlations[f"S{spin_axis}T{gamma}_S{spin_axis}T{gamma}"][i, j])
+        spin_gamma = complex(correlations[f"S{gamma}_S{gamma}"][i, j])
+        orbital_dot = sum(complex(correlations[f"T{axis}_T{axis}"][i, j]) for axis in ("x", "y", "z"))
+        mixed_dot_dot = sum(
+            complex(correlations[f"S{spin_axis}T{orbital_axis}_S{spin_axis}T{orbital_axis}"][i, j])
             for spin_axis in ("x", "y", "z")
+            for orbital_axis in ("x", "y", "z")
+        )
+        mixed_gamma_dot = sum(
+            complex(correlations[f"S{gamma}T{orbital_axis}_S{gamma}T{orbital_axis}"][i, j])
+            for orbital_axis in ("x", "y", "z")
         )
         components = [
+            {
+                "channel": "ST",
+                "operator": "SdotTdot",
+                "axis": "dot",
+                "coefficient": -float(coupling_j) * float(alpha),
+                "correlation": float(np.real(mixed_dot_dot)),
+                "energy": float(np.real(-float(coupling_j) * float(alpha) * mixed_dot_dot)),
+            },
             {
                 "channel": "S",
                 "operator": "Sdot",
                 "axis": "dot",
-                "coefficient": float(spin_coeff),
+                "coefficient": float(coupling_j) * float(alpha) * float(beta),
                 "correlation": float(np.real(spin_dot)),
-                "energy": float(np.real(spin_coeff * spin_dot)),
-            },
-            {
-                "channel": "T",
-                "operator": f"T{gamma}",
-                "axis": gamma,
-                "coefficient": float(orbital_coeff),
-                "correlation": float(np.real(orbital_gamma)),
-                "energy": float(np.real(orbital_coeff * orbital_gamma)),
+                "energy": float(np.real(float(coupling_j) * float(alpha) * float(beta) * spin_dot)),
             },
             {
                 "channel": "ST",
-                "operator": f"SdotT{gamma}",
+                "operator": f"S{gamma}Tdot",
                 "axis": gamma,
-                "coefficient": float(mixed_coeff),
-                "correlation": float(np.real(mixed_gamma)),
-                "energy": float(np.real(mixed_coeff * mixed_gamma)),
+                "coefficient": 2.0 * float(coupling_j),
+                "correlation": float(np.real(mixed_gamma_dot)),
+                "energy": float(np.real(2.0 * float(coupling_j) * mixed_gamma_dot)),
+            },
+            {
+                "channel": "S",
+                "operator": f"S{gamma}",
+                "axis": gamma,
+                "coefficient": -2.0 * float(coupling_j) * float(beta),
+                "correlation": float(np.real(spin_gamma)),
+                "energy": float(np.real(-2.0 * float(coupling_j) * float(beta) * spin_gamma)),
+            },
+            {
+                "channel": "T",
+                "operator": "Tdot",
+                "axis": "dot",
+                "coefficient": float(coupling_j) * float(beta),
+                "correlation": float(np.real(orbital_dot)),
+                "energy": float(np.real(float(coupling_j) * float(beta) * orbital_dot)),
+            },
+            {
+                "channel": "constant",
+                "operator": "Id",
+                "axis": "identity",
+                "coefficient": -float(coupling_j) * float(beta) * float(beta),
+                "correlation": 1.0,
+                "energy": -float(coupling_j) * float(beta) * float(beta),
             },
         ]
         channel_energies = {

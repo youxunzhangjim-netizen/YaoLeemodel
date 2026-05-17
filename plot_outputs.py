@@ -12,11 +12,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import tempfile
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
-from matplotlib.collections import PatchCollection
-from matplotlib.patches import Polygon
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "matplotlib-cache"))
 
 from analysis import ENTROPY_ORDERS
 from models import (
@@ -25,25 +27,38 @@ from models import (
     build_lattice_geometry,
     honeycomb_plaquette_flux_operators,
     lattice_display_name,
-    model_terms_for_bond,
+    phase_scan_method_display_name,
+    two_site_operator_terms_for_bond,
 )
 
 
-METHOD_ORDER = ("DMRG", "ED", "iDMRG-x")
+METHOD_ORDER = ("DMRG", "PEPS", "ED", "iDMRG-x", "iPEPS", "quimb_peps", "quimb_ipeps")
 METHOD_COLORS = {
     "DMRG": "#1f77b4",
+    "PEPS": "#008b8b",
     "ED": "#ff7f0e",
     "iDMRG-x": "#2ca02c",
+    "iPEPS": "#7b3294",
+    "quimb_peps": "#008b8b",
+    "quimb_ipeps": "#7b3294",
 }
 METHOD_MARKERS = {
     "DMRG": "o",
+    "PEPS": "D",
     "ED": "s",
     "iDMRG-x": "^",
+    "iPEPS": "*",
+    "quimb_peps": "D",
+    "quimb_ipeps": "*",
 }
 METHOD_LINESTYLES = {
     "DMRG": "-",
+    "PEPS": "-",
     "ED": "--",
     "iDMRG-x": ":",
+    "iPEPS": "-.",
+    "quimb_peps": "-",
+    "quimb_ipeps": "-.",
 }
 CHANNEL_ORDER = ("S", "T", "ST")
 CHANNEL_COLORS = {
@@ -64,7 +79,14 @@ CHANNEL_LABELS = {
     "ST": "mixed ST",
     "total": "total",
 }
+PLOTTED_BOND_CHANNELS = ("S", "T", "ST", "total")
+BOND_ENERGY_CMAP = "viridis"
 GAMMA_COLORS = {"x": "#1f77b4", "y": "#2ca02c", "z": "#d62728"}
+BACKGROUND_BOND_ZORDER = 1
+RESOLVED_BOND_ZORDER = 3
+SITE_MARKER_ZORDER = 20
+SPIN_VECTOR_HALO_ZORDER = 49
+SPIN_VECTOR_ZORDER = 50
 
 
 def titled_for_run(base_title: str, title_label: str | None = None) -> str:
@@ -77,8 +99,95 @@ def _ordered_available_methods(data: Dict[str, Any]) -> List[str]:
     return [method for method in METHOD_ORDER if method in data]
 
 
+def _lattice_size_scale(n_sites: int, *, min_scale: float = 0.68, max_scale: float = 1.32) -> float:
+    """Return a gentle visual scale that shrinks as lattice size grows."""
+    site_count = max(int(n_sites), 1)
+    raw_scale = (12.0 / float(site_count)) ** 0.25
+    return float(np.clip(raw_scale, min_scale, max_scale))
+
+
+def _scaled_value(
+    n_sites: int,
+    base: float,
+    *,
+    min_value: float,
+    max_value: float,
+    exponent: float = 0.25,
+) -> float:
+    site_count = max(int(n_sites), 1)
+    raw_scale = (12.0 / float(site_count)) ** float(exponent)
+    return float(np.clip(float(base) * raw_scale, float(min_value), float(max_value)))
+
+
+def _field_direction_text(field_vector: Any) -> str | None:
+    if field_vector is None:
+        return None
+    try:
+        vector = np.asarray(field_vector, dtype=float).reshape(3)
+    except Exception:
+        return None
+    magnitude = float(np.linalg.norm(vector))
+    if not np.isfinite(magnitude) or magnitude <= 1e-14:
+        return None
+    direction = vector / magnitude
+    return "H/|H|=(" + ", ".join(f"{value:.3g}" for value in direction) + ")"
+
+
+def _annotate_field_direction(axis: Any, field_vector: Any, *, fontsize: float) -> None:
+    label = _field_direction_text(field_vector)
+    if label is None:
+        return
+    axis.text(
+        0.02,
+        0.98,
+        label,
+        transform=axis.transAxes,
+        ha="left",
+        va="top",
+        fontsize=fontsize,
+        color="#222222",
+        bbox={
+            "boxstyle": "round,pad=0.25",
+            "facecolor": "white",
+            "edgecolor": "#777777",
+            "alpha": 0.86,
+            "linewidth": 0.6,
+        },
+        zorder=60,
+    )
+
+
+def _phase_row_method_key(row: Dict[str, Any]) -> str:
+    method = row.get("method", row.get("backend", row.get("solver", "")))
+    method_text = str(method).strip()
+    if method_text == "tenpy" and "idmrg" in str(row.get("scan_type", row.get("engine", ""))).lower():
+        return "tenpy_idmrg"
+    if method_text == "quimb_peps":
+        return "quimb_peps"
+    if method_text == "quimb_ipeps":
+        return "quimb_ipeps"
+    return method_text
+
+
 def ensure_folder_exists(folder_path: str) -> None:
     os.makedirs(folder_path, exist_ok=True)
+
+
+def _resolve_target_folder(output_folder: str | None, default_folder: str) -> str:
+    if output_folder is None:
+        return os.path.abspath(default_folder)
+    expanded_folder = os.path.expanduser(str(output_folder))
+    if os.path.isabs(expanded_folder):
+        candidate = os.path.abspath(expanded_folder)
+    else:
+        candidate = os.path.abspath(expanded_folder)
+    script_name = os.path.basename(SCRIPT_DIR)
+    duplicate_root = os.path.abspath(os.path.join(SCRIPT_DIR, script_name))
+    if candidate == duplicate_root or candidate.startswith(duplicate_root + os.sep):
+        candidate = os.path.abspath(
+            os.path.join(os.path.dirname(SCRIPT_DIR), os.path.relpath(candidate, SCRIPT_DIR))
+        )
+    return candidate
 
 
 def _geometry_positions(geometry: Any) -> np.ndarray:
@@ -150,7 +259,7 @@ def _channels_for_geometry_bond(
     if model_spec is None:
         return []
     channels: List[str] = []
-    for coeff, op_name in model_terms_for_bond(
+    for coeff, op_i, op_j in two_site_operator_terms_for_bond(
         gamma,
         model_spec,
         alpha,
@@ -160,9 +269,10 @@ def _channels_for_geometry_bond(
         jy=jy,
         jz=jz,
     ):
-        if abs(float(coeff)) <= 1e-14:
+        if abs(complex(coeff)) <= 1e-14:
             continue
-        channels.append(_operator_channel(str(op_name)))
+        channels.append(_operator_channel(str(op_i)))
+        channels.append(_operator_channel(str(op_j)))
     return _ordered_channels(channels)
 
 
@@ -185,6 +295,15 @@ def _bond_row_channel_values(row: Dict[str, Any]) -> Dict[str, float]:
     return values
 
 
+def _plottable_bond_channel_values(row: Dict[str, Any]) -> Dict[str, float]:
+    values = _bond_row_channel_values(row)
+    return {
+        channel: value
+        for channel, value in values.items()
+        if channel in PLOTTED_BOND_CHANNELS and np.isfinite(float(value))
+    }
+
+
 def save_geometry_diagram(
     geometry: GeometryData,
     filepath: str,
@@ -197,6 +316,7 @@ def save_geometry_diagram(
     jx: float = 1.0,
     jy: float = 1.0,
     jz: float = 1.0,
+    external_field_vector: Tuple[float, float, float] | None = None,
 ) -> None:
     import matplotlib
     matplotlib.use("Agg")
@@ -204,6 +324,14 @@ def save_geometry_diagram(
     from matplotlib.lines import Line2D
 
     positions = _geometry_positions(geometry)
+    n_sites = int(getattr(geometry, "number_of_sites", positions.shape[0]))
+    bond_width = _scaled_value(n_sites, 1.5, min_value=0.75, max_value=2.25)
+    guide_bond_width = _scaled_value(n_sites, 0.8, min_value=0.35, max_value=1.2)
+    site_size = _scaled_value(n_sites, 20.0, min_value=9.0, max_value=34.0, exponent=0.34)
+    gamma_fontsize = _scaled_value(n_sites, 7.0, min_value=4.8, max_value=8.6, exponent=0.18)
+    label_fontsize = _scaled_value(n_sites, 10.0, min_value=7.5, max_value=11.5, exponent=0.14)
+    title_fontsize = _scaled_value(n_sites, 12.0, min_value=9.0, max_value=13.0, exponent=0.12)
+    legend_fontsize = _scaled_value(n_sites, 8.0, min_value=6.2, max_value=9.4, exponent=0.14)
     offset_spacing = 0.025 * _position_span(positions)
     fig, ax = plt.subplots(figsize=(8, 6), dpi=150)
     for bond in geometry.bond_list:
@@ -216,11 +344,11 @@ def save_geometry_diagram(
                 [p_i[0], p_j[0]],
                 [p_i[1], p_j[1]],
                 color=GAMMA_COLORS.get(gamma, "#666666"),
-                linewidth=1.5,
+                linewidth=bond_width,
                 alpha=0.9,
             )
             continue
-        ax.plot([p_i[0], p_j[0]], [p_i[1], p_j[1]], color="#bbbbbb", linewidth=0.8, alpha=0.5)
+        ax.plot([p_i[0], p_j[0]], [p_i[1], p_j[1]], color="#bbbbbb", linewidth=guide_bond_width, alpha=0.5)
         for channel, offset in zip(channels, _centered_offsets(len(channels), offset_spacing)):
             segment = _offset_segment(p_i, p_j, offset)
             ax.plot(
@@ -228,7 +356,7 @@ def save_geometry_diagram(
                 [segment[0][1], segment[1][1]],
                 color=CHANNEL_COLORS.get(channel, "#666666"),
                 linestyle=CHANNEL_LINESTYLES.get(channel, "solid"),
-                linewidth=1.5,
+                linewidth=bond_width,
                 alpha=0.95,
             )
         midpoint = 0.5 * (p_i + p_j)
@@ -237,7 +365,7 @@ def save_geometry_diagram(
             midpoint[1],
             gamma,
             color=GAMMA_COLORS.get(gamma, "#666666"),
-            fontsize=7,
+            fontsize=gamma_fontsize,
             ha="center",
             va="center",
             zorder=4,
@@ -248,15 +376,16 @@ def save_geometry_diagram(
         if np.any(sublattice == 1):
             a_idx = np.where(sublattice == 0)[0]
             b_idx = np.where(sublattice == 1)[0]
-            ax.scatter(positions[a_idx, 0], positions[a_idx, 1], s=20, c="#111111", label="A")
-            ax.scatter(positions[b_idx, 0], positions[b_idx, 1], s=20, c="#ff7f0e", label="B")
+            ax.scatter(positions[a_idx, 0], positions[a_idx, 1], s=site_size, c="#111111", label="A")
+            ax.scatter(positions[b_idx, 0], positions[b_idx, 1], s=site_size, c="#ff7f0e", label="B")
         else:
-            ax.scatter(positions[:, 0], positions[:, 1], s=16, c="#111111", label="sites")
+            ax.scatter(positions[:, 0], positions[:, 1], s=0.8 * site_size, c="#111111", label="sites")
     else:
-        ax.scatter(positions[:, 0], positions[:, 1], s=16, c="#111111", label="sites")
-    ax.set_title(titled_for_run(f"{lattice_display_name(lattice)} Lattice Geometry", title_label))
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
+        ax.scatter(positions[:, 0], positions[:, 1], s=0.8 * site_size, c="#111111", label="sites")
+    ax.set_title(titled_for_run(f"{lattice_display_name(lattice)} Lattice Geometry", title_label), fontsize=title_fontsize)
+    ax.set_xlabel("x", fontsize=label_fontsize)
+    ax.set_ylabel("y", fontsize=label_fontsize)
+    ax.tick_params(labelsize=max(6.0, label_fontsize - 1.5))
     handles, labels = ax.get_legend_handles_labels()
     if model_spec is not None:
         channel_handles = [
@@ -265,14 +394,15 @@ def save_geometry_diagram(
                 [0],
                 color=CHANNEL_COLORS.get(channel, "#666666"),
                 linestyle=CHANNEL_LINESTYLES.get(channel, "solid"),
-                linewidth=1.8,
+                linewidth=max(bond_width, 1.2),
                 label=CHANNEL_LABELS.get(channel, channel),
             )
             for channel in CHANNEL_ORDER
         ]
         handles.extend(channel_handles)
         labels.extend([handle.get_label() for handle in channel_handles])
-    ax.legend(handles, labels, loc="upper right", fontsize=8)
+    ax.legend(handles, labels, loc="upper right", fontsize=legend_fontsize)
+    _annotate_field_direction(ax, external_field_vector, fontsize=legend_fontsize)
     ax.set_aspect("equal", adjustable="datalim")
     fig.tight_layout()
     fig.savefig(filepath)
@@ -293,6 +423,13 @@ def save_bond_energy_diagram(
     from matplotlib.lines import Line2D
 
     positions = _geometry_positions(geometry)
+    n_sites = int(getattr(geometry, "number_of_sites", positions.shape[0]))
+    bond_width = _scaled_value(n_sites, 2.2, min_value=0.9, max_value=3.0)
+    site_size = _scaled_value(n_sites, 10.0, min_value=4.5, max_value=18.0, exponent=0.34)
+    title_fontsize = _scaled_value(n_sites, 12.0, min_value=8.8, max_value=13.0, exponent=0.12)
+    label_fontsize = _scaled_value(n_sites, 10.0, min_value=7.2, max_value=11.4, exponent=0.14)
+    legend_fontsize = _scaled_value(n_sites, 8.0, min_value=6.0, max_value=9.3, exponent=0.14)
+    colorbar_fontsize = _scaled_value(n_sites, 9.0, min_value=6.5, max_value=10.0, exponent=0.14)
     offset_spacing = 0.018 * _position_span(positions)
     segments_by_channel: Dict[str, List[List[np.ndarray]]] = {}
     values_by_channel: Dict[str, List[float]] = {}
@@ -300,7 +437,7 @@ def save_bond_energy_diagram(
         i, j = int(row["i"]), int(row["j"])
         p_i = positions[i]
         p_j = positions[j]
-        channel_values = _bond_row_channel_values(row)
+        channel_values = _plottable_bond_channel_values(row)
         channels = _ordered_channels(list(channel_values.keys()))
         for channel, offset in zip(channels, _centered_offsets(len(channels), offset_spacing)):
             segments_by_channel.setdefault(channel, []).append(_offset_segment(p_i, p_j, offset))
@@ -329,38 +466,47 @@ def save_bond_energy_diagram(
         channel_values = np.asarray(values_by_channel[channel], dtype=float)
         collection = LineCollection(
             segments_by_channel[channel],
-            cmap="coolwarm",
+            cmap=BOND_ENERGY_CMAP,
             norm=norm,
-            linewidths=2.6,
+            linewidths=bond_width,
             linestyles=CHANNEL_LINESTYLES.get(channel, "solid"),
             alpha=0.95,
         )
         collection.set_array(channel_values)
         ax.add_collection(collection)
         collections.append(collection)
-    ax.scatter(positions[:, 0], positions[:, 1], c="black", s=10, zorder=3)
+    ax.scatter(positions[:, 0], positions[:, 1], c="black", s=site_size, zorder=3)
     legend_handles = [
         Line2D(
             [0],
             [0],
             color="#444444",
             linestyle=CHANNEL_LINESTYLES.get(channel, "solid"),
-            linewidth=2.0,
+            linewidth=max(1.2, bond_width),
             label=CHANNEL_LABELS.get(channel, channel),
         )
         for channel in _ordered_channels(list(segments_by_channel.keys()))
     ]
     if len(legend_handles) > 0:
-        ax.legend(handles=legend_handles, loc="upper right", fontsize=8)
+        ax.legend(
+            handles=legend_handles,
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.12),
+            ncol=min(4, max(1, len(legend_handles))),
+            fontsize=legend_fontsize,
+            framealpha=0.94,
+        )
     ax.autoscale()
-    ax.set_title(title)
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
+    ax.set_title(title, fontsize=title_fontsize)
+    ax.set_xlabel("x", fontsize=label_fontsize)
+    ax.set_ylabel("y", fontsize=label_fontsize)
+    ax.tick_params(labelsize=max(6.0, label_fontsize - 1.5))
     ax.set_aspect("equal", adjustable="datalim")
     cbar = fig.colorbar(collections[0], ax=ax, shrink=0.9)
-    cbar.set_label("Channel bond-energy contribution")
-    fig.tight_layout()
-    fig.savefig(filepath)
+    cbar.set_label("Channel bond-energy contribution", fontsize=colorbar_fontsize)
+    cbar.ax.tick_params(labelsize=max(6.0, colorbar_fontsize - 1.0))
+    fig.tight_layout(rect=(0.0, 0.12, 1.0, 1.0))
+    fig.savefig(filepath, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -569,15 +715,16 @@ def save_phase_representative_pattern(
     bond_rows: List[Dict[str, Any]] | None,
     filepath: str,
     title: str,
+    external_field_vector: Tuple[float, float, float] | None = None,
 ) -> None:
     """Save one compact phase-representative plot with spin arrows and resolved bonds."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.cm import ScalarMappable
     from matplotlib.collections import LineCollection
     from matplotlib.colors import Normalize
     from matplotlib.lines import Line2D
+    import matplotlib.patheffects as path_effects
 
     positions = _geometry_positions(geometry)
     values = np.real_if_close(np.asarray(spin_correlation_array)).astype(float).reshape(-1)
@@ -590,6 +737,21 @@ def save_phase_representative_pattern(
     if reference_site_idx < 0 or reference_site_idx >= n_sites:
         raise IndexError(f"reference_site_idx={reference_site_idx} is outside [0, {n_sites - 1}].")
 
+    size_scale = _lattice_size_scale(n_sites)
+    background_bond_width = _scaled_value(n_sites, 0.8, min_value=0.32, max_value=1.05)
+    resolved_bond_base_width = _scaled_value(n_sites, 0.85, min_value=0.45, max_value=1.15)
+    resolved_bond_dynamic_width = _scaled_value(n_sites, 2.25, min_value=1.15, max_value=2.8)
+    site_size = _scaled_value(n_sites, 32.0, min_value=13.0, max_value=52.0, exponent=0.34)
+    site_edge_width = _scaled_value(n_sites, 0.7, min_value=0.35, max_value=1.0, exponent=0.18)
+    title_fontsize = _scaled_value(n_sites, 12.0, min_value=8.6, max_value=13.0, exponent=0.12)
+    label_fontsize = _scaled_value(n_sites, 10.0, min_value=7.2, max_value=11.4, exponent=0.14)
+    legend_fontsize = _scaled_value(n_sites, 8.0, min_value=6.0, max_value=9.3, exponent=0.14)
+    colorbar_fontsize = _scaled_value(n_sites, 9.0, min_value=6.5, max_value=10.0, exponent=0.14)
+    arrow_width = float(np.clip(0.014 * size_scale, 0.009, 0.020))
+    arrow_halo_width = float(np.clip(1.75 * arrow_width, 0.016, 0.034))
+    arrow_headwidth = float(np.clip(5.4 * size_scale, 4.2, 7.0))
+    arrow_headlength = float(np.clip(6.6 * size_scale, 5.0, 8.4))
+
     fig, ax = plt.subplots(figsize=(8.8, 6.4), dpi=150)
 
     for bond in geometry.bond_list:
@@ -600,9 +762,9 @@ def save_phase_representative_pattern(
             [p_i[0], p_j[0]],
             [p_i[1], p_j[1]],
             color=GAMMA_COLORS.get(gamma, "#bdbdbd"),
-            linewidth=0.9,
+            linewidth=background_bond_width,
             alpha=0.28,
-            zorder=1,
+            zorder=BACKGROUND_BOND_ZORDER,
         )
 
     rows = [row for row in (bond_rows or []) if isinstance(row, dict)]
@@ -636,11 +798,13 @@ def save_phase_representative_pattern(
     ]
     bond_abs_max = max([abs(value) for value in all_bond_values], default=0.0)
     bond_norm = Normalize(vmin=-bond_abs_max, vmax=bond_abs_max) if bond_abs_max > 1e-14 else Normalize(vmin=-1.0, vmax=1.0)
-    cmap = plt.get_cmap("coolwarm")
+    cmap = plt.get_cmap(BOND_ENERGY_CMAP)
     first_collection = None
     for channel in [channel for channel in channel_order if channel in segments_by_channel]:
         channel_values = np.asarray(values_by_channel[channel], dtype=float)
-        widths = 1.2 + 3.4 * (np.abs(channel_values) / max(bond_abs_max, 1e-12))
+        widths = resolved_bond_base_width + resolved_bond_dynamic_width * (
+            np.abs(channel_values) / max(bond_abs_max, 1e-12)
+        )
         collection = LineCollection(
             segments_by_channel[channel],
             cmap=cmap,
@@ -648,7 +812,7 @@ def save_phase_representative_pattern(
             linewidths=widths,
             linestyles=CHANNEL_LINESTYLES.get(channel, "solid"),
             alpha=0.92,
-            zorder=2,
+            zorder=RESOLVED_BOND_ZORDER,
         )
         collection.set_array(channel_values)
         ax.add_collection(collection)
@@ -658,11 +822,11 @@ def save_phase_representative_pattern(
     ax.scatter(
         positions[:, 0],
         positions[:, 1],
-        s=32,
+        s=site_size,
         c="#f7f7f7",
         edgecolors="#222222",
-        linewidths=0.7,
-        zorder=4,
+        linewidths=site_edge_width,
+        zorder=SITE_MARKER_ZORDER,
     )
 
     non_reference_sites = np.asarray([site for site in range(n_sites) if site != reference_site_idx], dtype=int)
@@ -674,32 +838,46 @@ def save_phase_representative_pattern(
     )
     if not np.isfinite(spin_scale) or spin_scale <= 1e-14:
         spin_scale = 1.0
-    arrow_base = 0.27 * _position_span(positions) / max(np.sqrt(max(n_sites, 1)), 2.0)
+    arrow_base = 0.62 * _position_span(positions) / max(np.sqrt(max(n_sites, 1)), 2.0)
 
-    reference_position = positions[reference_site_idx]
-    ax.scatter(
-        [reference_position[0]],
-        [reference_position[1]],
-        s=190,
-        marker="*",
-        c="#ffd92f",
-        edgecolors="#111111",
-        linewidths=1.0,
-        zorder=6,
-    )
+    pattern_values = np.array(values, dtype=float, copy=True)
+    if 0 <= reference_site_idx < n_sites and np.isfinite(pattern_values[reference_site_idx]):
+        # The selected row only fixes the relative sign pattern. Draw the row site
+        # as an ordinary +direction arrow rather than marking it as special.
+        pattern_values[reference_site_idx] = spin_scale
 
     for site in range(n_sites):
-        value = float(values[site])
+        value = float(pattern_values[site])
         if not np.isfinite(value) or abs(value) <= 1e-14:
             continue
         sign = 1.0 if value > 0.0 else -1.0
         magnitude = min(1.0, abs(value) / spin_scale)
-        length = arrow_base * (0.35 + 0.65 * magnitude)
+        length = arrow_base * (0.45 + 0.75 * magnitude)
         vector = np.asarray([sign * length, 0.0], dtype=float)
         start = positions[site] - 0.5 * vector
         color = "#d62728" if value > 0.0 else "#1f77b4"
-        is_reference = int(site) == int(reference_site_idx)
-        ax.quiver(
+        halo = ax.quiver(
+            [start[0]],
+            [start[1]],
+            [vector[0]],
+            [vector[1]],
+            angles="xy",
+            scale_units="xy",
+            scale=1.0,
+            color="#ffffff",
+            width=arrow_halo_width,
+            headwidth=arrow_headwidth + 0.6,
+            headlength=arrow_headlength + 0.6,
+            headaxislength=arrow_headwidth + 0.6,
+            pivot="tail",
+            zorder=SPIN_VECTOR_HALO_ZORDER,
+            clip_on=False,
+        )
+        halo.set_path_effects([
+            path_effects.Stroke(linewidth=1.2, foreground="#ffffff"),
+            path_effects.Normal(),
+        ])
+        arrow = ax.quiver(
             [start[0]],
             [start[1]],
             [vector[0]],
@@ -708,21 +886,24 @@ def save_phase_representative_pattern(
             scale_units="xy",
             scale=1.0,
             color=color,
-            width=0.008,
-            headwidth=4.0,
-            headlength=5.0,
-            headaxislength=4.2,
+            width=arrow_width,
+            headwidth=arrow_headwidth,
+            headlength=arrow_headlength,
+            headaxislength=arrow_headwidth,
             pivot="tail",
-            zorder=8 if is_reference else 5,
+            zorder=SPIN_VECTOR_ZORDER,
+            clip_on=False,
         )
+        arrow.set_path_effects([
+            path_effects.Stroke(linewidth=0.5, foreground="#ffffff"),
+            path_effects.Normal(),
+        ])
 
     legend_handles = [
-        Line2D([0], [0], marker="*", color="none", markerfacecolor="#ffd92f",
-               markeredgecolor="#111111", markersize=12, label="reference site"),
-        Line2D([0], [0], color="#d62728", linewidth=2.2, marker=">", markevery=[1],
-               label="spin arrow: C_S > 0"),
-        Line2D([0], [0], color="#1f77b4", linewidth=2.2, marker="<", markevery=[1],
-               label="spin arrow: C_S < 0"),
+        Line2D([0], [0], color="#d62728", linewidth=max(2.0, resolved_bond_base_width + 1.0), marker=">", markevery=[1],
+               label="spin pattern: + direction"),
+        Line2D([0], [0], color="#1f77b4", linewidth=max(2.0, resolved_bond_base_width + 1.0), marker="<", markevery=[1],
+               label="spin pattern: - direction"),
     ]
     for channel in [channel for channel in channel_order if channel in segments_by_channel]:
         legend_handles.append(
@@ -731,7 +912,7 @@ def save_phase_representative_pattern(
                 [0],
                 color="#555555",
                 linestyle=CHANNEL_LINESTYLES.get(channel, "solid"),
-                linewidth=2.3,
+                linewidth=max(1.4, resolved_bond_base_width + 1.0),
                 label=f"{CHANNEL_LABELS.get(channel, channel)} bond",
             )
         )
@@ -739,24 +920,20 @@ def save_phase_representative_pattern(
         handles=legend_handles,
         loc="upper center",
         bbox_to_anchor=(0.5, -0.12),
-        ncol=3,
-        fontsize=8,
+        ncol=min(4, max(1, len(legend_handles))),
+        fontsize=legend_fontsize,
         framealpha=0.94,
     )
     if first_collection is not None:
         colorbar = fig.colorbar(first_collection, ax=ax, shrink=0.84)
-        colorbar.set_label("Resolved bond-energy contribution")
-    else:
-        colorbar = fig.colorbar(
-            ScalarMappable(norm=Normalize(vmin=-spin_scale, vmax=spin_scale), cmap="coolwarm"),
-            ax=ax,
-            shrink=0.84,
-        )
-        colorbar.set_label("C_S reference correlation")
+        colorbar.set_label("Resolved bond-energy contribution", fontsize=colorbar_fontsize)
+        colorbar.ax.tick_params(labelsize=max(6.0, colorbar_fontsize - 1.0))
 
-    ax.set_title(title)
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
+    _annotate_field_direction(ax, external_field_vector, fontsize=legend_fontsize)
+    ax.set_title(title, fontsize=title_fontsize)
+    ax.set_xlabel("x", fontsize=label_fontsize)
+    ax.set_ylabel("y", fontsize=label_fontsize)
+    ax.tick_params(labelsize=max(6.0, label_fontsize - 1.5))
     ax.set_aspect("equal", adjustable="datalim")
     ax.autoscale()
     fig.tight_layout(rect=(0.0, 0.14, 1.0, 1.0))
@@ -793,7 +970,9 @@ def save_flux_crystal_pattern(
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.collections import PatchCollection
     from matplotlib.colors import Normalize
+    from matplotlib.patches import Polygon
 
     positions = _geometry_positions(geometry)
     plaquettes = honeycomb_plaquette_flux_operators(geometry)
@@ -964,6 +1143,162 @@ def save_multi_method_energy_comparison(
     fig.tight_layout()
     fig.savefig(filepath)
     plt.close(fig)
+
+
+def _comparison_rows(payload: Any, method: str) -> List[Dict[str, Any]]:
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        rows = [row for row in payload if isinstance(row, dict)]
+    elif isinstance(payload, dict) and isinstance(payload.get("rows"), list):
+        rows = [row for row in payload["rows"] if isinstance(row, dict)]
+    elif isinstance(payload, dict):
+        rows = [payload]
+    else:
+        rows = []
+    output: List[Dict[str, Any]] = []
+    for row in rows:
+        if str(row.get("status", "completed")) not in ("completed", "completed_with_warnings"):
+            continue
+        energy = row.get("ground_state_energy_per_site", row.get("energy_per_site"))
+        try:
+            energy_value = float(energy)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(energy_value):
+            continue
+        normalized = dict(row)
+        normalized["method"] = str(row.get("method", row.get("backend", method)))
+        normalized["energy_per_site"] = energy_value
+        output.append(normalized)
+    return output
+
+
+def _comparison_alpha(row: Dict[str, Any], fallback: float | None = None) -> float:
+    value = row.get("alpha", fallback)
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = 0.0
+    return parsed if np.isfinite(parsed) else 0.0
+
+
+def _comparison_correlation_value(row: Dict[str, Any]) -> float | None:
+    for container in (row, row.get("diagnostics"), row.get("phase_observables")):
+        if not isinstance(container, dict):
+            continue
+        diagnostics = container.get("diagnostics") if isinstance(container.get("diagnostics"), dict) else container
+        for key in ("average_spin_dot", "spin_order_strength", "nearest_neighbor_spin_correlation"):
+            value = diagnostics.get(key)
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(parsed):
+                return parsed
+    bond_rows = row.get("bond_energies") or row.get("resolved_bond_observables")
+    if isinstance(bond_rows, list):
+        values: List[float] = []
+        for bond in bond_rows:
+            if not isinstance(bond, dict):
+                continue
+            value = bond.get("spin_dot", bond.get("S"))
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(parsed):
+                values.append(parsed)
+        if values:
+            return float(np.mean(values))
+    return None
+
+
+def plot_peps_vs_ed_comparison(
+    peps_results: Any,
+    ed_results: Any,
+    filepath: str,
+    title: str = "PEPS vs ED Benchmark",
+    title_label: str | None = None,
+    peps_label: str = "PEPS",
+    ed_label: str = "ED",
+) -> None:
+    """Overlay PEPS/iPEPS and ED energy/correlation benchmarks versus alpha."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    peps_rows = _comparison_rows(peps_results, peps_label)
+    ed_rows = _comparison_rows(ed_results, ed_label)
+    if not peps_rows and not ed_rows:
+        raise RuntimeError("No completed PEPS/iPEPS or ED rows available for comparison.")
+
+    fig, axes = plt.subplots(2, 1, figsize=(7.4, 7.2), dpi=150, sharex=True)
+    series = ((peps_label, peps_rows), (ed_label, ed_rows))
+    plotted_correlation = False
+    for label, rows in series:
+        if not rows:
+            continue
+        rows_sorted = sorted(rows, key=lambda row: _comparison_alpha(row))
+        alphas = np.asarray([_comparison_alpha(row) for row in rows_sorted], dtype=float)
+        energies = np.asarray([float(row["energy_per_site"]) for row in rows_sorted], dtype=float)
+        marker = METHOD_MARKERS.get(label, METHOD_MARKERS.get(str(label).lower(), "o"))
+        color = METHOD_COLORS.get(label, METHOD_COLORS.get(str(label).lower(), "#444444"))
+        axes[0].plot(
+            alphas,
+            energies,
+            marker=marker,
+            linestyle=METHOD_LINESTYLES.get(label, "-"),
+            color=color,
+            linewidth=1.4,
+            markersize=8 if marker == "*" else 5,
+            label=label,
+        )
+        corr_pairs = [
+            (_comparison_alpha(row), _comparison_correlation_value(row))
+            for row in rows_sorted
+        ]
+        corr_pairs = [(alpha, value) for alpha, value in corr_pairs if value is not None]
+        if corr_pairs:
+            corr_alpha = np.asarray([alpha for alpha, _value in corr_pairs], dtype=float)
+            corr_values = np.asarray([float(value) for _alpha, value in corr_pairs], dtype=float)
+            axes[1].plot(
+                corr_alpha,
+                corr_values,
+                marker=marker,
+                linestyle=METHOD_LINESTYLES.get(label, "-"),
+                color=color,
+                linewidth=1.4,
+                markersize=8 if marker == "*" else 5,
+                label=label,
+            )
+            plotted_correlation = True
+    axes[0].set_title(titled_for_run(title, title_label))
+    axes[0].set_ylabel("Energy per site")
+    axes[1].set_ylabel("Average <S_i . S_j>")
+    axes[1].set_xlabel("alpha")
+    if not plotted_correlation:
+        axes[1].text(
+            0.5,
+            0.5,
+            "No correlation data",
+            ha="center",
+            va="center",
+            transform=axes[1].transAxes,
+            color="#555555",
+        )
+    for axis in axes:
+        axis.grid(alpha=0.25)
+        handles, labels = axis.get_legend_handles_labels()
+        if len(handles) > 0:
+            axis.legend(handles, labels, loc="best")
+    fig.tight_layout()
+    fig.savefig(filepath)
+    plt.close(fig)
+
+
+def save_peps_vs_ed_comparison(*args: Any, **kwargs: Any) -> None:
+    plot_peps_vs_ed_comparison(*args, **kwargs)
 
 
 def save_entropy_profiles_comparison(
@@ -1233,6 +1568,87 @@ def save_low_energy_spectrum_comparison(
     plt.close(fig)
 
 
+def save_energy_b_scan_plot(
+    scan_data: Dict[str, Any],
+    filepath: str,
+    title: str = "Energy vs External Field",
+    title_label: str | None = None,
+) -> None:
+    """Overlay DMRG ground-state energy and ED low-energy bands versus B."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    rows = [
+        row for row in list(scan_data.get("rows", []))
+        if isinstance(row, dict) and str(row.get("status", "completed")) == "completed"
+    ]
+    if len(rows) == 0:
+        raise RuntimeError("No completed Energy-B scan rows available to plot.")
+    rows = sorted(rows, key=lambda row: float(row.get("field_strength", row.get("B", 0.0))))
+    fields = np.asarray([float(row.get("field_strength", row.get("B", 0.0))) for row in rows], dtype=float)
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.8), dpi=150)
+    max_band_count = max(
+        [
+            len(row.get("ed_energies_per_site", []) or [])
+            for row in rows
+        ],
+        default=0,
+    )
+    for band_index in range(max_band_count):
+        band_values: List[float] = []
+        band_fields: List[float] = []
+        for field_value, row in zip(fields, rows):
+            energies = row.get("ed_energies_per_site", []) or []
+            if band_index >= len(energies):
+                continue
+            value = float(energies[band_index])
+            if np.isfinite(value):
+                band_fields.append(float(field_value))
+                band_values.append(value)
+        if band_values:
+            ax.plot(
+                band_fields,
+                band_values,
+                color="#5f6b7a",
+                alpha=0.50 if band_index > 0 else 0.85,
+                linewidth=1.0 if band_index > 0 else 1.5,
+                label="ED bands" if band_index == 0 else None,
+            )
+
+    dmrg_fields: List[float] = []
+    dmrg_values: List[float] = []
+    for field_value, row in zip(fields, rows):
+        value = row.get("dmrg_energy_per_site")
+        if value is None:
+            continue
+        value_float = float(value)
+        if np.isfinite(value_float):
+            dmrg_fields.append(float(field_value))
+            dmrg_values.append(value_float)
+    if dmrg_values:
+        ax.plot(
+            dmrg_fields,
+            dmrg_values,
+            color="#7b3294",
+            marker="*",
+            markersize=9,
+            linewidth=1.2,
+            label="DMRG ground state",
+            zorder=4,
+        )
+
+    ax.set_xlabel(r"External field strength $B$")
+    ax.set_ylabel("Energy per site")
+    ax.set_title(titled_for_run(title, title_label))
+    ax.grid(alpha=0.25)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(filepath)
+    plt.close(fig)
+
+
 def save_multi_method_structure_comparison(
     method_to_rows: Dict[str, List[Dict[str, Any]]],
     filepath: str,
@@ -1297,10 +1713,10 @@ def save_multi_method_structure_comparison(
         ax.grid(alpha=0.25)
         if not plotted:
             ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+        handles, legend_labels = ax.get_legend_handles_labels()
+        if len(handles) > 0:
+            ax.legend(handles, legend_labels, loc="best")
     axes[0].set_ylabel("Value")
-    handles, legend_labels = axes[0].get_legend_handles_labels()
-    if len(handles) > 0:
-        axes[0].legend(loc="best")
     fig.suptitle(titled_for_run(title, title_label))
     fig.tight_layout()
     fig.savefig(filepath)
@@ -1764,11 +2180,14 @@ def save_phase_diagram_plot(
     filepath: str,
     title: str,
     title_label: str | None = None,
+    x_label: str = r"$\alpha$",
+    y_label: str = r"$\beta$",
 ) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.colors import ListedColormap, BoundaryNorm
+    from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
 
     good_rows = [
@@ -1779,6 +2198,7 @@ def save_phase_diagram_plot(
         raise RuntimeError("No completed phase-scan rows available to plot.")
 
     phase_order = [
+        "Spin-Orbital Liquid",
         "Spin liquid",
         "NP1",
         "NP2",
@@ -1788,6 +2208,7 @@ def save_phase_diagram_plot(
         "Weak/undetermined",
     ]
     phase_colors = {
+        "Spin-Orbital Liquid": "#d7191c",
         "Spin liquid": "#d7191c",
         "NP1": "#f3dfb8",
         "NP2": "#ead1d9",
@@ -1832,15 +2253,23 @@ def save_phase_diagram_plot(
         edgecolors=(0.0, 0.0, 0.0, 0.10),
         linewidth=0.25,
     )
-    ax.scatter(
-        [float(row["alpha"]) for row in good_rows],
-        [float(row["beta"]) for row in good_rows],
-        c="black",
-        s=8,
-        marker=".",
-        linewidths=0,
-        zorder=3,
-    )
+    rows_by_method: Dict[str, List[Dict[str, Any]]] = {}
+    for row in good_rows:
+        method_key = _phase_row_method_key(row) or "phase_scan"
+        rows_by_method.setdefault(method_key, []).append(row)
+    for method_key, method_rows in rows_by_method.items():
+        marker = METHOD_MARKERS.get(method_key, ".")
+        ax.scatter(
+            [float(row["alpha"]) for row in method_rows],
+            [float(row["beta"]) for row in method_rows],
+            c=METHOD_COLORS.get(method_key, "black"),
+            s=42 if marker == "*" else 14,
+            marker=marker,
+            linewidths=0.35 if marker == "*" else 0,
+            edgecolors="#222222" if marker == "*" else "none",
+            zorder=3,
+            label=phase_scan_method_display_name(method_key),
+        )
 
     for phase in phase_order:
         phase_rows = [row for row in good_rows if str(row["phase_label"]) == phase]
@@ -1851,16 +2280,35 @@ def save_phase_diagram_plot(
         label = phase.replace(" / ", "\n")
         ax.text(alpha_center, beta_center, label, ha="center", va="center", fontsize=8.5)
 
-    ax.set_xlabel(r"$\alpha$")
-    ax.set_ylabel(r"$\beta$")
+    ax.set_xlabel(str(x_label))
+    ax.set_ylabel(str(y_label))
     ax.set_title(titled_for_run(title, title_label))
     legend_handles = [
         Patch(facecolor=phase_colors[phase], edgecolor="black", linewidth=0.4, label=phase)
         for phase in phase_order
         if np.any(code_grid == phase_to_code[phase])
     ]
+    phase_legend = None
     if legend_handles:
-        ax.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=8)
+        phase_legend = ax.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=8)
+        ax.add_artist(phase_legend)
+    method_handles = [
+        Line2D(
+            [0],
+            [0],
+            marker=METHOD_MARKERS.get(method_key, "."),
+            color="none",
+            markerfacecolor=METHOD_COLORS.get(method_key, "black"),
+            markeredgecolor="#222222" if METHOD_MARKERS.get(method_key) == "*" else "none",
+            markersize=9 if METHOD_MARKERS.get(method_key) == "*" else 5,
+            label=phase_scan_method_display_name(method_key),
+        )
+        for method_key in rows_by_method
+        if method_key in METHOD_MARKERS
+    ]
+    if method_handles and (len(method_handles) > 1 or "quimb_ipeps" in rows_by_method):
+        anchor_y = 0.46 if phase_legend is not None else 1.0
+        ax.legend(handles=method_handles, loc="upper left", bbox_to_anchor=(1.02, anchor_y), fontsize=8)
     ax.set_xlim(float(alpha_edges[0]), float(alpha_edges[-1]))
     ax.set_ylim(float(beta_edges[0]), float(beta_edges[-1]))
     ax.grid(color="black", alpha=0.12, linewidth=0.4)
@@ -1878,11 +2326,15 @@ PHASE_DIAGRAM_TITLES: tuple[tuple[str, str], ...] = (
     ("tenpy_dmrg", "TeNPy Finite-DMRG Phase Diagram"),
     ("tenax_idmrg", "Tenax iDMRG Phase Diagram"),
     ("tenpy_idmrg", "TeNPy iDMRG Phase Diagram"),
+    ("quimb_peps", "quimb PEPS Phase Diagram"),
+    ("quimb_ipeps", "quimb iPEPS Phase Diagram"),
 )
 
 TENSOR_NETWORK_OBSERVABLE_TITLES: tuple[tuple[str, str], ...] = (
     ("tenpy_dmrg", "TeNPy finite-DMRG"),
     ("tenpy_idmrg", "TeNPy iDMRG"),
+    ("quimb_peps", "quimb PEPS"),
+    ("quimb_ipeps", "quimb iPEPS"),
 )
 
 BASE_PHASE_OBSERVABLE_SPECS: tuple[tuple[str, tuple[str, ...], str], ...] = (
@@ -1953,7 +2405,7 @@ def save_phase_diagrams_from_json(
     data = _load_json_object(json_path)
     phase_scan = _phase_scan_from_json_object(data)
 
-    target_folder = output_folder or os.path.dirname(os.path.abspath(json_path))
+    target_folder = _resolve_target_folder(output_folder, os.path.dirname(os.path.abspath(json_path)))
     os.makedirs(target_folder, exist_ok=True)
     filename_prefix = prefix or _default_phase_json_prefix(json_path, data)
     requested_modes = set(modes or [])
@@ -2057,11 +2509,25 @@ def _pattern_payload_from_summary(summary: dict[str, Any], method: str) -> dict[
             "Run ylmodel_main.py with --calculate-real-space-patterns."
         )
     correlations = patterns.get("correlations")
-    if not isinstance(correlations, dict) or "S" not in correlations or "T" not in correlations:
+    if not isinstance(correlations, dict) or "S" not in correlations:
         raise KeyError(
-            f"{method}.real_space_patterns must contain spin 'S' and orbital 'T' correlation rows."
+            f"{method}.real_space_patterns must contain spin 'S' correlation rows."
         )
     return patterns
+
+
+def _bond_rows_from_summary(summary: dict[str, Any], method: str) -> list[dict[str, Any]]:
+    method_payload = summary.get(method)
+    if not isinstance(method_payload, dict):
+        return []
+    for container in (method_payload, method_payload.get("info")):
+        if not isinstance(container, dict):
+            continue
+        for key in ("bond_energies", "bond_rows"):
+            rows = container.get(key)
+            if isinstance(rows, list):
+                return [row for row in rows if isinstance(row, dict)]
+    return []
 
 
 def _default_pattern_json_prefix(summary_json: str, method: str) -> str:
@@ -2079,37 +2545,47 @@ def save_patterns_from_summary(
     output_folder: str | None = None,
     prefix: str | None = None,
 ) -> dict[str, str]:
-    """Save spin and orbital reference-site pattern diagrams from a run-summary JSON."""
+    """Save the compact spin-direction pattern with resolved bond energies."""
     summary = _load_json_object(summary_json)
     geometry = _geometry_from_run_summary(summary)
     patterns = _pattern_payload_from_summary(summary, method)
     reference_site_idx = int(patterns["reference_site_idx"])
     correlations = patterns["correlations"]
+    bond_rows = _bond_rows_from_summary(summary, method)
+    if len(bond_rows) == 0:
+        raise KeyError(
+            f"Run summary has no {method}.bond_energies rows to overlay. "
+            "Regenerate the summary with the current ylmodel_main.py and --calculate-bond-energies."
+        )
 
-    target_folder = output_folder or os.path.dirname(os.path.abspath(summary_json))
+    target_folder = _resolve_target_folder(output_folder, os.path.dirname(os.path.abspath(summary_json)))
     os.makedirs(target_folder, exist_ok=True)
     filename_prefix = prefix or _default_pattern_json_prefix(summary_json, method)
-
-    spin_path = os.path.join(target_folder, f"{filename_prefix}_spin_real_space_pattern.png")
-    orbital_path = os.path.join(target_folder, f"{filename_prefix}_orbital_real_space_pattern.png")
-
-    save_real_space_pattern_diagram(
-        geometry=geometry,
-        correlation_array=np.asarray(correlations["S"], dtype=float),
-        reference_site_idx=reference_site_idx,
-        filepath=spin_path,
-        title=f"{method.upper()} spin reference-site pattern",
-        channel_label="C_S[j] = <S_ref . S_j>",
+    method_label = {
+        "dmrg": "DMRG",
+        "peps": "PEPS",
+        "ed": "ED",
+    }.get(method, method.upper())
+    title_label = summary.get("plot_title_label")
+    external_field_payload = summary.get("external_field")
+    external_field_vector = (
+        external_field_payload.get("field_vector_hx_hy_hz")
+        if isinstance(external_field_payload, dict)
+        else None
     )
-    save_real_space_pattern_diagram(
+
+    combined_path = os.path.join(target_folder, f"{filename_prefix}_spin_vectors_bond_energy.png")
+
+    save_phase_representative_pattern(
         geometry=geometry,
-        correlation_array=np.asarray(correlations["T"], dtype=float),
+        spin_correlation_array=np.asarray(correlations["S"], dtype=float),
         reference_site_idx=reference_site_idx,
-        filepath=orbital_path,
-        title=f"{method.upper()} orbital reference-site pattern",
-        channel_label="C_T[j] = <T_ref . T_j>",
+        bond_rows=bond_rows,
+        filepath=combined_path,
+        title=titled_for_run(f"{method_label} Spin Pattern + Resolved Bond Energy", str(title_label) if title_label else None),
+        external_field_vector=external_field_vector,
     )
-    return {"spin": spin_path, "orbital": orbital_path}
+    return {"combined": combined_path}
 
 
 def _build_plot_outputs_parser() -> argparse.ArgumentParser:
@@ -2139,10 +2615,10 @@ def _build_plot_outputs_parser() -> argparse.ArgumentParser:
 
     pattern_parser = subparsers.add_parser(
         "real-space-json",
-        help="Regenerate reference-site real-space pattern diagrams from a run summary.",
+        help="Regenerate the compact spin-pattern/bond-energy diagram from a run summary.",
     )
     pattern_parser.add_argument("summary_json", help="Path to a *_run_summary.json file.")
-    pattern_parser.add_argument("--method", choices=("dmrg", "ed"), default="dmrg", help="Summary method section to plot.")
+    pattern_parser.add_argument("--method", choices=("dmrg", "peps", "ed"), default="dmrg", help="Summary method section to plot.")
     pattern_parser.add_argument("--output-folder", default=None, help="Folder for generated PNG files.")
     pattern_parser.add_argument("--prefix", default=None, help="Output filename prefix.")
     return parser
@@ -2169,8 +2645,7 @@ def main() -> None:
             output_folder=args.output_folder,
             prefix=args.prefix,
         )
-        print(f"[pattern] saved spin: {saved['spin']}")
-        print(f"[pattern] saved orbital: {saved['orbital']}")
+        print(f"[pattern] saved combined: {saved['combined']}")
         return
     parser.error(f"Unknown command '{args.command}'.")
 

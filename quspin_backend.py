@@ -8,13 +8,228 @@ is d=4, represented as a tensor product of a spin chain and an orbital chain.
 
 from __future__ import annotations
 
+import argparse
+import importlib.metadata as importlib_metadata
+import json
+import os
+import subprocess
+import sys
 import time
-from typing import Any, Dict, List, Tuple
+import traceback
+from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 import numpy as np
 import scipy.sparse as sparse
-from quspin.basis import spin_basis_1d, spin_basis_general, tensor_basis
-from quspin.operators import hamiltonian
+
+from analysis import profile_stage
+
+_QUSPIN_IMPORT_ERROR: Exception | None = None
+
+
+def _quspin_basis_api() -> Tuple[Any, Any, Any]:
+    """Load QuSpin basis classes only when a QuSpin calculation needs them."""
+    global _QUSPIN_IMPORT_ERROR
+    try:
+        from quspin.basis import spin_basis_1d, spin_basis_general, tensor_basis  # type: ignore
+    except Exception as exc:
+        _QUSPIN_IMPORT_ERROR = exc
+        raise ImportError(
+            "The Python package 'quspin' is required only for the QuSpin ED backend. "
+            "Install quspin or use --ed-backend standard / --no-run-ed."
+        ) from exc
+    return spin_basis_1d, spin_basis_general, tensor_basis
+
+
+def _quspin_hamiltonian_class() -> Any:
+    """Load QuSpin's Hamiltonian builder only for actual QuSpin ED work."""
+    global _QUSPIN_IMPORT_ERROR
+    try:
+        from quspin.operators import hamiltonian  # type: ignore
+    except Exception as exc:
+        _QUSPIN_IMPORT_ERROR = exc
+        raise ImportError(
+            "The Python package 'quspin' is required only for the QuSpin ED backend. "
+            "Install quspin or use --ed-backend standard / --no-run-ed."
+        ) from exc
+    return hamiltonian
+
+
+def quspin_package_available() -> Tuple[bool, str | None]:
+    """Return whether QuSpin can be imported, without forcing callers to use it."""
+    try:
+        _quspin_basis_api()
+        _quspin_hamiltonian_class()
+    except Exception as exc:
+        return False, str(exc)
+    return True, None
+
+
+def quspin_combined_c3_api_support_report(
+    *,
+    model_family: str = "yao_lee",
+    phase_scan_requested: bool = False,
+) -> Dict[str, Any]:
+    """Report whether QuSpin can currently host the physical combined C3.
+
+    The Yao-Lee C3 symmetry is not a pure integer site map.  It is a lattice
+    120-degree rotation composed with the local spin rotation
+    ``exp[-i(2*pi/3)*(Sx+Sy+Sz)/sqrt(3)]``.  In the working Sz computational
+    basis this local spin rotation maps each spin bit to a superposition, so the
+    usual QuSpin map interfaces cannot express it as a single integer-state
+    representative map.  A future QuSpin implementation would need a carefully
+    validated spin-[111] basis encoding or a deeper custom route that can carry
+    configuration-dependent complex phases and the transformed Hamiltonian.
+    """
+    report: Dict[str, Any] = {
+        "status": "checked",
+        "experimental": True,
+        "model_family": str(model_family),
+        "physical_combined_c3": (
+            "lattice 120-degree rotation times local spin rotation "
+            "U_C3=exp[-i(2*pi/3)*(Sx+Sy+Sz)/sqrt(3)]"
+        ),
+        "pure_site_permutation_c3_supported_by_quspin": False,
+        "pure_site_permutation_c3_rejected_for_yao_lee": str(model_family).strip().lower() == "yao_lee",
+        "why_not_native_quspin": (
+            "spin_basis_general and the current tensor_basis route represent symmetry generators "
+            "as basis-state maps. The physical Yao-Lee combined C3 includes a non-diagonal local "
+            "spin rotation in the Sz basis, so a pure C3_map would block-diagonalize the wrong "
+            "operator."
+        ),
+        "what_would_be_needed_for_quspin": (
+            "Rotate the spin sector to the [111] basis so U_C3 is diagonal, rebuild every Yao-Lee "
+            "Hamiltonian term in that basis, encode the resulting configuration-dependent C3 phase "
+            "in a packed spin-orbital user_basis, and validate N=8 against the standard projector."
+        ),
+        "z2_compatibility_note": (
+            "The currently used spin_pi_z or spin_flip Z2 label is not treated as an independent "
+            "commuting label with true combined C3. C3 cycles spin axes, so the full little group "
+            "would need a joint group projector rather than separate QuSpin zblock and C3 labels."
+        ),
+        "combined_c3_implemented": False,
+        "phase_scan_requested": bool(phase_scan_requested),
+        "phase_scan_allowed": False,
+        "validation_location": "tests/test_projector_ed_symmetry_path.py",
+        "requires": [
+            "a spin-[111] basis rotation with correctly encoded local C3 phase sectors",
+            "a packed spin-orbital user_basis carrying fused-site translation and total Tz filtering",
+            "Hamiltonian terms transformed consistently into the spin-[111] basis",
+            "N=8 validation against the standard_projector combined-C3 spectrum in the test suite before phase scans",
+        ],
+    }
+    try:
+        import quspin.basis as quspin_basis  # type: ignore
+
+        report["quspin_available"] = True
+        has_user_basis = bool(hasattr(quspin_basis, "user_basis"))
+        report["has_user_basis"] = has_user_basis
+        report["has_spin_basis_general"] = bool(hasattr(quspin_basis, "spin_basis_general"))
+        report["user_basis_note"] = (
+            "user_basis is installed, but no validated packed spin-[111] implementation exists here; "
+            "presence of user_basis alone is not enough for non-diagonal combined C3."
+            if has_user_basis
+            else "user_basis is not installed."
+        )
+    except Exception as exc:
+        report["quspin_available"] = False
+        report["api_error"] = str(exc)
+        report["has_user_basis"] = False
+        report["has_spin_basis_general"] = False
+    report["reason"] = (
+        "No QuSpin combined-C3 implementation is enabled. A pure C3_map is rejected for Yao-Lee "
+        "because it omits the required local spin rotation and would not commute with the "
+        "bond-directional Hamiltonian."
+    )
+    if bool(phase_scan_requested):
+        report["phase_scan_rejection_reason"] = (
+            "quspin_experimental_c3 cannot be used in phase scans until combined C3 is implemented; "
+            "N=8 validation belongs in the test suite, not in runtime options."
+        )
+    return report
+
+
+def quspin_fused_translation_api_support_report(
+    geometry: Any | None = None,
+    *,
+    use_tau_z_block: bool = True,
+    use_z2_block: bool = False,
+    requested: bool = False,
+) -> Dict[str, Any]:
+    """Report whether QuSpin can host fused spin-orbital translations.
+
+    The physical translation needed for the spin-orbital Yao-Lee model is the
+    diagonal operation on the local physical site,
+    ``T_fused |s_i,t_i> = |s_{T(i)},t_{T(i)}>``.  QuSpin's current
+    ``tensor_basis`` route represents spin and orbital as separate chains, so
+    ordinary translation blocks there would be independent factor translations,
+    not this fused physical-site translation.  A future QuSpin implementation
+    would need a packed ``user_basis`` with local ``sps=4`` states, explicit
+    total-Tz filtering, and validated custom maps.
+    """
+    report: Dict[str, Any] = {
+        "status": "checked",
+        "experimental": True,
+        "requested": bool(requested),
+        "physical_translation": "T_fused |s_i,t_i> = |s_{T(i)},t_{T(i)}>",
+        "tensor_basis_translation_supported": False,
+        "tensor_basis_translation_rejected": True,
+        "implemented": False,
+        "available": False,
+        "use_tau_z_block": bool(use_tau_z_block),
+        "use_z2_block": bool(use_z2_block),
+        "validation_location": "tests/test_projector_ed_symmetry_path.py",
+        "requires": [
+            "packed spin-orbital user_basis with sps=4 local states",
+            "custom total-Tz state filtering/pcon for the orbital component",
+            "custom fused translation maps acting on packed physical sites",
+            "optional Z2 maps validated in the same packed basis",
+            "N=8 comparison against standard_projector in the test suite before production use",
+        ],
+    }
+    try:
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="pkg_resources is deprecated as an API.*",
+                category=UserWarning,
+            )
+            import quspin.basis as quspin_basis  # type: ignore
+
+        report["quspin_available"] = True
+        report["has_user_basis"] = bool(hasattr(quspin_basis, "user_basis"))
+        report["has_spin_basis_general"] = bool(hasattr(quspin_basis, "spin_basis_general"))
+        user_basis_obj = getattr(quspin_basis, "user_basis", None)
+        report["user_basis_object"] = str(user_basis_obj) if user_basis_obj is not None else None
+    except Exception as exc:
+        report["quspin_available"] = False
+        report["api_error"] = str(exc)
+        report["has_user_basis"] = False
+        report["has_spin_basis_general"] = False
+
+    if geometry is not None:
+        try:
+            translation_support = quspin_translation_block_support(geometry)
+            report["geometry_translation_support"] = translation_support
+            report["geometry_supports_requested_maps"] = bool(
+                all(
+                    axis_report.get("geometry_supported", False)
+                    for axis_report in translation_support.values()
+                )
+            )
+        except Exception as exc:
+            report["geometry_translation_error"] = str(exc)
+            report["geometry_supports_requested_maps"] = False
+
+    report["reason"] = (
+        "QuSpin fused-site translation is unavailable in this build. The installed API exposes "
+        "user_basis, but this project has not implemented and validated the required packed sps=4 "
+        "basis, total-Tz filter, fused translation maps, and optional Z2 maps. "
+        "QuSpin tensor_basis translation is not used with Tz because Yao-Lee translation must act "
+        "on fused spin-orbital physical sites."
+    )
+    return report
 
 try:
     from models import (
@@ -118,6 +333,46 @@ def build_honeycomb_torus_translation_permutations(geometry: Any) -> Tuple[np.nd
     return t1, t2
 
 
+def build_quspin_1d_translation_maps_from_geometry(geometry: Any) -> Dict[str, Dict[str, Any]]:
+    """Build raw 1D integer Tx/Ty maps from ``GeometryData`` cell labels.
+
+    These are the maps QuSpin's ``spin_basis_general`` expects for a single
+    spin-1/2 chain.  For the spin-orbital Yao-Lee tensor basis they are only a
+    validated ingredient: a production translation block must still be the
+    diagonal/fused physical-site translation acting on spin and orbital
+    together.
+    """
+    t1, t2 = build_honeycomb_torus_translation_permutations(geometry)
+    result: Dict[str, Dict[str, Any]] = {}
+    if bool(getattr(geometry, "circumference_x", False)):
+        result["x"] = {
+            "available": True,
+            "map": [int(value) for value in np.asarray(t1, dtype=np.int32).tolist()],
+            "quspin_map": [int(value) for value in np.asarray(t1, dtype=np.int32).tolist()],
+            "direction": "x",
+        }
+    else:
+        result["x"] = {
+            "available": False,
+            "direction": "x",
+            "reason": "circumference_x is false; no periodic Tx map is available.",
+        }
+    if bool(getattr(geometry, "circumference_y", False)):
+        result["y"] = {
+            "available": True,
+            "map": [int(value) for value in np.asarray(t2, dtype=np.int32).tolist()],
+            "quspin_map": [int(value) for value in np.asarray(t2, dtype=np.int32).tolist()],
+            "direction": "y",
+        }
+    else:
+        result["y"] = {
+            "available": False,
+            "direction": "y",
+            "reason": "circumference_y is false; no periodic Ty map is available.",
+        }
+    return result
+
+
 def _translation_preserves_bond_directions(geometry: Any, permutation: np.ndarray) -> bool:
     bond_set = {
         (min(int(i), int(j)), max(int(i), int(j)), str(gamma))
@@ -129,6 +384,69 @@ def _translation_preserves_bond_directions(geometry: Any, permutation: np.ndarra
         if (min(mapped_i, mapped_j), max(mapped_i, mapped_j), str(gamma)) not in bond_set:
             return False
     return True
+
+
+def _translation_validation_report(
+    geometry: Any,
+    permutation: np.ndarray,
+    *,
+    axis: str,
+) -> Dict[str, Any]:
+    bond_set = {
+        (min(int(i), int(j)), max(int(i), int(j)), str(gamma))
+        for i, j, gamma in _bond_triplets(geometry)
+    }
+    missing: List[Dict[str, Any]] = []
+    for i, j, gamma in _bond_triplets(geometry):
+        mapped_i = int(permutation[int(i)])
+        mapped_j = int(permutation[int(j)])
+        mapped = (min(mapped_i, mapped_j), max(mapped_i, mapped_j), str(gamma))
+        if mapped not in bond_set:
+            missing.append(
+                {
+                    "source_bond": [int(i), int(j), str(gamma)],
+                    "mapped_bond": [int(mapped_i), int(mapped_j), str(gamma)],
+                }
+            )
+    return {
+        "axis": str(axis),
+        "periodic": bool(
+            getattr(
+                geometry,
+                "circumference_x" if str(axis) == "x" else "circumference_y",
+                False,
+            )
+        ),
+        "bond_gamma_preserving": len(missing) == 0,
+        "missing_or_mismatched_bonds": missing[:8],
+        "missing_or_mismatched_bond_count": int(len(missing)),
+    }
+
+
+def quspin_tensor_basis_fused_translation_equivalence(
+    *,
+    model_family: str = "yao_lee",
+    spin_orbital_tensor_basis: bool = True,
+) -> Tuple[bool, str]:
+    """Whether native QuSpin tensor-basis maps equal fused physical translation.
+
+    For the spin-orbital Yao-Lee representation used here, ``tensor_basis`` is
+    a product of a spin chain basis and an orbital chain basis.  Applying the
+    same site map to both factors creates independent factor momentum labels,
+    not the single diagonal momentum block of the fused physical site
+    ``|S_i,T_i>``.  The latter is what the standard projector path implements.
+    """
+    if str(model_family).strip().lower() == "yao_lee" and bool(spin_orbital_tensor_basis):
+        return (
+            False,
+            "QuSpin tensor_basis would impose spin-chain and orbital-chain translations separately; "
+            "this is not equivalent to the fused physical-site translation required for spin-orbital Yao-Lee. "
+            "Use ED_SYMMETRY_ENGINE=standard_projector for production Tx/Ty blocks.",
+        )
+    return (
+        False,
+        "No validated QuSpin-native fused translation equivalence is registered for this model.",
+    )
 
 
 def _validated_translation_blocks(
@@ -164,19 +482,49 @@ def _validated_translation_blocks(
 
 
 def quspin_translation_block_support(geometry: Any) -> Dict[str, Dict[str, Any]]:
-    """Check x/y honeycomb translation blocks independently."""
+    """Check x/y honeycomb translation maps and production QuSpin support.
+
+    ``geometry_supported=True`` means the raw 1D map exists and preserves the
+    honeycomb bond/gamma list. ``supported=True`` is stricter: it means the map
+    can be used as a production native QuSpin symmetry for this backend.  The
+    current spin-orbital tensor-basis route reports the valid maps but does not
+    use them because they are not equivalent to fused physical-site
+    translations.
+    """
     support: Dict[str, Dict[str, Any]] = {}
+    equivalence_ok, equivalence_reason = quspin_tensor_basis_fused_translation_equivalence()
     for axis, use_x, use_y in (("x", True, False), ("y", False, True)):
         try:
-            _validated_translation_blocks(
+            t1, t2 = _validated_translation_blocks(
                 geometry,
                 use_translation_x_block=use_x,
                 use_translation_y_block=use_y,
             )
+            permutation = t1 if axis == "x" else t2
+            if permutation is None:
+                raise ValueError(f"No {axis}-translation map was generated.")
+            validation = _translation_validation_report(geometry, permutation, axis=axis)
         except Exception as exc:
-            support[axis] = {"supported": False, "reason": str(exc)}
+            support[axis] = {
+                "supported": False,
+                "geometry_supported": False,
+                "bond_gamma_preserving": False,
+                "tensor_basis_equivalent_to_fused_translation": False,
+                "reason": str(exc),
+            }
         else:
-            support[axis] = {"supported": True, "reason": None}
+            support[axis] = {
+                "supported": bool(equivalence_ok),
+                "geometry_supported": True,
+                "bond_gamma_preserving": bool(validation["bond_gamma_preserving"]),
+                "commutes_with_uniform_yao_lee_hamiltonian_by_bond_check": bool(
+                    validation["bond_gamma_preserving"]
+                ),
+                "tensor_basis_equivalent_to_fused_translation": bool(equivalence_ok),
+                "reason": None if equivalence_ok else equivalence_reason,
+                "map": [int(value) for value in np.asarray(permutation, dtype=np.int32).tolist()],
+                "validation": validation,
+            }
     return support
 
 
@@ -194,6 +542,9 @@ def quspin_translation_blocks_supported(
         )
     except Exception as exc:
         return False, str(exc)
+    equivalence_ok, equivalence_reason = quspin_tensor_basis_fused_translation_equivalence()
+    if not equivalence_ok:
+        return False, equivalence_reason
     return True, None
 
 
@@ -202,8 +553,19 @@ def _spin_flip_permutation(n_sites: int) -> np.ndarray:
     return -(np.arange(int(n_sites), dtype=np.int32) + 1)
 
 
+def _quspin_zblock_from_parity(z2_target_parity: int) -> int:
+    """Map user parity 0/1 to QuSpin spin-inversion zblock +/-1."""
+    return 1 if int(z2_target_parity) % 2 == 0 else -1
+
+
+def _is_spin_flip_z2_generator(z2_generator: str | None) -> bool:
+    generator = str(z2_generator or "spin_flip").strip().lower().replace("-", "_")
+    return generator in ("spin_flip", "spin_inversion", "zblock")
+
+
 def _general_spin_basis_with_fallbacks(n_sites: int, **kwargs: Any) -> Any:
     """Build spin_basis_general while keeping compatibility with QuSpin variants."""
+    _spin_basis_1d, spin_basis_general, _tensor_basis = _quspin_basis_api()
     attempts: List[Dict[str, Any]] = [dict(kwargs)]
     literal_kwargs = dict(kwargs)
     literal_block_dict: Dict[str, np.ndarray] = {}
@@ -239,11 +601,12 @@ def _general_spin_basis_with_fallbacks(n_sites: int, **kwargs: Any) -> Any:
 def build_quspin_yao_lee_basis(
     n_sites: int,
     geometry: Any | None = None,
-    use_sz_block: bool = True,
+    use_sz_block: bool = False,
     target_sz2: int = 0,
     use_tau_z_block: bool = False,
     target_tz2: int = 0,
     use_z2_block: bool = False,
+    z2_generator: str | None = None,
     z2_target_parity: int = 0,
     use_translation_block: bool = False,
     use_translation_x_block: bool | None = None,
@@ -259,13 +622,23 @@ def build_quspin_yao_lee_basis(
     n_sites = int(n_sites)
     if n_sites <= 0:
         raise ValueError("n_sites must be positive.")
+    if bool(use_sz_block):
+        raise ValueError(
+            "QuSpin Yao-Lee basis cannot use a total-Sz block: total Sz is not conserved "
+            "by the bond-directional Yao-Lee Hamiltonian. Use tau_z or full spin basis."
+        )
+    spin_basis_1d, _spin_basis_general, tensor_basis = _quspin_basis_api()
     if bool(use_reflection_block) or int(reflection_block) != 0:
         raise ValueError(
             "QuSpin reflection/C3 spatial blocks are forbidden for the bond-directional Yao-Lee "
             "Hamiltonian unless a gauge transformation that permutes x/y/z bonds is implemented."
         )
-    if bool(use_z2_block) and (not bool(use_sz_block) or int(target_sz2) != 0):
-        raise ValueError("QuSpin spin-flip Z2 parity is allowed only inside the total Sz=0 sector.")
+    if bool(use_z2_block):
+        if not _is_spin_flip_z2_generator(z2_generator):
+            raise ValueError(
+                "QuSpin Yao-Lee Z2 currently implements the full-spin spin-flip block "
+                f"with z2_generator='spin_flip'; got {z2_generator or 'None'}."
+            )
     translation_x_requested = (
         bool(use_translation_block)
         if use_translation_x_block is None
@@ -279,24 +652,35 @@ def build_quspin_yao_lee_basis(
     any_translation_requested = bool(translation_x_requested or translation_y_requested)
     kx = int(momentum_block_1 if momentum_x_block is None else momentum_x_block)
     ky = int(momentum_block_2 if momentum_y_block is None else momentum_y_block)
-    if bool(use_tau_z_block) and (bool(use_z2_block) or any_translation_requested):
-        raise ValueError(
-            "QuSpin does not combine tau_z with the optimized Sz/Z2/translation reduction path. "
-            "Use tau_z alone only when the Hamiltonian really conserves it."
+    if any_translation_requested:
+        if geometry is None:
+            raise ValueError("QuSpin translation blocks require the full geometry object.")
+        _validated_translation_blocks(
+            geometry,
+            use_translation_x_block=translation_x_requested,
+            use_translation_y_block=translation_y_requested,
         )
+        equivalence_ok, equivalence_reason = quspin_tensor_basis_fused_translation_equivalence()
+        if not equivalence_ok:
+            raise ValueError(equivalence_reason)
+    if bool(use_z2_block) and any_translation_requested:
+        raise ValueError("QuSpin spin-flip Z2 is not combined with custom 2D translation blocks.")
 
     # pauli=False makes x, y, z represent spin-1/2 operators S and tau rather
     # than Pauli matrices sigma.
-    spin_kwargs: Dict[str, Any] = {"pauli": False}
-    orbital_kwargs: Dict[str, Any] = {"pauli": False}
+    spin_kwargs: Dict[str, Any] = {"pauli": 0}
+    orbital_kwargs: Dict[str, Any] = {"pauli": 0}
     if bool(use_sz_block):
         spin_kwargs["Nup"] = _nup_from_total_m2(n_sites, int(target_sz2), "spin")
     if bool(use_tau_z_block):
         orbital_kwargs["Nup"] = _nup_from_total_m2(n_sites, int(target_tz2), "orbital")
+    if bool(use_z2_block):
+        # This is the spin-sector global spin inversion supported directly by
+        # QuSpin's spin_basis_1d. It acts on the full S Hilbert space and does
+        # not require, or imply, total-Sz conservation.
+        spin_kwargs["zblock"] = _quspin_zblock_from_parity(z2_target_parity)
 
     if any_translation_requested:
-        if geometry is None:
-            raise ValueError("QuSpin translation blocks require the full geometry object.")
         t1_perm, t2_perm = _validated_translation_blocks(
             geometry,
             use_translation_x_block=translation_x_requested,
@@ -308,12 +692,7 @@ def build_quspin_yao_lee_basis(
         if translation_y_requested:
             spin_kwargs["kblock_2"] = (t2_perm, ky)
             orbital_kwargs["kblock_2"] = (t2_perm, ky)
-    if bool(use_z2_block):
-        # Spin-flip is a spin-sector symmetry only.  Even parity is the default
-        # target and corresponds to the user-facing z2_target_parity=0.
-        spin_kwargs["pblock"] = (_spin_flip_permutation(n_sites), int(z2_target_parity) % 2)
-
-    if any_translation_requested or bool(use_z2_block):
+    if any_translation_requested:
         basis_spin = _general_spin_basis_with_fallbacks(n_sites, **spin_kwargs)
         basis_orbital = _general_spin_basis_with_fallbacks(n_sites, **orbital_kwargs)
     else:
@@ -369,25 +748,34 @@ def build_quspin_yao_lee_static_terms(
     QuSpin counts the ``I`` character as a local operator in the tensor string.
     """
     static: List[List[Any]] = []
-    spin_coefficient = float(coupling_j) * (1.0 + float(beta))
-    orbital_coefficient = float(coupling_j) * (1.0 - float(beta))
-    mixed_coefficient = float(coupling_j) * float(alpha)
-    orbital_pair_for_gamma = {"x": "xx", "y": "yy", "z": "zz"}
+    spin_dot_coefficient = float(coupling_j) * float(alpha) * float(beta)
+    spin_gamma_coefficient = -2.0 * float(coupling_j) * float(beta)
+    orbital_dot_coefficient = float(coupling_j) * float(beta)
+    spin_dot_orbital_dot_coefficient = -float(coupling_j) * float(alpha)
+    spin_gamma_orbital_dot_coefficient = 2.0 * float(coupling_j)
+    constant_coefficient = -float(coupling_j) * float(beta) * float(beta)
+    axis_pair = {"x": "xx", "y": "yy", "z": "zz"}
+    orbital_dot_terms = (("+-", 0.5), ("-+", 0.5), ("zz", 1.0))
 
     for i, j, gamma in _bond_triplets(geometry):
-        orbital_pair = orbital_pair_for_gamma[gamma]
-
-        # Spin Heisenberg term: (1+beta) S_i dot S_j.
         for spin_pair in ("xx", "yy", "zz"):
-            _append_term(static, f"{spin_pair}|I", [spin_coefficient, i, j, i])
-
-        # Orbital compass/Ising term: (1-beta) tau_i^gamma tau_j^gamma.
-        _append_term(static, f"I|{orbital_pair}", [orbital_coefficient, i, i, j])
-
-        # Mixed term: alpha (S_i dot S_j)(tau_i^gamma tau_j^gamma).
-        for spin_pair in ("xx", "yy", "zz"):
-            _append_term(static, f"{spin_pair}|{orbital_pair}", [mixed_coefficient, i, j, i, j])
-
+            _append_term(static, f"{spin_pair}|I", [spin_dot_coefficient, i, j, i])
+            for orbital_pair, orbital_factor in orbital_dot_terms:
+                _append_term(
+                    static,
+                    f"{spin_pair}|{orbital_pair}",
+                    [spin_dot_orbital_dot_coefficient * orbital_factor, i, j, i, j],
+                )
+        spin_gamma_pair = axis_pair[gamma]
+        _append_term(static, f"{spin_gamma_pair}|I", [spin_gamma_coefficient, i, j, i])
+        for orbital_pair, orbital_factor in orbital_dot_terms:
+            _append_term(static, f"I|{orbital_pair}", [orbital_dot_coefficient * orbital_factor, i, i, j])
+            _append_term(
+                static,
+                f"{spin_gamma_pair}|{orbital_pair}",
+                [spin_gamma_orbital_dot_coefficient * orbital_factor, i, j, i, j],
+            )
+        _append_term(static, "I|I", [constant_coefficient, i, i])
     spin_field_ops = {
         "Sx": "x|I",
         "Sy": "y|I",
@@ -407,11 +795,12 @@ def build_quspin_yao_lee_hamiltonian(
     alpha: float,
     beta: float,
     coupling_j: float,
-    use_sz_block: bool = True,
+    use_sz_block: bool = False,
     target_sz2: int = 0,
     use_tau_z_block: bool = False,
     target_tz2: int = 0,
     use_z2_block: bool = False,
+    z2_generator: str | None = None,
     z2_target_parity: int = 0,
     use_translation_block: bool = False,
     use_translation_x_block: bool | None = None,
@@ -429,43 +818,47 @@ def build_quspin_yao_lee_hamiltonian(
 ) -> Tuple[Any, Any, List[List[Any]]]:
     """Construct the QuSpin Yao-Lee Hamiltonian and return ``(H, basis, static)``."""
     n_sites = int(getattr(geometry, "number_of_sites"))
-    basis = build_quspin_yao_lee_basis(
-        n_sites,
-        geometry=geometry,
-        use_sz_block=use_sz_block,
-        target_sz2=target_sz2,
-        use_tau_z_block=use_tau_z_block,
-        target_tz2=target_tz2,
-        use_z2_block=use_z2_block,
-        z2_target_parity=z2_target_parity,
-        use_translation_block=use_translation_block,
-        use_translation_x_block=use_translation_x_block,
-        use_translation_y_block=use_translation_y_block,
-        momentum_block_1=momentum_block_1,
-        momentum_block_2=momentum_block_2,
-        momentum_x_block=momentum_x_block,
-        momentum_y_block=momentum_y_block,
-        use_reflection_block=use_reflection_block,
-        reflection_block=reflection_block,
-    )
-    static = build_quspin_yao_lee_static_terms(
-        geometry=geometry,
-        alpha=alpha,
-        beta=beta,
-        coupling_j=coupling_j,
-        external_field_terms=external_field_terms,
-    )
-    hamiltonian_operator = hamiltonian(
-        static,
-        [],
-        basis=basis,
-        dtype=np.complex128,
-        # QuSpin does not implement check_symm for tensor_basis; forcing this
-        # off avoids a noisy warning while keeping hermiticity/pcon checks.
-        check_symm=False,
-        check_herm=bool(check_herm),
-        check_pcon=bool(check_pcon),
-    )
+    with profile_stage("QuSpin basis construction"):
+        basis = build_quspin_yao_lee_basis(
+            n_sites,
+            geometry=geometry,
+            use_sz_block=use_sz_block,
+            target_sz2=target_sz2,
+            use_tau_z_block=use_tau_z_block,
+            target_tz2=target_tz2,
+            use_z2_block=use_z2_block,
+            z2_generator=z2_generator,
+            z2_target_parity=z2_target_parity,
+            use_translation_block=use_translation_block,
+            use_translation_x_block=use_translation_x_block,
+            use_translation_y_block=use_translation_y_block,
+            momentum_block_1=momentum_block_1,
+            momentum_block_2=momentum_block_2,
+            momentum_x_block=momentum_x_block,
+            momentum_y_block=momentum_y_block,
+            use_reflection_block=use_reflection_block,
+            reflection_block=reflection_block,
+        )
+    with profile_stage("QuSpin Hamiltonian construction"):
+        static = build_quspin_yao_lee_static_terms(
+            geometry=geometry,
+            alpha=alpha,
+            beta=beta,
+            coupling_j=coupling_j,
+            external_field_terms=external_field_terms,
+        )
+        hamiltonian = _quspin_hamiltonian_class()
+        hamiltonian_operator = hamiltonian(
+            static,
+            [],
+            basis=basis,
+            dtype=np.complex128,
+            # QuSpin does not implement check_symm for tensor_basis; forcing this
+            # off avoids a noisy warning while keeping hermiticity/pcon checks.
+            check_symm=False,
+            check_herm=bool(check_herm),
+            check_pcon=bool(check_pcon),
+        )
     return hamiltonian_operator, basis, static
 
 
@@ -490,15 +883,17 @@ def _solve_lowest_quspin_eigenpairs(
     if dimension <= 0:
         raise ValueError("Cannot diagonalize an empty QuSpin basis.")
     if dimension == 1:
-        matrix = quspin_hamiltonian_as_sparse_matrix(hamiltonian_operator)
+        with profile_stage("diagonalization"):
+            matrix = quspin_hamiltonian_as_sparse_matrix(hamiltonian_operator)
         return (
             np.asarray([float(np.real(matrix[0, 0]))], dtype=float),
             np.ones((1, 1), dtype=np.complex128),
         )
     requested_count = max(1, int(eigenstate_count))
     if dimension <= 2 or requested_count >= dimension - 1:
-        matrix = quspin_hamiltonian_as_sparse_matrix(hamiltonian_operator).toarray()
-        eigenvalues, eigenvectors = np.linalg.eigh(matrix)
+        with profile_stage("diagonalization"):
+            matrix = quspin_hamiltonian_as_sparse_matrix(hamiltonian_operator).toarray()
+            eigenvalues, eigenvectors = np.linalg.eigh(matrix)
         count = min(requested_count, dimension)
         return (
             np.asarray(np.real(eigenvalues[:count]), dtype=float),
@@ -512,7 +907,8 @@ def _solve_lowest_quspin_eigenpairs(
             f"dim={hamiltonian_matrix.shape[0]}, nnz={hamiltonian_matrix.nnz}, k={k}"
         )
     start = time.perf_counter()
-    eigenvalues, eigenvectors = hamiltonian_operator.eigsh(k=k, which="SA")
+    with profile_stage("diagonalization"):
+        eigenvalues, eigenvectors = hamiltonian_operator.eigsh(k=k, which="SA")
     if show_progress:
         print(f"[quspin-ed] {label} eigsh finished in {time.perf_counter() - start:.2f}s")
     order = np.argsort(np.real(eigenvalues))
@@ -520,6 +916,38 @@ def _solve_lowest_quspin_eigenpairs(
         np.asarray(np.real(eigenvalues[order]), dtype=float),
         np.asarray(eigenvectors[:, order], dtype=np.complex128),
     )
+
+
+def _sanitize_quspin_yao_lee_blocks(
+    *,
+    use_tau_z_block: bool,
+    use_z2_block: bool,
+    z2_generator: str | None = None,
+    use_translation_block: bool,
+    use_translation_x_block: bool | None,
+    use_translation_y_block: bool | None,
+) -> Tuple[bool, bool, bool, bool | None, bool | None, List[str]]:
+    """Keep only tested QuSpin block combinations for spin-orbital Yao-Lee ED."""
+    warnings: List[str] = []
+    z2 = bool(use_z2_block)
+    translation = bool(use_translation_block)
+    tx = use_translation_x_block
+    ty = use_translation_y_block
+    if z2:
+        generator = str(z2_generator or "").strip()
+        if not _is_spin_flip_z2_generator(generator):
+            z2 = False
+            warnings.append(
+                "Dropped QuSpin Z2 because this backend currently implements only the spin_flip zblock generator."
+            )
+    translation_requested = bool(translation or bool(tx) or bool(ty))
+    if translation_requested:
+        _equivalence_ok, equivalence_reason = quspin_tensor_basis_fused_translation_equivalence()
+        translation = False
+        tx = False
+        ty = False
+        warnings.append(f"Dropped QuSpin translation blocks: {equivalence_reason}")
+    return bool(use_tau_z_block), bool(z2), bool(translation), tx, ty, warnings
 
 
 def _basis_operator_matrix(
@@ -794,11 +1222,12 @@ def run_small_cluster_exact_diagonalization(
     solver: str = "auto",
     sparse_tol: float = 0.0,
     sparse_maxiter: int | None = None,
-    use_sz_block: bool = True,
+    use_sz_block: bool = False,
     target_sz2: int = 0,
     use_tau_z_block: bool = False,
     target_tz2: int = 0,
     use_z2_block: bool = False,
+    z2_generator: str | None = None,
     z2_target_parity: int = 0,
     use_translation_block: bool = False,
     use_translation_x_block: bool | None = None,
@@ -822,14 +1251,35 @@ def run_small_cluster_exact_diagonalization(
     """
     del model_spec, jx, jy, jz, solver, sparse_tol, sparse_maxiter
 
+    (
+        use_tau_z_block,
+        use_z2_block,
+        use_translation_block,
+        use_translation_x_block,
+        use_translation_y_block,
+        block_warnings,
+    ) = _sanitize_quspin_yao_lee_blocks(
+        use_tau_z_block=use_tau_z_block,
+        use_z2_block=use_z2_block,
+        z2_generator=z2_generator,
+        use_translation_block=use_translation_block,
+        use_translation_x_block=use_translation_x_block,
+        use_translation_y_block=use_translation_y_block,
+    )
+    if show_progress:
+        for warning in block_warnings:
+            print(f"[quspin-ed] {warning}")
     field_terms = _field_terms(external_field_terms)
+    if bool(use_sz_block):
+        if show_progress:
+            print("[quspin-ed] total Sz is not conserved by the Yao-Lee Hamiltonian; using the full spin basis.")
+        use_sz_block = False
     transverse_field = _has_transverse_spin_field_terms(field_terms)
     scan_sz_sectors = bool(use_sz_block and _has_sz_zeeman_terms(field_terms) and not transverse_field)
     if transverse_field and bool(use_sz_block):
         if show_progress:
             print("[quspin-ed] transverse field breaks total Sz; using the full spin basis.")
         use_sz_block = False
-        use_z2_block = False
     if _spin_field_breaks_z2(field_terms) and bool(use_z2_block):
         if show_progress:
             print("[quspin-ed] spin field breaks spin-flip Z2; disabling the Z2 block.")
@@ -850,6 +1300,7 @@ def run_small_cluster_exact_diagonalization(
                 use_tau_z_block=use_tau_z_block,
                 target_tz2=target_tz2,
                 use_z2_block=False if scan_sz_sectors else use_z2_block,
+                z2_generator=z2_generator,
                 z2_target_parity=z2_target_parity,
                 use_translation_block=use_translation_block,
                 use_translation_x_block=use_translation_x_block,
@@ -905,11 +1356,12 @@ def run_small_cluster_exact_spectrum(
     solver: str = "auto",
     sparse_tol: float = 0.0,
     sparse_maxiter: int | None = None,
-    use_sz_block: bool = True,
+    use_sz_block: bool = False,
     target_sz2: int = 0,
     use_tau_z_block: bool = False,
     target_tz2: int = 0,
     use_z2_block: bool = False,
+    z2_generator: str | None = None,
     z2_target_parity: int = 0,
     use_translation_block: bool = False,
     use_translation_x_block: bool | None = None,
@@ -931,14 +1383,36 @@ def run_small_cluster_exact_spectrum(
     requested_use_sz_block = bool(use_sz_block)
     requested_target_sz2 = int(target_sz2)
     requested_use_z2_block = bool(use_z2_block)
+    requested_z2_generator = z2_generator
+    (
+        use_tau_z_block,
+        use_z2_block,
+        use_translation_block,
+        use_translation_x_block,
+        use_translation_y_block,
+        block_warnings,
+    ) = _sanitize_quspin_yao_lee_blocks(
+        use_tau_z_block=use_tau_z_block,
+        use_z2_block=use_z2_block,
+        z2_generator=z2_generator,
+        use_translation_block=use_translation_block,
+        use_translation_x_block=use_translation_x_block,
+        use_translation_y_block=use_translation_y_block,
+    )
+    if show_progress:
+        for warning in block_warnings:
+            print(f"[quspin-ed] {warning}")
     field_terms = _field_terms(external_field_terms)
+    if bool(use_sz_block):
+        if show_progress:
+            print("[quspin-ed] total Sz is not conserved by the Yao-Lee Hamiltonian; using the full spin basis.")
+        use_sz_block = False
     transverse_field = _has_transverse_spin_field_terms(field_terms)
     scan_sz_sectors = bool(use_sz_block and _has_sz_zeeman_terms(field_terms) and not transverse_field)
     if transverse_field and bool(use_sz_block):
         if show_progress:
             print("[quspin-ed] transverse field breaks total Sz; using the full spin basis.")
         use_sz_block = False
-        use_z2_block = False
     if _spin_field_breaks_z2(field_terms) and bool(use_z2_block):
         if show_progress:
             print("[quspin-ed] spin field breaks spin-flip Z2; disabling the Z2 block.")
@@ -967,6 +1441,7 @@ def run_small_cluster_exact_spectrum(
                 use_tau_z_block=use_tau_z_block,
                 target_tz2=target_tz2,
                 use_z2_block=use_z2_block,
+                z2_generator=z2_generator,
                 z2_target_parity=z2_target_parity,
                 use_translation_block=use_translation_block,
                 use_translation_x_block=use_translation_x_block,
@@ -1023,14 +1498,30 @@ def run_small_cluster_exact_spectrum(
     translation_y_used = bool(use_translation_block) if use_translation_y_block is None else bool(use_translation_y_block)
     kx = int(momentum_block_1 if momentum_x_block is None else momentum_x_block)
     ky = int(momentum_block_2 if momentum_y_block is None else momentum_y_block)
+    spin_basis_label = "spin_flip_z2" if bool(use_z2_block) else ("fixed Sz" if bool(use_sz_block) else "full")
+    orbital_basis_label = "fixed tau_z" if bool(use_tau_z_block) else "full"
+    basis_type = (
+        "quspin_tensor_spin_z2_orbital_tz"
+        if bool(use_z2_block) and bool(use_tau_z_block)
+        else (
+            "quspin_tensor_spin_z2_orbital_full"
+            if bool(use_z2_block)
+            else (
+                "quspin_tensor_spin_u1_block_orbital_tz"
+                if bool(use_sz_block) and bool(use_tau_z_block)
+                else (
+                    "quspin_tensor_spin_full_orbital_tz"
+                    if bool(use_tau_z_block)
+                    else "quspin_tensor_spin_full_orbital_full"
+                )
+            )
+        )
+    )
     spectrum: Dict[str, Any] = {
         "backend": "quspin",
-        "basis": (
-            "tensor_basis("
-            f"spin={'fixed Sz' if bool(use_sz_block) else 'full'}, "
-            f"orbital={'fixed tau_z' if bool(use_tau_z_block) else 'full'}"
-            ")"
-        ),
+        "symmetry_engine": "quspin_native",
+        "basis": f"tensor_basis(spin={spin_basis_label}, orbital={orbital_basis_label})",
+        "basis_type": basis_type,
         "use_sz_block": bool(use_sz_block),
         "target_sz2": int(target_sz2),
         "requested_use_sz_block": bool(requested_use_sz_block),
@@ -1039,7 +1530,24 @@ def run_small_cluster_exact_spectrum(
         "target_tz2": int(target_tz2),
         "use_z2_block": bool(use_z2_block),
         "requested_use_z2_block": bool(requested_use_z2_block),
+        "z2_generator": "spin_flip" if bool(use_z2_block) else None,
+        "z2_kind": "spin_flip" if bool(use_z2_block) else None,
+        "quspin_zblock": _quspin_zblock_from_parity(z2_target_parity) if bool(use_z2_block) else None,
+        "requested_z2_generator": requested_z2_generator,
+        "block_warnings": list(block_warnings),
         "z2_target_parity": int(z2_target_parity) % 2,
+        "native_supported_symmetries": {
+            "u1_tz": True,
+            "spin_flip_z2_zero_field": True,
+            "spin_pi_z": False,
+            "translation": False,
+            "combined_c3": False,
+            "reason": (
+                "QuSpin native Yao-Lee uses tensor_basis with a full spin basis and optional orbital Tz. "
+                "The only tested Z2 is zero-field spin_flip. Fused translations and true combined "
+                "spin-lattice C3 remain in the standard_projector path."
+            ),
+        },
         "use_translation_block": bool(translation_x_used or translation_y_used),
         "use_translation_x_block": bool(translation_x_used),
         "use_translation_y_block": bool(translation_y_used),
@@ -1049,10 +1557,10 @@ def run_small_cluster_exact_spectrum(
         "momentum_y_block": int(ky),
         "use_reflection_block": bool(use_reflection_block),
         "reflection_block": int(reflection_block),
+        "block_warnings": list(block_warnings),
         "formula": (
-            "H = J sum_<ij>_gamma [(1+beta) S_i.S_j + "
-            "(1-beta) tau_i^gamma tau_j^gamma + "
-            "alpha (S_i.S_j)(tau_i^gamma tau_j^gamma)]"
+            "H = -J sum_<ij>_gamma [alpha S_i.S_j - 2 S_i^gamma S_j^gamma - beta]"
+            "[T_i.T_j - beta]"
         ),
         "hilbert_dimension": dimension,
         "static_term_count": len(static),
@@ -1105,3 +1613,451 @@ def run_small_cluster_exact_spectrum(
         spectrum["first_excited_energy"] = None
         spectrum["spectral_gap"] = None
     return spectrum, eigenvectors
+
+
+# ----------------------------------------------------------------------
+# Opt-in QuSpin environment validation
+# ----------------------------------------------------------------------
+
+_COMPAT_PACKAGE_NAMES = (
+    "numpy",
+    "scipy",
+    "quspin",
+    "tenpy",
+    "tenax",
+    "quimb",
+    "numba",
+    "llvmlite",
+)
+
+
+def _compat_json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _compat_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_compat_json_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, complex):
+        return {"real": float(value.real), "imag": float(value.imag)}
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return _compat_json_safe(item())
+        except Exception:
+            pass
+    return str(value)
+
+
+def _compat_package_versions() -> Dict[str, Any]:
+    versions: Dict[str, Any] = {}
+    for package_name in _COMPAT_PACKAGE_NAMES:
+        try:
+            versions[package_name] = importlib_metadata.version(package_name)
+        except importlib_metadata.PackageNotFoundError:
+            versions[package_name] = None
+        except Exception as exc:
+            versions[package_name] = f"unavailable: {exc}"
+    return versions
+
+
+def _compat_run_step(name: str, fn: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
+    start = time.perf_counter()
+    try:
+        payload = fn()
+        if not isinstance(payload, dict):
+            payload = {"result": payload}
+        payload.setdefault("status", "passed")
+    except Exception as exc:
+        payload = {
+            "status": "failed",
+            "error": str(exc),
+            "traceback": traceback.format_exc(limit=8),
+        }
+    payload["wall_time_seconds"] = float(time.perf_counter() - start)
+    payload["name"] = str(name)
+    return payload
+
+
+def _validate_required_quspin_api() -> Dict[str, Any]:
+    from quspin.basis import spin_basis_1d, spin_basis_general, tensor_basis  # type: ignore
+    from quspin.operators import hamiltonian  # type: ignore
+    import quspin.basis as quspin_basis  # type: ignore
+
+    return {
+        "spin_basis_1d": str(spin_basis_1d),
+        "spin_basis_general": str(spin_basis_general),
+        "tensor_basis": str(tensor_basis),
+        "hamiltonian": str(hamiltonian),
+        "has_user_basis": bool(hasattr(quspin_basis, "user_basis")),
+        "user_basis": str(getattr(quspin_basis, "user_basis", None)),
+        "has_basis_general": bool(hasattr(quspin_basis, "basis_general")),
+    }
+
+
+def _validate_spin_chain_translation() -> Dict[str, Any]:
+    from quspin.basis import spin_basis_general  # type: ignore
+    from quspin.operators import hamiltonian  # type: ignore
+
+    length = 4
+    translation = np.asarray([(site + 1) % length for site in range(length)], dtype=np.int32)
+    basis = spin_basis_general(length, kblock=(translation, 0), pauli=0)
+    zz_terms = [[1.0, site, (site + 1) % length] for site in range(length)]
+    x_terms = [[0.25, site] for site in range(length)]
+    ham = hamiltonian(
+        [["zz", zz_terms], ["x", x_terms]],
+        [],
+        basis=basis,
+        dtype=np.float64,
+        check_symm=False,
+        check_herm=False,
+        check_pcon=False,
+    )
+    eigenvalues = np.linalg.eigvalsh(ham.toarray())
+    return {
+        "length": int(length),
+        "translation_map": [int(value) for value in translation.tolist()],
+        "basis_dimension": int(basis.Ns),
+        "ground_state_energy": float(eigenvalues[0]),
+        "native_translation_maps_supported": True,
+    }
+
+
+def _validate_zblock_spin_flip() -> Dict[str, Any]:
+    from quspin.basis import spin_basis_1d  # type: ignore
+    from quspin.operators import hamiltonian  # type: ignore
+
+    length = 4
+    dimensions: Dict[str, int] = {}
+    energies: Dict[str, float] = {}
+    for parity in (-1, 1):
+        basis = spin_basis_1d(L=length, zblock=parity, pauli=0)
+        ham = hamiltonian(
+            [["x", [[1.0, site] for site in range(length)]]],
+            [],
+            basis=basis,
+            dtype=np.float64,
+            check_symm=False,
+            check_herm=False,
+            check_pcon=False,
+        )
+        dimensions[str(parity)] = int(basis.Ns)
+        energies[str(parity)] = float(np.linalg.eigvalsh(ham.toarray())[0])
+    return {
+        "length": int(length),
+        "parity_dimensions": dimensions,
+        "parity_ground_state_energies": energies,
+        "zblock_spin_flip_supported": True,
+    }
+
+
+def _validate_tensor_basis() -> Dict[str, Any]:
+    from quspin.basis import spin_basis_1d, tensor_basis  # type: ignore
+
+    length = 2
+    spin_basis = spin_basis_1d(L=length, pauli=0)
+    orbital_basis = spin_basis_1d(L=length, pauli=0)
+    basis = tensor_basis(spin_basis, orbital_basis)
+    return {
+        "length": int(length),
+        "spin_basis_dimension": int(spin_basis.Ns),
+        "orbital_basis_dimension": int(orbital_basis.Ns),
+        "tensor_basis_dimension": int(basis.Ns),
+        "tensor_basis_supported": True,
+    }
+
+
+def _validate_backend_supported_spin_orbital_blocks() -> Dict[str, Any]:
+    from models import build_lattice_geometry, build_model_spec
+
+    geometry = build_lattice_geometry(
+        "honeycomb",
+        1,
+        length_y=2,
+        circumference_x=False,
+        circumference_y=True,
+    )
+    model_spec = build_model_spec("1/2", "1/2", "yao_lee", "z")
+    hamiltonian_operator, basis, static = build_quspin_yao_lee_hamiltonian(
+        geometry=geometry,
+        alpha=0.7,
+        beta=0.2,
+        coupling_j=1.0,
+        use_sz_block=False,
+        use_tau_z_block=True,
+        target_tz2=0,
+        use_z2_block=True,
+        z2_generator="spin_flip",
+        z2_target_parity=0,
+        use_translation_block=False,
+        external_field_terms=[],
+        check_symm=False,
+        check_herm=False,
+        check_pcon=False,
+    )
+    return {
+        "package_available": quspin_package_available(),
+        "fused_translation_report": quspin_fused_translation_api_support_report(
+            geometry,
+            use_tau_z_block=True,
+            use_z2_block=False,
+            requested=True,
+        ),
+        "combined_c3_report": quspin_combined_c3_api_support_report(
+            model_family=model_spec.model_family,
+            phase_scan_requested=False,
+        ),
+        "supported_backend_basis": "tensor_basis(spin=spin_flip_z2, orbital=fixed tau_z)",
+        "basis_dimension": int(basis.Ns),
+        "static_term_count": int(len(static)),
+        "sparse_shape": [int(value) for value in hamiltonian_operator.tocsr().shape],
+    }
+
+
+def _validate_yao_lee_quspin_vs_standard_ed() -> Dict[str, Any]:
+    import ed_backend
+    from models import build_lattice_geometry, build_model_spec
+
+    geometry = build_lattice_geometry(
+        "honeycomb",
+        1,
+        length_y=2,
+        circumference_x=False,
+        circumference_y=True,
+    )
+    model_spec = build_model_spec("1/2", "1/2", "yao_lee", "z")
+    alpha = 0.7
+    beta = 0.2
+    coupling_j = 1.0
+    standard_spectrum, _standard_vectors = ed_backend.run_small_cluster_exact_spectrum(
+        geometry=geometry,
+        model_spec=model_spec,
+        alpha=alpha,
+        beta=beta,
+        coupling_j=coupling_j,
+        eigenstate_count=1,
+        check_ground_state_degeneracy=False,
+        external_field_terms=[],
+        show_progress=False,
+        solver="dense",
+    )
+    quspin_operator, quspin_basis, _static = build_quspin_yao_lee_hamiltonian(
+        geometry=geometry,
+        alpha=alpha,
+        beta=beta,
+        coupling_j=coupling_j,
+        use_sz_block=False,
+        use_tau_z_block=False,
+        use_z2_block=False,
+        use_translation_block=False,
+        external_field_terms=[],
+        check_symm=False,
+        check_herm=False,
+        check_pcon=False,
+    )
+    quspin_ground_energy = float(
+        np.linalg.eigvalsh(quspin_hamiltonian_as_sparse_matrix(quspin_operator).toarray())[0]
+    )
+    standard_ground_energy = float(standard_spectrum["ground_state_energy"])
+    difference = abs(quspin_ground_energy - standard_ground_energy)
+    tolerance = 1.0e-8
+    return {
+        "status": "passed" if difference <= tolerance else "failed",
+        "geometry": {
+            "lattice": "honeycomb",
+            "length_x": 1,
+            "length_y": 2,
+            "circumference_x": False,
+            "circumference_y": True,
+            "number_of_sites": int(geometry.number_of_sites),
+        },
+        "parameters": {
+            "alpha": float(alpha),
+            "beta": float(beta),
+            "coupling_j": float(coupling_j),
+        },
+        "standard_ed_ground_energy": standard_ground_energy,
+        "quspin_ground_energy": quspin_ground_energy,
+        "absolute_difference": float(difference),
+        "tolerance": float(tolerance),
+        "quspin_basis_dimension": int(quspin_basis.Ns),
+    }
+
+
+def run_quspin_compatibility_validation() -> Dict[str, Any]:
+    """Validate QuSpin APIs and tiny Yao-Lee ED parity without changing packages."""
+    report: Dict[str, Any] = {
+        "validator": "quspin_backend.run_quspin_compatibility_validation",
+        "python_version": sys.version,
+        "python_executable": sys.executable,
+        "package_versions": _compat_package_versions(),
+        "steps": {},
+    }
+    steps: List[Tuple[str, Callable[[], Dict[str, Any]]]] = [
+        ("import_required_quspin_api", _validate_required_quspin_api),
+        ("spin_chain_translation_block", _validate_spin_chain_translation),
+        ("zblock_spin_flip", _validate_zblock_spin_flip),
+        ("tensor_basis", _validate_tensor_basis),
+        ("yao_lee_backend_supported_spin_orbital_blocks", _validate_backend_supported_spin_orbital_blocks),
+        ("yao_lee_quspin_vs_standard_ed", _validate_yao_lee_quspin_vs_standard_ed),
+    ]
+    for name, fn in steps:
+        report["steps"][name] = _compat_run_step(name, fn)
+    report["passed"] = all(
+        str(report["steps"].get(name, {}).get("status")) == "passed"
+        for name, _fn in steps
+    )
+    return report
+
+
+def _pip_freeze(timeout_seconds: float = 60.0) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "command": [sys.executable, "-m", "pip", "freeze"],
+        "timeout_seconds": float(timeout_seconds),
+        "status": "not_run",
+        "returncode": None,
+        "stdout": "",
+        "stderr": "",
+        "error": None,
+        "timed_out": False,
+    }
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "pip", "freeze"],
+            capture_output=True,
+            text=True,
+            timeout=float(timeout_seconds),
+            check=False,
+        )
+        result.update(
+            {
+                "status": "completed",
+                "returncode": int(completed.returncode),
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+            }
+        )
+    except subprocess.TimeoutExpired as exc:
+        result.update(
+            {
+                "status": "timeout",
+                "timed_out": True,
+                "stdout": exc.stdout if isinstance(exc.stdout, str) else "",
+                "stderr": exc.stderr if isinstance(exc.stderr, str) else "",
+                "error": f"timed out after {float(timeout_seconds):.1f}s",
+            }
+        )
+    except Exception as exc:
+        result.update({"status": "failed", "error": str(exc)})
+    return result
+
+
+def _write_text_file(output_folder: str, filename: str, text: str) -> str:
+    os.makedirs(output_folder, exist_ok=True)
+    filepath = os.path.join(output_folder, filename)
+    with open(filepath, "w", encoding="utf-8") as file:
+        file.write(text)
+    return filepath
+
+
+def _requirements_header(report: Dict[str, Any], *, tested: bool) -> str:
+    lines = [
+        "# Generated by quspin_backend.run_quspin_compatibility_validation",
+        "# No packages were installed, upgraded, pinned, or changed by this code.",
+        f"# Python executable: {sys.executable}",
+        f"# Validation passed: {bool(report.get('passed', False))}",
+    ]
+    if tested:
+        lines.append("# This file was written only because the QuSpin compatibility validation passed.")
+    else:
+        lines.append("# Current environment freeze; this is not a recommendation.")
+    return "\n".join(lines) + "\n"
+
+
+def write_quspin_compatibility_requirement_files(
+    report: Dict[str, Any],
+    output_folder: str,
+    *,
+    write_current_freeze: bool,
+    write_tested_freeze: bool,
+) -> Dict[str, Any]:
+    """Write optional requirements snapshots from the active environment."""
+    files: Dict[str, Any] = {}
+    if not (write_current_freeze or write_tested_freeze):
+        return files
+    freeze = _pip_freeze()
+    files["pip_freeze"] = {
+        "status": freeze.get("status"),
+        "returncode": freeze.get("returncode"),
+        "stderr": freeze.get("stderr"),
+        "error": freeze.get("error"),
+        "timed_out": freeze.get("timed_out"),
+    }
+    freeze_text = str(freeze.get("stdout") or "")
+    if freeze.get("status") != "completed" or int(freeze.get("returncode") or 1) != 0:
+        freeze_text = (
+            "# pip freeze did not complete successfully.\n"
+            f"# status: {freeze.get('status')}\n"
+            f"# returncode: {freeze.get('returncode')}\n"
+            f"# error: {freeze.get('error')}\n"
+            "# stderr:\n"
+            f"{freeze.get('stderr') or ''}\n"
+            "# stdout:\n"
+            f"{freeze.get('stdout') or ''}\n"
+        )
+    if write_current_freeze:
+        files["requirements_current_freeze"] = _write_text_file(
+            output_folder,
+            "requirements-current-freeze.txt",
+            _requirements_header(report, tested=False) + freeze_text,
+        )
+    if write_tested_freeze:
+        if bool(report.get("passed", False)):
+            files["requirements_quspin_tested"] = _write_text_file(
+                output_folder,
+                "requirements-quspin-tested.txt",
+                _requirements_header(report, tested=True) + freeze_text,
+            )
+        else:
+            files["requirements_quspin_tested"] = {
+                "status": "not_written",
+                "reason": "QuSpin compatibility validation did not pass.",
+            }
+    return files
+
+
+def quspin_compatibility_cli_main(argv: Sequence[str] | None = None) -> int:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    parser = argparse.ArgumentParser(
+        description=(
+            "Validate the active QuSpin environment against the Yao-Lee ED backend. "
+            "This never installs or changes packages."
+        )
+    )
+    parser.add_argument("--output-folder", default=os.path.join(script_dir, "outputs", "profiling"))
+    parser.add_argument("--json", dest="json_path", default=None)
+    parser.add_argument("--write-current-freeze", action="store_true")
+    parser.add_argument("--write-tested-freeze", action="store_true")
+    parser.add_argument("--write-files", action="store_true")
+    args = parser.parse_args(argv)
+    output_folder = os.path.abspath(os.path.expanduser(str(args.output_folder)))
+    report = run_quspin_compatibility_validation()
+    report["output_folder"] = output_folder
+    report["files"] = write_quspin_compatibility_requirement_files(
+        report,
+        output_folder,
+        write_current_freeze=bool(args.write_current_freeze or args.write_files),
+        write_tested_freeze=bool(args.write_tested_freeze or args.write_files),
+    )
+    if args.json_path:
+        json_path = os.path.abspath(os.path.expanduser(str(args.json_path)))
+        os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
+        with open(json_path, "w", encoding="utf-8") as file:
+            json.dump(_compat_json_safe(report), file, indent=2, sort_keys=True)
+        report["json_report"] = json_path
+    print(json.dumps(_compat_json_safe(report), indent=2, sort_keys=True))
+    return 0 if bool(report.get("passed", False)) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(quspin_compatibility_cli_main())

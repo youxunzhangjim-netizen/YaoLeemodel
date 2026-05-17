@@ -7,6 +7,7 @@ The canonical work is split across sibling modules:
 - ed_backend.py: full ED plus bitwise total-Sz-conserved sparse ED.
 - tenax_backend.py: Tenax MPO/DMRG/iDMRG execution.
 - tenpy_backend.py: TeNPy YaoLeeSite/YaoLeeModel execution.
+- peps_backend.py: optional quimb.tensor PEPS/iPEPS execution.
 - analysis.py: phase scans, entropy, diagnostics, and summary helpers.
 - plot_outputs.py: plotting helpers.
 
@@ -16,11 +17,21 @@ main() binds the split modules before running so fixes stay shared by owner.
 
 from __future__ import annotations
 import argparse
+import copy
 import importlib.util
 import json
 import math
 import os
+import time
+import warnings
 from typing import Any, Callable, Dict, List, Tuple
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"pkg_resources is deprecated as an API\..*",
+    category=UserWarning,
+    module=r"llvmlite\.binding\.ffi",
+)
 
 import numpy as np
 
@@ -29,26 +40,31 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # ----------------------------------------------------------------------
 # Configuration (edit this top block for normal runs)
 # ----------------------------------------------------------------------
-# Resource profiles.
-# Edit ACTIVE_RESOURCE_PROFILE to switch all geometry/DMRG/ED/iDMRG defaults
-# together. Keep larger aragorn/beehive choices on the command line or in a new
-# profile so local/shared-machine runs stay polite by default.
-#
-# Geometry tuning uses four independent options everywhere:
-#   length_x, length_y: number of unit cells.
-#   circumference_x, circumference_y: whether x/y boundaries are closed.
+# ACTIVE_RESOURCE_PROFILE: local_laptop | shared_workstation
 LOCAL_LAPTOP_SETTINGS = {
     "geometry": {
         "length_x": 2,
         "length_y": 2,
-        "circumference_x": True,
-        "circumference_y": True,
+        "circumference_x": 1,
+        "circumference_y": 1,
         "lattice_type": "honeycomb",
     },
     "finite_dmrg": {
         "max_sites": 18,
         "max_bond_dimension": 64,
-        "max_sweeps": 10,
+        "max_sweeps": 20,
+        "svd_min": 1.0e-10,
+    },
+    "finite_peps": {
+        "max_sites": 18,
+        "max_bond_dimension": 4,
+        "bond_dimension_cap": 6,
+        "max_sweeps": 40,
+        "sweep_cap": 160,
+        "ctm_chi": 64,
+        "ctm_chi_cap": 96,
+        "tau": 0.1,
+        "entropy_max_dense_dim": 262144,
     },
     "ed": {
         "run": True,
@@ -72,10 +88,21 @@ LOCAL_LAPTOP_SETTINGS = {
     },
     "idmrg": {
         "run": True,
-        "max_bond_dimension": 32,
-        "max_iterations": 10,
+        "max_bond_dimension": 64,
+        "max_iterations": 60,
         "max_local_dim": 16,
         "bulk_kind": "auto",
+        "svd_min": 1.0e-10,
+    },
+    "ipeps": {
+        "max_unit_cell_sites": 18,
+        "max_bond_dimension": 4,
+        "bond_dimension_cap": 6,
+        "max_iterations": 80,
+        "iteration_cap": 160,
+        "ctm_chi": 64,
+        "ctm_chi_cap": 96,
+        "tau": 0.1,
     },
 }
 
@@ -83,14 +110,26 @@ SHARED_WORKSTATION_SETTINGS = {
     "geometry": {
         "length_x": 3,
         "length_y": 3,
-        "circumference_x": True,
-        "circumference_y": True,
+        "circumference_x": 1,
+        "circumference_y": 1,
         "lattice_type": "honeycomb",
     },
     "finite_dmrg": {
         "max_sites": 32,
         "max_bond_dimension": 128,
-        "max_sweeps": 20,
+        "max_sweeps": 60,
+        "svd_min": 1.0e-10,
+    },
+    "finite_peps": {
+        "max_sites": 32,
+        "max_bond_dimension": 6,
+        "bond_dimension_cap": 8,
+        "max_sweeps": 120,
+        "sweep_cap": 240,
+        "ctm_chi": 96,
+        "ctm_chi_cap": 160,
+        "tau": 0.1,
+        "entropy_max_dense_dim": 1048576,
     },
     "ed": {
         "run": True,
@@ -114,10 +153,21 @@ SHARED_WORKSTATION_SETTINGS = {
     },
     "idmrg": {
         "run": True,
-        "max_bond_dimension": 32,
-        "max_iterations": 40,
+        "max_bond_dimension": 96,
+        "max_iterations": 60,
         "max_local_dim": 16,
         "bulk_kind": "auto",
+        "svd_min": 1.0e-10,
+    },
+    "ipeps": {
+        "max_unit_cell_sites": 32,
+        "max_bond_dimension": 6,
+        "bond_dimension_cap": 8,
+        "max_iterations": 120,
+        "iteration_cap": 240,
+        "ctm_chi": 96,
+        "ctm_chi_cap": 160,
+        "tau": 0.1,
     },
 }
 
@@ -129,55 +179,34 @@ RESOURCE_PROFILES = {
 
 ACTIVE_RESOURCE_PROFILE = "local_laptop"  # local_laptop | shared_workstation
 
-# Change this one line when you want to force the DMRG/tensor-network backend:
-#   "tenax" -> JAX/Tenax path
-#   "tenpy" -> TeNPy U(1) Yao-Lee template path
-#   "auto"  -> try Tenax first, then compatible TeNPy fallback
-BACKEND = "tenpy"  # auto | tenax | tenpy
+BACKEND = "tenpy"  # auto | tenax | tenpy | quimb
+METHOD = "dmrg"  # auto | dmrg | idmrg | peps | ipeps
 
-# - yao_lee: spin/orbital model using spin-dot and orbital-compass bonds:
-#       J[(1+beta) S_i.S_j + (1-beta) T_i^gamma T_j^gamma + alpha (S_i.S_j)(T_i^gamma T_j^gamma)].
-#       This conserves total spin Sz and does not conserve orbital tau_z.
-# - ising_like: every bond uses the single ISING_AXIS channel.
-# - heisenberg/xy/xxz/xyz: spin-only benchmark models; set ORBITAL_REP=0.
-# - orbital_rep=0: removes orbital DOF and reduces yao_lee to spin-only Ising-like bonds.
-MODEL_FAMILY = "yao_lee"    # yao_lee | ising_like | heisenberg | xy | xxz | xyz
-SPIN_REP = "1/2"            # 1/2 | 3/2
-ORBITAL_REP = "1/2"         # 0 | 1/2 ; CLI also accepts legacy alias 1 -> 0
-ISING_AXIS = "z"            # x | y | z
+MODEL_FAMILY = "yao_lee"  # yao_lee | ising_like | heisenberg | xy | xxz | xyz
+SPIN_REP = "1/2"  # 1/2 | 3/2
+ORBITAL_REP = "1/2"  # 0 | 1/2
+ISING_AXIS = "z"  # x | y | z
 ALPHA = 1.0
 BETA = 0.5
-COUPLING_J = 1.0          # overall exchange scale; zero gives a deliberately empty Hamiltonian
-JX = 1.0                    # simple XY/XXZ/XYZ benchmark coupling multiplier
+COUPLING_J = 1.0
+JX = 1.0
 JY = 1.0
 JZ = 1.0
 
-# External spin Zeeman field / perturbation.
-# eg orbital angular momentum is taken as L=0, so the field couples only to spin:
-#   H_Z = FIELD_SIGN * MU_B * SIGMA_FACTOR * sum_i (hx*Sx_i + hy*Sy_i + hz*Sz_i)
-# SIGMA_FACTOR=2 maps sigma=2S for spin-1/2. Keep this explicit if exploring spin=3/2.
-# treatment:
-# - perturbation: recorded and annotated, but not inserted into the MPO/ED Hamiltonian.
-# - hamiltonian: inserted as one-site terms; use symmetry_mode=none for hx/hy fields.
 EXTERNAL_FIELD_TREATMENT = "off"  # off | perturbation | hamiltonian
-EXTERNAL_FIELD_AXIS = "custom"                # 111 | custom
-EXTERNAL_FIELD_STRENGTH = 1.0              # used for axis=111 as H/sqrt(3)*(1,1,1)
-FIELD_HX = 0.0                             # used for axis=custom
+EXTERNAL_FIELD_AXIS = "111"  # 111 | 001 | custom
+EXTERNAL_FIELD_STRENGTH = 1.0
+FIELD_HX = 0.0
 FIELD_HY = 0.0
 FIELD_HZ = 1.0
 MU_B = 1.0
-FIELD_SIGN = 1.0
-FIELD_SIGMA_FACTOR = 2.0
+FIELD_SIGN = -1.0
+FIELD_SIGMA_FACTOR = 1.0
 
-# Shared symmetry simplification/block-sparse controls.
-# SYMMETRY_REDUCTIONS is additive: combine any of "sz", "tz", and "z2".
-# "auto" asks the precheck to enable every conserved/reachable reduction that a
-# method can implement. Old CLI values like --symmetry-mode u1_sz are still
-# accepted, but normal runs should edit only SYMMETRY_REDUCTIONS.
-SYMMETRY_REDUCTIONS = ("sz","z2")  # auto | none | sz | tz | z2 ; e.g. ("sz", "tz", "z2")
-U1_TARGET_TOTAL_SZ2 = 0     # equals 2 * total S^z; neutral sector is usually 0
-U1_TARGET_TOTAL_TZ2 = 0     # equals 2 * total tau^z/T^z; neutral sector is usually 0
-Z2_TARGET_PARITY = 0        # 0=even, 1=odd
+SYMMETRY_REDUCTIONS = ("tz", "z2")  # auto | none | sz | tz | z2
+U1_TARGET_TOTAL_SZ2 = 0
+U1_TARGET_TOTAL_TZ2 = 0
+Z2_TARGET_PARITY = 0  # 0 | 1
 STRICT_SYMMETRY_SELECTION_RULES = True
 SYMMETRY_PRECHECK = True
 STRICT_SYMMETRY_PRECHECK = True
@@ -187,56 +216,46 @@ TRUNCATION_CUTOFF = 1e-8
 SEED = 42
 INITIAL_STATE_STYLE = "random"  # alternating | random
 
-# Optional comparison workflows.
-ED_BACKEND = "quspin"  # standard | quspin ; CLI also accepts ed -> standard
+ED_BACKEND = "quspin"  # standard | quspin
+ED_SYMMETRY_ENGINE = "quspin"  # auto | standard_projector | quspin/quspin_native | quspin_experimental_c3
+ED_QUSPIN_EXPERIMENTAL_FUSED_TRANSLATION = False
+ED_C3_MODE = "off"  # auto | off | on
+ED_C3_Q_BLOCKS = "all"  # all | 0 | 1 | 2
+ED_Z2_MODE = "auto"  # auto | off | on
+ED_Z2_KIND = "auto"  # auto | spin_flip | spin_pi_z
 SZ_CONSERVED_ED_EIGENSTATES = 3
 CHECK_GROUND_STATE_DEGENERACY = True
 ED_GROUND_MANIFOLD_ABS_TOL = 1e-12
 ED_GROUND_MANIFOLD_REL_TOL = 1e-12
+
 DMRG_EXCITED_OVERLAP_TOL = 1e-6
 DMRG_EXCITED_ENERGY_TOL = 1e-7
 DMRG_EXCITED_VARIANCE_TOL = 1e-7
 DMRG_EXCITED_MAX_ATTEMPTS = 10
 
-# Spatial symmetry reductions are shared options. A backend uses them only when
-# it has an implementation for that block and the geometry supports it.  For a
-# honeycomb cylinder, x is usually open while y is periodic; keep the directions
-# independent so the valid y momentum block can still be used.
-USE_TRANSLATION_X_BLOCK = 0
-USE_TRANSLATION_Y_BLOCK = 0
+USE_TRANSLATION_X_BLOCK = 1
+USE_TRANSLATION_Y_BLOCK = 1
 MOMENTUM_X_BLOCK = 0
 MOMENTUM_Y_BLOCK = 0
 USE_REFLECTION_BLOCK = 0
-REFLECTION_BLOCK = 0  # Reflection/C3 is unsafe for bond-directional Yao-Lee unless a gauge map is implemented.
+REFLECTION_BLOCK = 0
 QUSPIN_CHECK_SYMMETRIES = False
 QUSPIN_CHECK_HERMITICITY = True
 QUSPIN_CHECK_PARTICLE_CONSERVATION = False
 
-# Optional alpha-beta phase diagrams.
-# PHASE_DIAGRAM_ENABLED is the single switch for both scan calculation and plot
-# output.
-# PHASE_SCAN_MODE chooses which physics level to scan:
-#   quantum   -> run the quantum methods listed in PHASE_SCAN_METHODS.
-#   classical -> run only the classical product-state scan.
-#   both      -> run the quantum methods plus the classical product-state scan.
-# PHASE_SCAN_METHODS chooses quantum solvers only. Use any comma-separated
-# subset of ed, dmrg, idmrg, or use all for every quantum solver.
-PHASE_SCAN_ONLY = 0
-PHASE_DIAGRAM_ENABLED = 1 or PHASE_SCAN_ONLY
-RUN_PHASE_SCAN = PHASE_DIAGRAM_ENABLED or PHASE_SCAN_ONLY
+PHASE_SCAN_ONLY = 1
+PHASE_DIAGRAM_ENABLED = 1
+RUN_PHASE_SCAN = bool(PHASE_DIAGRAM_ENABLED) or bool(PHASE_SCAN_ONLY)
 
-PHASE_SCAN_MODE = "quantum"    # quantum | classical | both
-PHASE_SCAN_METHODS = "dmrg"    # ed | dmrg | idmrg | all
-# Phase-scan ED uses the same SYMMETRY_REDUCTIONS and target-sector options as
-# single-point ED. For spin+orbital N=18, even the reduced dimension
-# C(18,9)*2^18 = 12,745,441,280 exceeds the default cap; use
-# length_x=2, length_y=3, circumference_x=False, circumference_y=True
-# (N=12 for honeycomb) or smaller for quantum ED scans.
-PHASE_SCAN_ALPHA_MIN = 0.0
+PHASE_SCAN_MODE = "quantum"  # quantum | classical | both
+PHASE_SCAN_METHODS = "ed"  # ed | dmrg | idmrg | peps | ipeps | all
+PHASE_SCAN_CHANNELS = "normal"  # auto | none | normal | external | both
+EXTERNAL_SCAN_MODE = "e_b"  # none | e_b | alpha_b_classical | alpha_b_quantum | alpha_b_both | alpha_b_all
+PHASE_SCAN_ALPHA_MIN = -0.25
 PHASE_SCAN_ALPHA_MAX = 2.25
 PHASE_SCAN_ALPHA_POINTS = 17
-PHASE_SCAN_BETA_MIN = 0.0
-PHASE_SCAN_BETA_MAX = 0.27
+PHASE_SCAN_BETA_MIN = -0.25
+PHASE_SCAN_BETA_MAX = 2.25
 PHASE_SCAN_BETA_POINTS = 13
 PHASE_SCAN_CLASSICAL_RESTARTS = 6
 PHASE_SCAN_CLASSICAL_SWEEPS = 320
@@ -252,25 +271,58 @@ PHASE_SCAN_CLASSICAL_NEMATICITY_THRESHOLD = 0.08
 PHASE_SCAN_PLAQUETTE_FLUX_TARGET = 1.0
 PHASE_SCAN_PLAQUETTE_FLUX_TOLERANCE = 0.15
 
-# Output/runtime behavior.
-OUTPUT_FOLDER = os.path.join(SCRIPT_DIR, "outputs")
+EXTERNAL_SCAN_FIELD_MIN = -0.5
+EXTERNAL_SCAN_FIELD_MAX = 2.0
+EXTERNAL_SCAN_FIELD_POINTS = PHASE_SCAN_BETA_POINTS
+EXTERNAL_SCAN_ED_BANDS = 5
+
+OUTPUT_FOLDER = "outputs"
 OVERWRITE_EXISTING_PLOTS = True
 CONTINUE_AFTER_PLOT_ERROR = True
 STRICT_PLOT_ERRORS = not CONTINUE_AFTER_PLOT_ERROR
 SHOW_PROGRESS = True
 
-# Observable calculation controls.
-# Calculation flags decide whether expensive post-processing is performed.
-# Plot flags decide whether an already-computed observable is written as PNG.
+PROFILE_ENABLED = False
+PROFILE_TIMING = True
+PROFILE_MEMORY = True
+PROFILE_CPROFILE = False
+PROFILE_LINE_HOOKS = False
+PROFILE_SCAN_POINTS = True
+PROFILE_OUTPUT_JSON = True
+PROFILE_OUTPUT_FOLDER = "outputs/profiling"
+
+
+def _resolve_output_folder(output_folder: str | None) -> str:
+    """Resolve output folders to the canonical folder beside this script.
+
+    Normal runs should write to ``<repo>/DMRG/outputs``.  If a user launches
+    from inside ``DMRG`` and passes ``--output-folder DMRG/outputs``, collapse
+    the accidental duplicate path ``DMRG/DMRG/outputs`` back to the canonical
+    sibling output folder.
+    """
+    raw_folder = OUTPUT_FOLDER if output_folder is None else str(output_folder)
+    expanded_folder = os.path.expanduser(raw_folder)
+    if os.path.isabs(expanded_folder):
+        candidate = os.path.abspath(expanded_folder)
+    else:
+        candidate = os.path.abspath(os.path.join(SCRIPT_DIR, expanded_folder))
+    script_name = os.path.basename(SCRIPT_DIR)
+    duplicate_root = os.path.abspath(os.path.join(SCRIPT_DIR, script_name))
+    if candidate == duplicate_root or candidate.startswith(duplicate_root + os.sep):
+        candidate = os.path.abspath(
+            os.path.join(os.path.dirname(SCRIPT_DIR), os.path.relpath(candidate, SCRIPT_DIR))
+        )
+    return candidate
+
 CALCULATE_CORRELATIONS = True
 CALCULATE_BOND_ENERGIES = True
 CALCULATE_STRUCTURE_FACTORS = True
 CALCULATE_ENTANGLEMENT = True
 CALCULATE_UNIFORM_OBSERVABLES = True
 CALCULATE_REAL_SPACE_PATTERNS = True
-REFERENCE_SITE_IDX = None  # None chooses the site closest to the geometric center.
+REFERENCE_SITE_IDX = None
 
-PLOT_GEOMETRY = True
+PLOT_GEOMETRY = 0
 PLOT_BOND_ENERGIES = True
 PLOT_STRUCTURE_FACTORS = True
 PLOT_CORRELATION_HEATMAPS = True
@@ -279,27 +331,37 @@ PLOT_ENTANGLEMENT = True
 PLOT_ENERGY_COMPARISON = True
 PLOT_LOW_ENERGY_SPECTRUM = True
 PLOT_FINITE_TEMPERATURE = True
-PLOT_PHASE_SCAN = PHASE_DIAGRAM_ENABLED
+PLOT_PHASE_SCAN = RUN_PHASE_SCAN
 
 # ----------------------------------------------------------------------
 # Derived/profile-linked defaults and available choices
 # ----------------------------------------------------------------------
 
-# Values below are linked to ACTIVE_RESOURCE_PROFILE or used only as parser
-# choice tables. Keep normal run edits in the option block above.
 ACTIVE_RESOURCE_SETTINGS = RESOURCE_PROFILES[ACTIVE_RESOURCE_PROFILE]
 
-# Geometry defaults from ACTIVE_RESOURCE_SETTINGS.
 LENGTH_X = int(ACTIVE_RESOURCE_SETTINGS["geometry"]["length_x"])
 LENGTH_Y = int(ACTIVE_RESOURCE_SETTINGS["geometry"]["length_y"])
 CIRCUMFERENCE_X = bool(ACTIVE_RESOURCE_SETTINGS["geometry"]["circumference_x"])
 CIRCUMFERENCE_Y = bool(ACTIVE_RESOURCE_SETTINGS["geometry"]["circumference_y"])
 LATTICE_TYPE = str(ACTIVE_RESOURCE_SETTINGS["geometry"]["lattice_type"])  # honeycomb | square | triangular
 
-# Resource-limited solver defaults from ACTIVE_RESOURCE_SETTINGS.
 MAX_DMRG_SITES = int(ACTIVE_RESOURCE_SETTINGS["finite_dmrg"]["max_sites"])
 MAX_BOND_DIMENSION = int(ACTIVE_RESOURCE_SETTINGS["finite_dmrg"]["max_bond_dimension"])
 MAX_SWEEPS = int(ACTIVE_RESOURCE_SETTINGS["finite_dmrg"]["max_sweeps"])
+DMRG_SVD_MIN = float(ACTIVE_RESOURCE_SETTINGS["finite_dmrg"].get("svd_min", 1.0e-10))
+
+MAX_PEPS_SITES = int(ACTIVE_RESOURCE_SETTINGS["finite_peps"]["max_sites"])
+PEPS_MAX_BOND_DIMENSION = int(ACTIVE_RESOURCE_SETTINGS["finite_peps"]["max_bond_dimension"])
+PEPS_BOND_DIMENSION_CAP = int(ACTIVE_RESOURCE_SETTINGS["finite_peps"]["bond_dimension_cap"])
+PEPS_MAX_SWEEPS = int(ACTIVE_RESOURCE_SETTINGS["finite_peps"]["max_sweeps"])
+PEPS_SWEEP_CAP = int(ACTIVE_RESOURCE_SETTINGS["finite_peps"]["sweep_cap"])
+PEPS_CTM_CHI = int(ACTIVE_RESOURCE_SETTINGS["finite_peps"]["ctm_chi"])
+PEPS_CTM_CHI_CAP = int(ACTIVE_RESOURCE_SETTINGS["finite_peps"]["ctm_chi_cap"])
+PEPS_TAU = float(ACTIVE_RESOURCE_SETTINGS["finite_peps"]["tau"])
+PEPS_ENTANGLEMENT_MAX_DENSE_DIM = int(ACTIVE_RESOURCE_SETTINGS["finite_peps"]["entropy_max_dense_dim"])
+PEPS_SYMMETRY_MODE = "auto"  # auto | none | u1_tz | u1_tz_z2
+PEPS_STRICT_SYMMETRY = True
+PEPS_ALLOW_DENSE_FALLBACK = True
 
 RUN_ED = bool(ACTIVE_RESOURCE_SETTINGS["ed"]["run"])
 MAX_ED_SITES = int(ACTIVE_RESOURCE_SETTINGS["ed"]["max_sites"])
@@ -324,6 +386,30 @@ IDMRG_MAX_BOND_DIMENSION = int(ACTIVE_RESOURCE_SETTINGS["idmrg"]["max_bond_dimen
 IDMRG_MAX_ITERATIONS = int(ACTIVE_RESOURCE_SETTINGS["idmrg"]["max_iterations"])
 IDMRG_MAX_LOCAL_DIM = int(ACTIVE_RESOURCE_SETTINGS["idmrg"]["max_local_dim"])
 IDMRG_BULK_KIND = str(ACTIVE_RESOURCE_SETTINGS["idmrg"]["bulk_kind"])  # auto | pair | single
+IDMRG_SVD_MIN = float(ACTIVE_RESOURCE_SETTINGS["idmrg"].get("svd_min", DMRG_SVD_MIN))
+IDMRG_USE_TRANSLATION_SYMMETRY = True
+
+MAX_IPEPS_UNIT_CELL_SITES = int(ACTIVE_RESOURCE_SETTINGS["ipeps"]["max_unit_cell_sites"])
+IPEPS_MAX_BOND_DIMENSION = int(ACTIVE_RESOURCE_SETTINGS["ipeps"]["max_bond_dimension"])
+IPEPS_BOND_DIMENSION_CAP = int(ACTIVE_RESOURCE_SETTINGS["ipeps"]["bond_dimension_cap"])
+IPEPS_MAX_ITERATIONS = int(ACTIVE_RESOURCE_SETTINGS["ipeps"]["max_iterations"])
+IPEPS_ITERATION_CAP = int(ACTIVE_RESOURCE_SETTINGS["ipeps"]["iteration_cap"])
+IPEPS_CTM_CHI = int(ACTIVE_RESOURCE_SETTINGS["ipeps"]["ctm_chi"])
+IPEPS_CTM_CHI_CAP = int(ACTIVE_RESOURCE_SETTINGS["ipeps"]["ctm_chi_cap"])
+IPEPS_TAU = float(ACTIVE_RESOURCE_SETTINGS["ipeps"]["tau"])
+IPEPS_SYMMETRY_MODE = "auto"  # auto | none | u1_tz | u1_tz_z2
+IPEPS_STRICT_SYMMETRY = True
+IPEPS_ALLOW_DENSE_FALLBACK = True
+IPEPS_UNIT_CELL_KIND = "auto"  # auto | minimal | two_sublattice | stripy | zigzag | plaquette
+IPEPS_USE_TRANSLATION_SYMMETRY = True
+IPEPS_CONTRACTION_METHOD = "ctmrg"  # auto | ctmrg | crtg | boundary
+IPEPS_UNIT_CELL_CANDIDATES = (
+    "minimal",
+    "two_sublattice",
+    "stripy",
+    "zigzag",
+    "plaquette",
+)
 
 PHASE_SCAN_ED_MAX_SITES = int(ACTIVE_RESOURCE_SETTINGS["ed"]["max_sites"])
 PHASE_SCAN_ED_MAX_HILBERT_DIM = int(ACTIVE_RESOURCE_SETTINGS["ed"]["max_hilbert_dim"])
@@ -336,18 +422,54 @@ SPIN_REP_OPTIONS = ("1/2", "3/2")
 ORBITAL_REP_OPTIONS = ("0", "1/2")
 AXIS_OPTIONS = ("x", "y", "z")
 INITIAL_STATE_OPTIONS = ("alternating", "random")
-SYMMETRY_MODE_OPTIONS = ("none", "auto", "u1", "u1_sz", "u1_tz", "z2")
-SYMMETRY_REDUCTION_OPTIONS = ("auto", "none", "sz", "tz", "z2", "u1", "u1_sz", "u1_tz")
+SYMMETRY_MODE_OPTIONS = ("none", "auto", "u1", "u1_sz", "u1_tz", "z2", "u1_tz_z2", "tz_z2")
+SYMMETRY_REDUCTION_OPTIONS = ("auto", "none", "sz", "tz", "z2", "u1", "u1_sz", "u1_tz", "u1_tz_z2", "tz_z2")
+PEPS_SYMMETRY_MODE_OPTIONS = ("auto", "none", "u1_tz", "u1_tz_z2")
+IPEPS_SYMMETRY_MODE_OPTIONS = PEPS_SYMMETRY_MODE_OPTIONS
+IPEPS_UNIT_CELL_KIND_OPTIONS = ("auto",) + IPEPS_UNIT_CELL_CANDIDATES
+IPEPS_CONTRACTION_METHOD_OPTIONS = ("auto", "ctmrg", "crtg", "boundary")
 U1_CHARGE_TZ_STRIDE = 4096
 Z2_PARITY_OPTIONS = (0, 1)
 IDMRG_BULK_KIND_OPTIONS = ("auto", "pair", "single")
-BACKEND_OPTIONS = ("auto", "tenax", "tenpy")
+BACKEND_OPTIONS = ("auto", "tenax", "tenpy", "quimb")
 ED_BACKEND_OPTIONS = ("standard", "ed", "quspin")
 ED_SOLVER_OPTIONS = ("auto", "sparse", "dense")
+ED_SYMMETRY_ENGINE_OPTIONS = (
+    "auto",
+    "standard_projector",
+    "quspin_native",
+    "quspin",  # readable alias for quspin_native
+    "quspin_experimental_c3",
+    "projector",  # legacy alias for standard_projector
+)
+ED_C3_MODE_OPTIONS = ("auto", "off", "on")
+ED_C3_Q_BLOCK_OPTIONS = ("all", "0", "1", "2")
+ED_Z2_MODE_OPTIONS = ("auto", "off", "on")
+ED_Z2_KIND_OPTIONS = ("auto", "spin_flip", "spin_pi_z")
 EXTERNAL_FIELD_TREATMENT_OPTIONS = ("off", "perturbation", "hamiltonian")
-EXTERNAL_FIELD_AXIS_OPTIONS = ("custom", "111")
-PHASE_SCAN_QUANTUM_METHOD_OPTIONS = ("ed", "dmrg", "idmrg")
+EXTERNAL_FIELD_AXIS_OPTIONS = ("custom", "111", "001")
+PHASE_SCAN_QUANTUM_METHOD_OPTIONS = ("ed", "dmrg", "idmrg", "peps", "ipeps")
 PHASE_SCAN_METHOD_OPTIONS = PHASE_SCAN_QUANTUM_METHOD_OPTIONS + ("all",)
+PHASE_SCAN_CHANNEL_OPTIONS = ("auto", "none", "normal", "external", "both")
+EXTERNAL_SCAN_MODE_OPTIONS = (
+    "none",
+    "e_b",
+    "alpha_b_classical",
+    "alpha_b_quantum",
+    "alpha_b_both",
+    "alpha_b_all",
+)
+CALCULATION_METHOD_OPTIONS = (
+    "auto",
+    "dmrg",
+    "idmrg",
+    "peps",
+    "ipeps",
+    "finite_peps",
+    "infinite_peps",
+    "quimb_peps",
+    "quimb_ipeps",
+)
 PHASE_SCAN_MODE_OPTIONS = (
     "quantum",
     "classical",
@@ -364,18 +486,25 @@ PHASE_SCAN_MODE_OPTIONS = (
     "finite_dmrg",
     "idmrg",
     "infinite_dmrg",
+    "peps",
+    "finite_peps",
+    "ipeps",
+    "infinite_peps",
     "tenax_dmrg",
     "tenax_idmrg",
     "tenpy_dmrg",
     "tenpy_idmrg",
+    "quimb_peps",
+    "quimb_ipeps",
 )
 REFLECTION_BLOCK_OPTIONS = (-1, 0, 1)
 ENTROPY_ORDERS = (1, 2, 3, 4)
 
 # Runtime implementation symbols are imported from sibling modules by
-# _bind_split_module_implementations(). Keep implementation work in:
-# models.py, ed_backend.py, tenax_backend.py, tenpy_backend.py, analysis.py,
-# and plot_outputs.py.
+# _bind_split_module_implementations(); optional PEPS code is loaded lazily
+# only when selected. Keep implementation work in: models.py, ed_backend.py,
+# tenax_backend.py, tenpy_backend.py, peps_backend.py, analysis.py, and
+# plot_outputs.py.
 # ----------------------------------------------------------------------
 # CLI + main
 # ----------------------------------------------------------------------
@@ -436,7 +565,9 @@ def parse_command_line() -> argparse.Namespace:
         type=str,
         choices=list(MODEL_FAMILY_OPTIONS),
         default=MODEL_FAMILY,
-        help="Hamiltonian family. With orbital_rep=0, yao_lee automatically reduces to spin-only Ising-like couplings.",
+        help=(
+            "Hamiltonian family. yao_lee uses the paper Eq. 7 spin-orbital bond formula."
+        ),
     )
     parser.add_argument(
         "--ising-axis",
@@ -455,7 +586,8 @@ def parse_command_line() -> argparse.Namespace:
         help=(
             "Additive shared symmetry reductions for ED/QuSpin/DMRG. "
             "Use comma-separated values from: auto, none, sz, tz, z2. "
-            "Aliases u1/u1_sz/u1_tz are accepted."
+            "For no-field Yao-Lee QuSpin ED, use tz,z2 for orbital Tz plus spin-flip Z2. "
+            "Aliases u1/u1_sz/u1_tz/u1_tz_z2 are accepted."
         ),
     )
     parser.add_argument(
@@ -466,7 +598,7 @@ def parse_command_line() -> argparse.Namespace:
         choices=list(SYMMETRY_MODE_OPTIONS),
         default=None,
         help=(
-            "Legacy single symmetry shortcut. Prefer --symmetry-reductions to combine sz/tz/z2."
+            "Legacy symmetry shortcut. Prefer --symmetry-reductions to combine sz/tz/z2."
         ),
     )
     parser.add_argument(
@@ -615,7 +747,10 @@ def parse_command_line() -> argparse.Namespace:
         type=str,
         choices=list(EXTERNAL_FIELD_AXIS_OPTIONS),
         default=EXTERNAL_FIELD_AXIS,
-        help="External field direction source: 111 uses H/sqrt(3)*(1,1,1); custom uses hx/hy/hz.",
+        help=(
+            "External field direction source: 111 uses H/sqrt(3)*(1,1,1); "
+            "001 uses H*(0,0,1); custom uses hx/hy/hz."
+        ),
     )
     parser.add_argument(
         "--external-field-strength",
@@ -623,7 +758,7 @@ def parse_command_line() -> argparse.Namespace:
         dest="external_field_strength",
         type=float,
         default=EXTERNAL_FIELD_STRENGTH,
-        help="Field magnitude H used when external_field_axis=111.",
+        help="Field magnitude H used when external_field_axis is 111 or 001.",
     )
     parser.add_argument("--field-hx", "--field_hx", dest="field_hx", type=float, default=FIELD_HX)
     parser.add_argument("--field-hy", "--field_hy", dest="field_hy", type=float, default=FIELD_HY)
@@ -636,15 +771,20 @@ def parse_command_line() -> argparse.Namespace:
         dest="field_sigma_factor",
         type=float,
         default=FIELD_SIGMA_FACTOR,
-        help="Multiplier converting spin operators to sigma; use 2 for sigma=2S in spin-1/2.",
+        help=(
+            "Multiplier on spin operators in the Zeeman term. The default 1 uses physical "
+            "spin S; use 2 only for an explicit Pauli sigma convention."
+        ),
     )
     parser.add_argument(
         "--max-bond-dimension",
         "--max_bond_dimension",
+        "--dmrg-final-max-bond-dimension",
+        "--dmrg_final_max_bond_dimension",
         dest="max_bond_dimension",
         type=int,
         default=MAX_BOND_DIMENSION,
-        help="Finite-DMRG maximum bond dimension.",
+        help="Finite-DMRG final maximum bond dimension after warmup.",
     )
     parser.add_argument(
         "--max-dmrg-sites",
@@ -657,14 +797,129 @@ def parse_command_line() -> argparse.Namespace:
             "for aragorn/beehive runs."
         ),
     )
-    parser.add_argument("--max-sweeps", "--max_sweeps", dest="max_sweeps", type=int, default=MAX_SWEEPS)
+    parser.add_argument(
+        "--max-sweeps",
+        "--max_sweeps",
+        dest="max_sweeps",
+        type=int,
+        default=MAX_SWEEPS,
+        help="Finite-DMRG maximum sweep count.",
+    )
+    parser.add_argument(
+        "--dmrg-svd-min",
+        "--dmrg_svd_min",
+        dest="dmrg_svd_min",
+        type=float,
+        default=DMRG_SVD_MIN,
+        help=(
+            "Finite-DMRG SVD singular-value truncation threshold passed as TeNPy "
+            "trunc_params['svd_min']; set 0 to disable this floor."
+        ),
+    )
+    parser.add_argument(
+        "--max-peps-sites",
+        "--max_peps_sites",
+        dest="max_peps_sites",
+        type=int,
+        default=MAX_PEPS_SITES,
+        help="Finite-PEPS site safety cap, independent of finite-DMRG max sites.",
+    )
+    parser.add_argument(
+        "--peps-max-bond-dimension",
+        "--peps_max_bond_dimension",
+        dest="peps_max_bond_dimension",
+        type=int,
+        default=PEPS_MAX_BOND_DIMENSION,
+        help="Finite-PEPS virtual bond dimension D, independent of DMRG chi.",
+    )
+    parser.add_argument(
+        "--peps-bond-dimension-cap",
+        "--peps_bond_dimension_cap",
+        dest="peps_bond_dimension_cap",
+        type=int,
+        default=PEPS_BOND_DIMENSION_CAP,
+        help="Profile safety cap for finite-PEPS bond dimension; raise deliberately for larger devices.",
+    )
+    parser.add_argument(
+        "--peps-max-sweeps",
+        "--peps_max_sweeps",
+        dest="peps_max_sweeps",
+        type=int,
+        default=PEPS_MAX_SWEEPS,
+        help="Finite-PEPS Simple Update steps/sweeps, independent of DMRG sweeps.",
+    )
+    parser.add_argument(
+        "--peps-sweep-cap",
+        "--peps_sweep_cap",
+        dest="peps_sweep_cap",
+        type=int,
+        default=PEPS_SWEEP_CAP,
+        help="Profile safety cap for finite-PEPS Simple Update steps.",
+    )
+    parser.add_argument(
+        "--peps-ctm-chi",
+        "--peps_ctm_chi",
+        dest="peps_ctm_chi",
+        type=int,
+        default=PEPS_CTM_CHI,
+        help="Finite-PEPS boundary/CTMRG contraction chi.",
+    )
+    parser.add_argument(
+        "--peps-ctm-chi-cap",
+        "--peps_ctm_chi_cap",
+        dest="peps_ctm_chi_cap",
+        type=int,
+        default=PEPS_CTM_CHI_CAP,
+        help="Profile safety cap for finite-PEPS CTMRG chi.",
+    )
+    parser.add_argument(
+        "--peps-tau",
+        "--peps_tau",
+        dest="peps_tau",
+        type=float,
+        default=PEPS_TAU,
+        help="Finite-PEPS Simple Update imaginary-time step.",
+    )
+    parser.add_argument(
+        "--peps-entanglement-max-dense-dim",
+        "--peps_entanglement_max_dense_dim",
+        dest="peps_entanglement_max_dense_dim",
+        type=int,
+        default=PEPS_ENTANGLEMENT_MAX_DENSE_DIM,
+        help="Dense Hilbert-dimension cap for optional finite-PEPS entanglement post-processing.",
+    )
+    parser.add_argument(
+        "--peps-symmetry-mode",
+        "--peps_symmetry_mode",
+        dest="peps_symmetry_mode",
+        type=str,
+        choices=list(PEPS_SYMMETRY_MODE_OPTIONS),
+        default=PEPS_SYMMETRY_MODE,
+        help="Finite-PEPS tensor symmetry request: auto, none, u1_tz, or u1_tz_z2.",
+    )
+    parser.add_argument(
+        "--peps-strict-symmetry",
+        "--peps_strict_symmetry",
+        dest="peps_strict_symmetry",
+        action=argparse.BooleanOptionalAction,
+        default=PEPS_STRICT_SYMMETRY,
+        help="Raise when a requested finite-PEPS spin-sector Z2 tensor symmetry is unsupported.",
+    )
+    parser.add_argument(
+        "--peps-allow-dense-fallback",
+        "--peps_allow_dense_fallback",
+        dest="peps_allow_dense_fallback",
+        action=argparse.BooleanOptionalAction,
+        default=PEPS_ALLOW_DENSE_FALLBACK,
+        help="Allow finite PEPS to run dense when requested tensor symmetries are unsupported.",
+    )
     parser.add_argument(
         "--truncation-cutoff",
         "--truncation_cutoff",
         dest="truncation_cutoff",
         type=float,
         default=TRUNCATION_CUTOFF,
-        help="TeNPy truncation cutoff; Tenax backend may ignore it.",
+        help="Tensor truncation cutoff for TeNPy and quimb PEPS/iPEPS; Tenax backend may ignore it.",
     )
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument(
@@ -731,6 +986,68 @@ def parse_command_line() -> argparse.Namespace:
         choices=list(ED_SOLVER_OPTIONS),
         default=ED_SOLVER,
         help="ED eigensolver: sparse requests ARPACK eigsh, dense computes the full dense spectrum, auto keeps the legacy fallback.",
+    )
+    parser.add_argument(
+        "--ed-symmetry-engine",
+        "--ed_symmetry_engine",
+        dest="ed_symmetry_engine",
+        type=str,
+        choices=list(ED_SYMMETRY_ENGINE_OPTIONS),
+        default=ED_SYMMETRY_ENGINE,
+        help=(
+            "ED symmetry engine: auto chooses the fastest physically valid route; "
+            "standard_projector uses in-repo Tz/spin_pi_z/fused-translation/combined-C3 projectors; "
+            "quspin or quspin_native uses only QuSpin-representable symmetries; "
+            "quspin_experimental_c3 checks QuSpin custom-basis API support but rejects pure C3 maps for Yao-Lee."
+        ),
+    )
+    parser.add_argument(
+        "--ed-quspin-experimental-fused-translation",
+        "--ed_quspin_experimental_fused_translation",
+        dest="ed_quspin_experimental_fused_translation",
+        action=argparse.BooleanOptionalAction,
+        default=ED_QUSPIN_EXPERIMENTAL_FUSED_TRANSLATION,
+        help=(
+            "Experimental opt-in for a future QuSpin packed user_basis route implementing fused "
+            "spin-orbital translations with Tz. The current code probes API support but still "
+            "routes Tz+translation to standard_projector unless that path is implemented and covered by tests."
+        ),
+    )
+    parser.add_argument(
+        "--ed-c3-mode",
+        "--ed_c3_mode",
+        dest="ed_c3_mode",
+        type=str,
+        choices=list(ED_C3_MODE_OPTIONS),
+        default=ED_C3_MODE,
+        help="ED combined spin-lattice C3 projector request: auto, off, or on.",
+    )
+    parser.add_argument(
+        "--ed-c3-q-blocks",
+        "--ed_c3_q_blocks",
+        dest="ed_c3_q_blocks",
+        type=str,
+        choices=list(ED_C3_Q_BLOCK_OPTIONS),
+        default=ED_C3_Q_BLOCKS,
+        help="Combined C3 charge sectors for ED projector planning: all, 0, 1, or 2.",
+    )
+    parser.add_argument(
+        "--ed-z2-mode",
+        "--ed_z2_mode",
+        dest="ed_z2_mode",
+        type=str,
+        choices=list(ED_Z2_MODE_OPTIONS),
+        default=ED_Z2_MODE,
+        help="ED spin-sector Z2 projector request: auto, off, or on.",
+    )
+    parser.add_argument(
+        "--ed-z2-kind",
+        "--ed_z2_kind",
+        dest="ed_z2_kind",
+        type=str,
+        choices=list(ED_Z2_KIND_OPTIONS),
+        default=ED_Z2_KIND,
+        help="ED Z2 kind: auto, spin_flip, or spin_pi_z.",
     )
     parser.add_argument(
         "--use-sz-conserved",
@@ -999,10 +1316,23 @@ def parse_command_line() -> argparse.Namespace:
     parser.add_argument(
         "--idmrg-max-bond-dimension",
         "--idmrg_max_bond_dimension",
+        "--idmrg-final-max-bond-dimension",
+        "--idmrg_final_max_bond_dimension",
         dest="idmrg_max_bond_dimension",
         type=int,
         default=IDMRG_MAX_BOND_DIMENSION,
-        help="iDMRG maximum bond dimension, independent of finite-DMRG chi.",
+        help="iDMRG final maximum bond dimension after warmup, independent of finite-DMRG chi.",
+    )
+    parser.add_argument(
+        "--idmrg-svd-min",
+        "--idmrg_svd_min",
+        dest="idmrg_svd_min",
+        type=float,
+        default=IDMRG_SVD_MIN,
+        help=(
+            "iDMRG SVD singular-value truncation threshold passed as TeNPy "
+            "trunc_params['svd_min']; set 0 to disable this floor."
+        ),
     )
     parser.add_argument(
         "--idmrg-max-local-dim",
@@ -1022,12 +1352,139 @@ def parse_command_line() -> argparse.Namespace:
         help="How to extract iDMRG bulk MPO from finite MPO.",
     )
     parser.add_argument(
+        "--idmrg-use-translation-symmetry",
+        "--idmrg_use_translation_symmetry",
+        dest="idmrg_use_translation_symmetry",
+        action=argparse.BooleanOptionalAction,
+        default=IDMRG_USE_TRANSLATION_SYMMETRY,
+        help="Use the infinite translated MPS unit cell in iDMRG; disable to skip iDMRG translation benchmarks.",
+    )
+    parser.add_argument(
+        "--max-ipeps-unit-cell-sites",
+        "--max_ipeps_unit_cell_sites",
+        dest="max_ipeps_unit_cell_sites",
+        type=int,
+        default=MAX_IPEPS_UNIT_CELL_SITES,
+        help="iPEPS unit-cell site safety cap, independent of finite-DMRG and iDMRG caps.",
+    )
+    parser.add_argument(
+        "--ipeps-max-bond-dimension",
+        "--ipeps_max_bond_dimension",
+        dest="ipeps_max_bond_dimension",
+        type=int,
+        default=IPEPS_MAX_BOND_DIMENSION,
+        help="iPEPS virtual bond dimension D, independent of iDMRG chi.",
+    )
+    parser.add_argument(
+        "--ipeps-bond-dimension-cap",
+        "--ipeps_bond_dimension_cap",
+        dest="ipeps_bond_dimension_cap",
+        type=int,
+        default=IPEPS_BOND_DIMENSION_CAP,
+        help="Profile safety cap for iPEPS virtual bond dimension.",
+    )
+    parser.add_argument(
+        "--ipeps-max-iterations",
+        "--ipeps_max_iterations",
+        dest="ipeps_max_iterations",
+        type=int,
+        default=IPEPS_MAX_ITERATIONS,
+        help="iPEPS Simple Update iterations, independent of iDMRG iterations.",
+    )
+    parser.add_argument(
+        "--ipeps-iteration-cap",
+        "--ipeps_iteration_cap",
+        dest="ipeps_iteration_cap",
+        type=int,
+        default=IPEPS_ITERATION_CAP,
+        help="Profile safety cap for iPEPS Simple Update iterations.",
+    )
+    parser.add_argument(
+        "--ipeps-ctm-chi",
+        "--ipeps_ctm_chi",
+        dest="ipeps_ctm_chi",
+        type=int,
+        default=IPEPS_CTM_CHI,
+        help="iPEPS CTMRG/boundary contraction chi.",
+    )
+    parser.add_argument(
+        "--ipeps-ctm-chi-cap",
+        "--ipeps_ctm_chi_cap",
+        dest="ipeps_ctm_chi_cap",
+        type=int,
+        default=IPEPS_CTM_CHI_CAP,
+        help="Profile safety cap for iPEPS CTMRG chi.",
+    )
+    parser.add_argument(
+        "--ipeps-tau",
+        "--ipeps_tau",
+        dest="ipeps_tau",
+        type=float,
+        default=IPEPS_TAU,
+        help="iPEPS Simple Update imaginary-time step.",
+    )
+    parser.add_argument(
+        "--ipeps-symmetry-mode",
+        "--ipeps_symmetry_mode",
+        dest="ipeps_symmetry_mode",
+        type=str,
+        choices=list(IPEPS_SYMMETRY_MODE_OPTIONS),
+        default=IPEPS_SYMMETRY_MODE,
+        help="iPEPS tensor symmetry request: auto, none, u1_tz, or u1_tz_z2.",
+    )
+    parser.add_argument(
+        "--ipeps-strict-symmetry",
+        "--ipeps_strict_symmetry",
+        dest="ipeps_strict_symmetry",
+        action=argparse.BooleanOptionalAction,
+        default=IPEPS_STRICT_SYMMETRY,
+        help="Raise when a requested iPEPS spin-sector Z2 tensor symmetry is unsupported.",
+    )
+    parser.add_argument(
+        "--ipeps-allow-dense-fallback",
+        "--ipeps_allow_dense_fallback",
+        dest="ipeps_allow_dense_fallback",
+        action=argparse.BooleanOptionalAction,
+        default=IPEPS_ALLOW_DENSE_FALLBACK,
+        help="Allow iPEPS to run dense when requested tensor symmetries are unsupported.",
+    )
+    parser.add_argument(
+        "--ipeps-unit-cell-kind",
+        "--ipeps_unit_cell_kind",
+        dest="ipeps_unit_cell_kind",
+        type=str,
+        choices=list(IPEPS_UNIT_CELL_KIND_OPTIONS),
+        default=IPEPS_UNIT_CELL_KIND,
+        help="iPEPS variational unit-cell ansatz label, separate from internal tensor symmetry.",
+    )
+    parser.add_argument(
+        "--ipeps-use-translation-symmetry",
+        "--ipeps_use_translation_symmetry",
+        dest="ipeps_use_translation_symmetry",
+        action=argparse.BooleanOptionalAction,
+        default=IPEPS_USE_TRANSLATION_SYMMETRY,
+        help="Use a repeated translated iPEPS unit cell; disable to skip iPEPS and use finite PEPS instead.",
+    )
+    parser.add_argument(
+        "--ipeps-contraction-method",
+        "--ipeps_contraction_method",
+        "--ipeps-ctm-method",
+        "--ipeps_ctm_method",
+        "--ipeps-crtg-method",
+        "--ipeps_crtg_method",
+        dest="ipeps_contraction_method",
+        type=str,
+        choices=list(IPEPS_CONTRACTION_METHOD_OPTIONS),
+        default=IPEPS_CONTRACTION_METHOD,
+        help="iPEPS environment contraction option: ctmrg/crtg or boundary.",
+    )
+    parser.add_argument(
         "--phase-diagram",
         "--phase_diagram",
         dest="phase_diagram",
         action=argparse.BooleanOptionalAction,
         default=PHASE_DIAGRAM_ENABLED,
-        help="Combined switch: enable/disable both phase-scan calculation and phase-diagram plots.",
+        help="Combined switch: when enabled, always run, plot, and save the selected phase scans.",
     )
     parser.add_argument(
         "--run-phase-scan",
@@ -1043,7 +1500,10 @@ def parse_command_line() -> argparse.Namespace:
         dest="phase_scan_only",
         action=argparse.BooleanOptionalAction,
         default=PHASE_SCAN_ONLY,
-        help="Run only the alpha-beta phase scan and skip the single-point DMRG workflow.",
+        help=(
+            "Run only the alpha-beta phase scan and skip the single-point workflow; "
+            "this automatically enables phase-diagram plotting/saving."
+        ),
     )
     parser.add_argument(
         "--phase-scan-methods",
@@ -1054,8 +1514,8 @@ def parse_command_line() -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            "Comma-separated quantum phase-scan methods: ed, dmrg, idmrg, or all. "
-            "Used when --phase-scan-mode is quantum or both."
+            "Comma-separated quantum phase-scan methods: ed, dmrg, idmrg, peps, ipeps, or all. "
+            "PEPS/iPEPS are explicit quimb methods and are not inferred from --backend."
         ),
     )
     parser.add_argument(
@@ -1063,9 +1523,21 @@ def parse_command_line() -> argparse.Namespace:
         "--phase_scan_mode",
         dest="phase_scan_mode",
         type=str,
-        choices=list(PHASE_SCAN_MODE_OPTIONS),
+        choices=("quantum", "classical", "both"),
         default=PHASE_SCAN_MODE,
-        help="High-level phase scan content: quantum, classical, or both. Legacy solver aliases are accepted.",
+        help="High-level phase scan content: quantum, classical, or both.",
+    )
+    parser.add_argument(
+        "--phase-scan-channels",
+        "--phase_scan_channels",
+        dest="phase_scan_channels",
+        type=str,
+        choices=list(PHASE_SCAN_CHANNEL_OPTIONS),
+        default=PHASE_SCAN_CHANNELS,
+        help=(
+            "Choose which phase-scan channel(s) to execute: auto, none, normal, external, or both. "
+            "normal is the alpha-beta scan; external is controlled by --external-scan-mode."
+        ),
     )
     parser.add_argument("--phase-scan-alpha-min", "--phase_scan_alpha_min", dest="phase_scan_alpha_min", type=float, default=PHASE_SCAN_ALPHA_MIN)
     parser.add_argument("--phase-scan-alpha-max", "--phase_scan_alpha_max", dest="phase_scan_alpha_max", type=float, default=PHASE_SCAN_ALPHA_MAX)
@@ -1073,6 +1545,52 @@ def parse_command_line() -> argparse.Namespace:
     parser.add_argument("--phase-scan-beta-min", "--phase_scan_beta_min", dest="phase_scan_beta_min", type=float, default=PHASE_SCAN_BETA_MIN)
     parser.add_argument("--phase-scan-beta-max", "--phase_scan_beta_max", dest="phase_scan_beta_max", type=float, default=PHASE_SCAN_BETA_MAX)
     parser.add_argument("--phase-scan-beta-points", "--phase_scan_beta_points", dest="phase_scan_beta_points", type=int, default=PHASE_SCAN_BETA_POINTS)
+    parser.add_argument(
+        "--external-scan-mode",
+        "--external_scan_mode",
+        dest="external_scan_mode",
+        type=str,
+        choices=list(EXTERNAL_SCAN_MODE_OPTIONS),
+        default=EXTERNAL_SCAN_MODE,
+        help=(
+            "When phase scanning and an external field are active, choose the field scan: "
+            f"{', '.join(EXTERNAL_SCAN_MODE_OPTIONS)}. "
+            "e_b overlays DMRG ground energy with ED low-energy bands versus |H|; "
+            "alpha_b_* scans alpha versus |H| using classical/quantum/both/all levels."
+        ),
+    )
+    parser.add_argument(
+        "--external-scan-field-min",
+        "--external_scan_field_min",
+        dest="external_scan_field_min",
+        type=float,
+        default=EXTERNAL_SCAN_FIELD_MIN,
+        help="Minimum external-field strength B for external phase scans.",
+    )
+    parser.add_argument(
+        "--external-scan-field-max",
+        "--external_scan_field_max",
+        dest="external_scan_field_max",
+        type=float,
+        default=EXTERNAL_SCAN_FIELD_MAX,
+        help="Maximum external-field strength B for external phase scans.",
+    )
+    parser.add_argument(
+        "--external-scan-field-points",
+        "--external_scan_field_points",
+        dest="external_scan_field_points",
+        type=int,
+        default=EXTERNAL_SCAN_FIELD_POINTS,
+        help="Number of external-field B samples for external phase scans.",
+    )
+    parser.add_argument(
+        "--external-scan-ed-bands",
+        "--external_scan_ed_bands",
+        dest="external_scan_ed_bands",
+        type=int,
+        default=EXTERNAL_SCAN_ED_BANDS,
+        help="Number of lowest ED bands to overlay in external_scan_mode=e_b.",
+    )
     parser.add_argument(
         "--phase-scan-ed-max-sites",
         "--phase_scan_ed_max_sites",
@@ -1117,14 +1635,95 @@ def parse_command_line() -> argparse.Namespace:
         help="Tolerance for |W_p| being near the conserved plaquette-flux value.",
     )
     parser.add_argument("--output-folder", "--output_folder", dest="output_folder", type=str, default=OUTPUT_FOLDER)
+    profile_group = parser.add_argument_group("Profiling")
+    profile_group.add_argument(
+        "--profile-enabled",
+        "--profile_enabled",
+        dest="profile_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=PROFILE_ENABLED,
+        help="Enable lightweight standard-library profiling output.",
+    )
+    profile_group.add_argument(
+        "--profile-timing",
+        "--profile_timing",
+        dest="profile_timing",
+        action=argparse.BooleanOptionalAction,
+        default=PROFILE_TIMING,
+        help="Record wall-clock stage timing when profiling is enabled.",
+    )
+    profile_group.add_argument(
+        "--profile-memory",
+        "--profile_memory",
+        dest="profile_memory",
+        action=argparse.BooleanOptionalAction,
+        default=PROFILE_MEMORY,
+        help="Record tracemalloc/resource memory metadata when profiling is enabled.",
+    )
+    profile_group.add_argument(
+        "--profile-cprofile",
+        "--profile_cprofile",
+        dest="profile_cprofile",
+        action=argparse.BooleanOptionalAction,
+        default=PROFILE_CPROFILE,
+        help="Collect optional cProfile cumulative stats when profiling is enabled.",
+    )
+    profile_group.add_argument(
+        "--profile-line-hooks",
+        "--profile_line_hooks",
+        dest="profile_line_hooks",
+        action=argparse.BooleanOptionalAction,
+        default=PROFILE_LINE_HOOKS,
+        help="Use an existing builtins @profile hook if the process was launched under line_profiler.",
+    )
+    profile_group.add_argument(
+        "--profile-scan-points",
+        "--profile_scan_points",
+        dest="profile_scan_points",
+        action=argparse.BooleanOptionalAction,
+        default=PROFILE_SCAN_POINTS,
+        help="Record per phase-scan point wall time when profiling is enabled.",
+    )
+    profile_group.add_argument(
+        "--profile-output-json",
+        "--profile_output_json",
+        dest="profile_output_json",
+        action=argparse.BooleanOptionalAction,
+        default=PROFILE_OUTPUT_JSON,
+        help="Write outputs/profiling/profile_summary.json when profiling is enabled.",
+    )
+    profile_group.add_argument(
+        "--profile-output-folder",
+        "--profile_output_folder",
+        dest="profile_output_folder",
+        type=str,
+        default=PROFILE_OUTPUT_FOLDER,
+        help="Folder for profile_summary.json when profiling output is enabled.",
+    )
     parser.add_argument(
         "--backend",
         type=str,
         choices=list(BACKEND_OPTIONS),
         default=BACKEND,
         help=(
-            "Select the DMRG/tensor-network backend. auto tries Tenax first, then falls back "
-            "to the local TeNPy U1 template when compatible. Use --ed-backend for ED."
+            "Select the DMRG/tensor-network backend. auto uses the local TeNPy "
+            "Yao-Lee path first when compatible, then falls back to Tenax. quimb uses quimb.tensor "
+            "PEPS for finite calculations and iPEPS for infinite calculations. "
+            "Use --ed-backend for ED."
+        ),
+    )
+    parser.add_argument(
+        "--method",
+        "--calculation-method",
+        "--calculation_method",
+        dest="method",
+        type=str,
+        choices=list(CALCULATION_METHOD_OPTIONS),
+        default=METHOD,
+        help=(
+            "Primary calculation method. With --backend quimb, choose peps/quimb_peps "
+            "for finite PEPS or ipeps/quimb_ipeps for infinite iPEPS. auto preserves "
+            "the default finite method for the selected backend."
         ),
     )
     parser.add_argument(
@@ -1179,7 +1778,7 @@ def parse_command_line() -> argparse.Namespace:
         dest="calculate_real_space_patterns",
         action=argparse.BooleanOptionalAction,
         default=CALCULATE_REAL_SPACE_PATTERNS,
-        help="Extract reference-site spin/orbital correlation rows for real-space order-pattern diagrams.",
+        help="Extract compact spin/orbital correlation rows for real-space order-pattern diagrams.",
     )
     parser.add_argument(
         "--reference-site-idx",
@@ -1227,7 +1826,7 @@ def parse_command_line() -> argparse.Namespace:
         dest="plot_real_space_patterns",
         action=argparse.BooleanOptionalAction,
         default=PLOT_REAL_SPACE_PATTERNS,
-        help="Save reference-site real-space pattern diagrams for S and T correlations.",
+        help="Save compact real-space pattern diagrams where supported.",
     )
     parser.add_argument(
         "--plot-entanglement",
@@ -1380,14 +1979,42 @@ def _extract_consistency_signature(parameters: Dict[str, Any]) -> Dict[str, Any]
         "strict_symmetry_precheck",
         "symmetry_allow_dense_fallback",
         "backend",
+        "method",
         "max_dmrg_sites",
         "max_bond_dimension",
         "max_sweeps",
+        "max_peps_sites",
+        "peps_max_bond_dimension",
+        "peps_bond_dimension_cap",
+        "peps_max_sweeps",
+        "peps_sweep_cap",
+        "peps_ctm_chi",
+        "peps_ctm_chi_cap",
+        "peps_tau",
+        "peps_entanglement_max_dense_dim",
+        "peps_symmetry_mode",
+        "peps_strict_symmetry",
+        "peps_allow_dense_fallback",
         "run_idmrg",
         "idmrg_max_bond_dimension",
         "idmrg_max_iterations",
         "idmrg_max_local_dim",
         "idmrg_bulk_kind",
+        "idmrg_use_translation_symmetry",
+        "max_ipeps_unit_cell_sites",
+        "ipeps_max_bond_dimension",
+        "ipeps_bond_dimension_cap",
+        "ipeps_max_iterations",
+        "ipeps_iteration_cap",
+        "ipeps_ctm_chi",
+        "ipeps_ctm_chi_cap",
+        "ipeps_tau",
+        "ipeps_symmetry_mode",
+        "ipeps_strict_symmetry",
+        "ipeps_allow_dense_fallback",
+        "ipeps_unit_cell_kind",
+        "ipeps_use_translation_symmetry",
+        "ipeps_contraction_method",
         "seed",
         "run_ed",
         "max_ed_sites",
@@ -1395,6 +2022,12 @@ def _extract_consistency_signature(parameters: Dict[str, Any]) -> Dict[str, Any]
         "ed_max_eigenstates",
         "ed_backend",
         "ed_solver",
+        "ed_symmetry_engine",
+        "ed_quspin_experimental_fused_translation",
+        "ed_c3_mode",
+        "ed_c3_q_blocks",
+        "ed_z2_mode",
+        "ed_z2_kind",
         "ed_sparse_tol",
         "ed_sparse_maxiter",
         "use_translation_x_block",
@@ -1433,6 +2066,11 @@ def _extract_consistency_signature(parameters: Dict[str, Any]) -> Dict[str, Any]
         "phase_scan_beta_min",
         "phase_scan_beta_max",
         "phase_scan_beta_points",
+        "external_scan_mode",
+        "external_scan_field_min",
+        "external_scan_field_max",
+        "external_scan_field_points",
+        "external_scan_ed_bands",
         "phase_scan_ed_max_sites",
         "phase_scan_ed_max_hilbert_dim",
         "phase_scan_classical_restarts",
@@ -1465,6 +2103,84 @@ def _finite_float_from_mapping(mapping: Any, *keys: str) -> float | None:
         if np.isfinite(value):
             return value
     return None
+
+
+def _require_positive_int(value: Any, name: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"{name} must be positive; got {value!r}.")
+    return parsed
+
+
+def _require_positive_float(value: Any, name: str) -> float:
+    parsed = float(value)
+    if not np.isfinite(parsed) or parsed <= 0.0:
+        raise ValueError(f"{name} must be a positive finite value; got {value!r}.")
+    return parsed
+
+
+def _require_nonnegative_float(value: Any, name: str) -> float:
+    parsed = float(value)
+    if not np.isfinite(parsed) or parsed < 0.0:
+        raise ValueError(f"{name} must be a nonnegative finite value; got {value!r}.")
+    return parsed
+
+
+def _validate_solver_resource_args(args: argparse.Namespace) -> None:
+    """Enforce profile-linked PEPS/iPEPS safety caps after CLI parsing."""
+    positive_int_names = (
+        "max_dmrg_sites",
+        "max_bond_dimension",
+        "max_sweeps",
+        "max_peps_sites",
+        "peps_max_bond_dimension",
+        "peps_bond_dimension_cap",
+        "peps_max_sweeps",
+        "peps_sweep_cap",
+        "peps_ctm_chi",
+        "peps_ctm_chi_cap",
+        "peps_entanglement_max_dense_dim",
+        "idmrg_max_bond_dimension",
+        "idmrg_max_iterations",
+        "idmrg_max_local_dim",
+        "max_ipeps_unit_cell_sites",
+        "ipeps_max_bond_dimension",
+        "ipeps_bond_dimension_cap",
+        "ipeps_max_iterations",
+        "ipeps_iteration_cap",
+        "ipeps_ctm_chi",
+        "ipeps_ctm_chi_cap",
+        "external_scan_field_points",
+        "external_scan_ed_bands",
+    )
+    for name in positive_int_names:
+        setattr(args, name, _require_positive_int(getattr(args, name), name))
+    args.truncation_cutoff = _require_nonnegative_float(args.truncation_cutoff, "truncation_cutoff")
+    args.dmrg_svd_min = _require_nonnegative_float(args.dmrg_svd_min, "dmrg_svd_min")
+    args.idmrg_svd_min = _require_nonnegative_float(args.idmrg_svd_min, "idmrg_svd_min")
+    args.peps_tau = _require_positive_float(args.peps_tau, "peps_tau")
+    args.ipeps_tau = _require_positive_float(args.ipeps_tau, "ipeps_tau")
+    args.external_scan_field_min = float(args.external_scan_field_min)
+    args.external_scan_field_max = float(args.external_scan_field_max)
+    if not np.isfinite(args.external_scan_field_min) or not np.isfinite(args.external_scan_field_max):
+        raise ValueError("external_scan_field_min/max must be finite.")
+
+    cap_checks = (
+        ("peps_max_bond_dimension", "peps_bond_dimension_cap", "finite PEPS bond dimension"),
+        ("peps_max_sweeps", "peps_sweep_cap", "finite PEPS Simple Update sweeps"),
+        ("peps_ctm_chi", "peps_ctm_chi_cap", "finite PEPS CTMRG chi"),
+        ("ipeps_max_bond_dimension", "ipeps_bond_dimension_cap", "iPEPS bond dimension"),
+        ("ipeps_max_iterations", "ipeps_iteration_cap", "iPEPS Simple Update iterations"),
+        ("ipeps_ctm_chi", "ipeps_ctm_chi_cap", "iPEPS CTMRG chi"),
+    )
+    for value_name, cap_name, label in cap_checks:
+        value = int(getattr(args, value_name))
+        cap = int(getattr(args, cap_name))
+        if value > cap:
+            raise ValueError(
+                f"{label} requested {value}, above profile cap {cap}. "
+                f"Increase --{cap_name.replace('_', '-')} deliberately for a larger device."
+            )
 
 
 def _idmrg_energy_is_suspicious(idmrg_energy_per_site: float | None, dmrg_energy_per_site: float) -> bool:
@@ -1505,6 +2221,12 @@ def _normalize_phase_scan_mode(value: Any) -> str:
         "tenpy_idmrg": "quantum",
         "idmrg": "quantum",
         "infinite_dmrg": "quantum",
+        "peps": "quantum",
+        "finite_peps": "quantum",
+        "quimb_peps": "quantum",
+        "ipeps": "quantum",
+        "infinite_peps": "quantum",
+        "quimb_ipeps": "quantum",
         "classical": "classical",
         "classical_product": "classical",
         "both": "both",
@@ -1523,6 +2245,10 @@ def _default_quantum_phase_scan_methods_from_legacy_mode(legacy_mode: str | None
         return ["dmrg"]
     if key in ("tenax_idmrg", "tenpy_idmrg", "idmrg", "infinite_dmrg"):
         return ["idmrg"]
+    if key in ("peps", "finite_peps", "quimb_peps"):
+        return ["peps"]
+    if key in ("ipeps", "infinite_peps", "quimb_ipeps"):
+        return ["ipeps"]
     if key == "all":
         return list(PHASE_SCAN_QUANTUM_METHOD_OPTIONS)
     return _split_phase_scan_csv(PHASE_SCAN_METHODS)
@@ -1532,7 +2258,7 @@ def _normalize_phase_scan_quantum_methods(
     methods_value: Any,
     legacy_mode: str | None = None,
 ) -> List[str]:
-    """Normalize quantum phase-scan solver choices to ed/dmrg/idmrg."""
+    """Normalize quantum phase-scan solver choices to ed/dmrg/idmrg/peps/ipeps."""
     alias_map = {
         "quantum_ed": "ed",
         "ed": "ed",
@@ -1546,6 +2272,12 @@ def _normalize_phase_scan_quantum_methods(
         "tenpy_idmrg": "idmrg",
         "idmrg": "idmrg",
         "infinite_dmrg": "idmrg",
+        "peps": "peps",
+        "finite_peps": "peps",
+        "quimb_peps": "peps",
+        "ipeps": "ipeps",
+        "infinite_peps": "ipeps",
+        "quimb_ipeps": "ipeps",
     }
     grouped_aliases = {
         "all": list(PHASE_SCAN_QUANTUM_METHOD_OPTIONS),
@@ -1597,7 +2329,7 @@ def _normalize_phase_scan_methods(
     methods_value: Any,
     legacy_mode: str | None = None,
 ) -> List[str]:
-    """Backward-compatible wrapper returning concrete ed/dmrg/idmrg/classical methods."""
+    """Backward-compatible wrapper returning concrete phase-scan methods."""
     scan_mode = _normalize_phase_scan_mode(legacy_mode)
     quantum_methods = _normalize_phase_scan_quantum_methods(methods_value, legacy_mode)
     return _selected_phase_scan_methods(scan_mode, quantum_methods)
@@ -1623,6 +2355,69 @@ def _normalize_ed_backend(value: str | None) -> str:
     raise ValueError(f"Unsupported ED backend '{value}'. Choose from: standard, quspin.")
 
 
+def _normalize_backend(value: str | None) -> str:
+    text = str(value if value is not None else BACKEND).strip().lower()
+    aliases = {
+        "auto": "auto",
+        "tenax": "tenax",
+        "jax": "tenax",
+        "tenpy": "tenpy",
+        "quimb": "quimb",
+    }
+    normalized = aliases.get(text)
+    if normalized is None:
+        raise ValueError(f"Unsupported backend '{value}'. Choose from: {', '.join(BACKEND_OPTIONS)}.")
+    return normalized
+
+
+def _normalize_calculation_method(value: str | None, backend: str | None = None) -> str:
+    text = str(value if value is not None else METHOD).strip().lower().replace("-", "_")
+    aliases = {
+        "auto": "auto",
+        "default": "auto",
+        "dmrg": "dmrg",
+        "finite_dmrg": "dmrg",
+        "idmrg": "idmrg",
+        "infinite_dmrg": "idmrg",
+        "peps": "peps",
+        "finite_peps": "peps",
+        "quimb_peps": "peps",
+        "ipeps": "ipeps",
+        "infinite_peps": "ipeps",
+        "quimb_ipeps": "ipeps",
+    }
+    normalized = aliases.get(text)
+    if normalized is None:
+        raise ValueError(
+            f"Unsupported calculation method '{value}'. Choose from: {', '.join(CALCULATION_METHOD_OPTIONS)}."
+        )
+    backend_key = str(backend or BACKEND).strip().lower()
+    if normalized == "auto":
+        return "peps" if backend_key == "quimb" else "dmrg"
+    if backend_key == "quimb" and normalized not in ("peps", "ipeps"):
+        raise ValueError("--backend quimb requires --method peps/quimb_peps or --method ipeps/quimb_ipeps.")
+    return normalized
+
+
+def _normalize_ipeps_contraction_method(value: str | None) -> str:
+    text = str(value if value is not None else IPEPS_CONTRACTION_METHOD).strip().lower().replace("-", "_")
+    aliases = {
+        "auto": "ctmrg",
+        "ctm": "ctmrg",
+        "ctmrg": "ctmrg",
+        "crtg": "ctmrg",
+        "boundary": "boundary",
+        "boundary_mps": "boundary",
+    }
+    normalized = aliases.get(text, text)
+    if normalized not in ("ctmrg", "boundary"):
+        raise ValueError(
+            f"Unsupported iPEPS contraction method '{value}'. "
+            f"Choose from: {', '.join(IPEPS_CONTRACTION_METHOD_OPTIONS)}."
+        )
+    return normalized
+
+
 def _normalize_symmetry_reductions(value: Any, legacy_mode: str | None = None) -> tuple[str, ...]:
     default_items = (
         [str(legacy_mode)]
@@ -1632,7 +2427,13 @@ def _normalize_symmetry_reductions(value: Any, legacy_mode: str | None = None) -
     if value is None:
         raw_items: List[str] = list(default_items)
     elif isinstance(value, (list, tuple, set)):
-        raw_items = [str(item) for item in value]
+        raw_items = []
+        for item in value:
+            raw_items.extend(
+                part.strip()
+                for part in str(item).replace("+", ",").replace(";", ",").split(",")
+                if part.strip()
+            )
     else:
         raw_items = [
             item.strip()
@@ -1649,6 +2450,12 @@ def _normalize_symmetry_reductions(value: Any, legacy_mode: str | None = None) -
         "dense": "none",
         "full": "none",
         "u1": "u1",
+        "u1_tz_z2": ("tz", "z2"),
+        "u1-tz-z2": ("tz", "z2"),
+        "u1tz_z2": ("tz", "z2"),
+        "tz_z2": ("tz", "z2"),
+        "tz-z2": ("tz", "z2"),
+        "tzz2": ("tz", "z2"),
         "u1_sz": "sz",
         "u1-sz": "sz",
         "u1sz": "sz",
@@ -1676,7 +2483,11 @@ def _normalize_symmetry_reductions(value: Any, legacy_mode: str | None = None) -
             raise ValueError(
                 f"Unsupported symmetry reduction '{raw}'. Choose from: {', '.join(SYMMETRY_REDUCTION_OPTIONS)}."
             )
-        if mapped == "u1":
+        if isinstance(mapped, (tuple, list)):
+            for item in mapped:
+                if item not in normalized:
+                    normalized.append(str(item))
+        elif mapped == "u1":
             for item in ("sz", "tz"):
                 if item not in normalized:
                     normalized.append(item)
@@ -1732,6 +2543,7 @@ def _symmetry_reduction_settings_from_report(
     report: Dict[str, Any] | None,
 ) -> Dict[str, Any]:
     reductions = tuple(getattr(args, "symmetry_reductions", ("none",)))
+    model_selection = getattr(args, "model_symmetry_selection", None)
     validation_report = None if (isinstance(report, dict) and report.get("status") == "disabled") else report
     if "auto" in reductions:
         use_sz_block = _u1_report_supports_sector(validation_report, "u1") or _u1_report_supports_sector(validation_report, "u1_sz")
@@ -1751,16 +2563,36 @@ def _symmetry_reduction_settings_from_report(
         use_z2_block = "z2" in reductions and (
             validation_report is None or _z2_report_supports_sector(validation_report)
         )
+    z2_generator = None
+    accepted_reductions = [] if reductions == ("none",) else list(reductions)
+    dropped_reductions: List[str] = []
+    backend_support_status: Dict[str, Any] = {}
+    if isinstance(model_selection, dict):
+        z2_generator = model_selection.get("z2_generator")
+        accepted_reductions = list(model_selection.get("accepted_reductions", model_selection.get("effective_reductions", accepted_reductions)))
+        dropped_reductions = list(model_selection.get("dropped_reductions", []))
+        backend_support_status = dict(model_selection.get("backend_support_status", {}))
+        use_sz_block = bool(model_selection.get("use_sz_block", use_sz_block)) and bool(use_sz_block)
+        use_tau_z_block = bool(model_selection.get("use_tau_z_block", use_tau_z_block)) and bool(use_tau_z_block)
+        use_z2_block = bool(model_selection.get("use_z2_block", use_z2_block)) and bool(use_z2_block)
+    if z2_generator is None:
+        use_z2_block = False
     return {
         "source": "shared_symmetry_reductions",
         "requested_reductions": list(reductions),
+        "accepted_reductions": list(accepted_reductions),
+        "dropped_reductions": list(dropped_reductions),
+        "model_aware_selection": model_selection,
+        "backend_support_status": backend_support_status,
         "legacy_tenax_mode": _legacy_symmetry_mode_from_reductions(reductions),
         "use_sz_block": bool(use_sz_block),
         "use_tau_z_block": bool(use_tau_z_block),
         "use_z2_block": bool(use_z2_block),
+        "z2_generator": z2_generator,
         "target_sz2": int(getattr(args, "u1_target_sz2", U1_TARGET_TOTAL_SZ2)),
         "target_tz2": int(getattr(args, "u1_target_tz2", U1_TARGET_TOTAL_TZ2)),
         "z2_target_parity": int(getattr(args, "z2_target_parity", Z2_TARGET_PARITY)) % 2,
+        "allow_dense_fallback": bool(getattr(args, "symmetry_allow_dense_fallback", SYMMETRY_ALLOW_DENSE_FALLBACK)),
         "use_translation_x_block": bool(getattr(args, "use_translation_x_block", USE_TRANSLATION_X_BLOCK)),
         "use_translation_y_block": bool(getattr(args, "use_translation_y_block", USE_TRANSLATION_Y_BLOCK)),
         "momentum_x_block": int(getattr(args, "momentum_x_block", MOMENTUM_X_BLOCK)),
@@ -1794,6 +2626,913 @@ def _spin_orbital_symmetry_reduced_dimension(
     return int(spin_dim * orbital_dim)
 
 
+def _ed_symmetry_mode_enabled(mode: str, *, auto_default: bool) -> bool:
+    text = str(mode).strip().lower()
+    if text == "on":
+        return True
+    if text == "off":
+        return False
+    return bool(auto_default)
+
+
+def _normalize_ed_symmetry_engine(engine: str) -> str:
+    text = str(engine).strip().lower()
+    if text == "projector":
+        return "standard_projector"
+    if text in {"quspin", "quspin_native"}:
+        return "quspin_native"
+    if text in {"auto", "standard_projector", "quspin_native", "quspin_experimental_c3"}:
+        return text
+    raise ValueError(
+        "ED symmetry engine must be one of auto, standard_projector, "
+        "quspin/quspin_native, or quspin_experimental_c3."
+    )
+
+
+def _geometry_allows_translation(geometry_obj: Any, axis: str) -> Tuple[bool, str]:
+    axis_key = str(axis).strip().lower()
+    if axis_key == "x":
+        if not bool(getattr(geometry_obj, "circumference_x", False)):
+            return False, "x translation requires periodic boundary conditions along x."
+        return True, "uniform Hamiltonian preserves x unit-cell translation on this periodic geometry."
+    if axis_key == "y":
+        if not bool(getattr(geometry_obj, "circumference_y", False)):
+            return False, "y translation requires periodic boundary conditions along y."
+        return True, "uniform Hamiltonian preserves y unit-cell translation on this periodic geometry."
+    return False, f"unknown translation axis {axis!r}."
+
+
+def _geometry_can_host_combined_c3(args: argparse.Namespace, geometry_obj: Any) -> Tuple[bool, str]:
+    if str(getattr(args, "lattice", "")).strip().lower() != "honeycomb":
+        return False, "combined spin-lattice C3 is defined here only for honeycomb geometry."
+    if int(getattr(args, "length_x", 0)) != int(getattr(args, "length_y", -1)):
+        return False, "combined C3 projector requires an Lx=Ly honeycomb torus in this ED planner."
+    if int(getattr(args, "length_x", 0)) < 2:
+        return False, "combined C3 projector requires at least a 2x2 honeycomb torus with resolved bond directions."
+    if not (bool(getattr(geometry_obj, "circumference_x", False)) and bool(getattr(geometry_obj, "circumference_y", False))):
+        return False, "combined C3 projector requires periodic boundaries in both directions."
+    return True, "honeycomb Lx=Ly torus can host the combined spin-lattice C3 check."
+
+
+def _resolve_ed_symmetry_plan(
+    *,
+    args: argparse.Namespace,
+    model_spec_obj: Any,
+    geometry_obj: Any,
+    resolved_field_vector: Tuple[float, float, float],
+    hamiltonian_field_terms: List[Tuple[float, str]],
+    shared_symmetry_settings: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Resolve ED symmetries from physics first, then record backend support.
+
+    This intentionally does not change DMRG/iDMRG/PEPS choices.  The result is an
+    ED-only plan stored on ``args.ed_symmetry_plan`` and copied into summaries.
+    """
+    field_report = classify_external_field(
+        getattr(args, "external_field_treatment", "off"),
+        resolved_field_vector,
+    )
+    field_class = str(field_report.get("field_class", "none"))
+    actual_field_class = "none" if field_class == "perturbation_only" else field_class
+    is_yao_lee_spin_orbital = bool(
+        str(getattr(model_spec_obj, "model_family", "")).strip().lower() == "yao_lee"
+        and str(getattr(model_spec_obj, "orbital_rep", "")).strip() == "1/2"
+    )
+    requested_engine = _normalize_ed_symmetry_engine(getattr(args, "ed_symmetry_engine", ED_SYMMETRY_ENGINE))
+    engine_prefers_quspin_native = requested_engine in ("quspin_native", "quspin_experimental_c3")
+    quspin_experimental_c3_report: Dict[str, Any] | None = None
+    quspin_experimental_fused_translation_report: Dict[str, Any] | None = None
+    if requested_engine == "quspin_experimental_c3":
+        try:
+            import quspin_backend as quspin_c3_backend
+
+            quspin_experimental_c3_report = quspin_c3_backend.quspin_combined_c3_api_support_report(
+                model_family=str(getattr(model_spec_obj, "model_family", "")),
+                phase_scan_requested=bool(getattr(args, "run_phase_scan", RUN_PHASE_SCAN)),
+            )
+        except Exception as exc:
+            quspin_experimental_c3_report = {
+                "status": "checked",
+                "experimental": True,
+                "combined_c3_implemented": False,
+                "phase_scan_allowed": False,
+                "api_error": str(exc),
+                "reason": "Could not validate QuSpin experimental C3 API support.",
+            }
+    requested_backend = str(getattr(args, "ed_backend", ED_BACKEND)).strip().lower()
+    if requested_backend == "ed":
+        requested_backend = "standard"
+    target_tz2 = int(getattr(args, "u1_target_tz2", U1_TARGET_TOTAL_TZ2))
+    target_sz2 = int(getattr(args, "u1_target_sz2", U1_TARGET_TOTAL_SZ2))
+    z2_target_parity = int(getattr(args, "z2_target_parity", Z2_TARGET_PARITY)) % 2
+    n_sites = int(getattr(geometry_obj, "number_of_sites", 0))
+
+    accepted: List[str] = []
+    dropped: List[Dict[str, str]] = []
+    reasons: Dict[str, str] = {}
+    warnings_list: List[str] = []
+
+    def accept(name: str, reason: str) -> None:
+        if name not in accepted:
+            accepted.append(name)
+        reasons[name] = reason
+
+    def drop(name: str, reason: str) -> None:
+        if name not in {str(item.get("name")) for item in dropped}:
+            dropped.append({"name": name, "reason": reason})
+        reasons[name] = reason
+
+    use_sz_block = False
+    if is_yao_lee_spin_orbital:
+        if bool(shared_symmetry_settings.get("use_sz_block", False)) or "sz" in set(getattr(args, "symmetry_reductions", ())):
+            drop("sz", "Total Sz is not conserved for the spin-orbital Yao-Lee Hamiltonian; ED never uses an Sz block.")
+    else:
+        use_sz_block = bool(shared_symmetry_settings.get("use_sz_block", False))
+        if use_sz_block:
+            accept("sz", "non-Yao-Lee model requested the shared total-Sz ED block.")
+
+    use_tau_z_block = False
+    if is_yao_lee_spin_orbital:
+        tz_dim = _sector_dimension_for_spin_half(n_sites, target_tz2)
+        if tz_dim > 0:
+            use_tau_z_block = True
+            accept("tz", "Total Tz is conserved for spin-orbital Yao-Lee, including uniform spin fields.")
+        else:
+            drop("tz", f"Requested total 2*Tz={target_tz2} is unreachable for N={n_sites} orbital-1/2 sites.")
+    elif bool(shared_symmetry_settings.get("use_tau_z_block", False)):
+        use_tau_z_block = True
+        accept("tz", "shared symmetry settings requested a reachable total-Tz block.")
+
+    translation_plan: Dict[str, Any] = {
+        "requested_x": bool(getattr(args, "use_translation_x_block", USE_TRANSLATION_X_BLOCK)),
+        "requested_y": bool(getattr(args, "use_translation_y_block", USE_TRANSLATION_Y_BLOCK)),
+        "use_x": False,
+        "use_y": False,
+        "momentum_x": int(getattr(args, "momentum_x_block", MOMENTUM_X_BLOCK)),
+        "momentum_y": int(getattr(args, "momentum_y_block", MOMENTUM_Y_BLOCK)),
+        "reasons": {},
+    }
+    if translation_plan["requested_x"]:
+        ok, reason = _geometry_allows_translation(geometry_obj, "x")
+        translation_plan["use_x"] = bool(ok)
+        translation_plan["reasons"]["x"] = reason
+        if ok:
+            accept("translation_x", reason)
+        else:
+            drop("translation_x", reason)
+    if translation_plan["requested_y"]:
+        ok, reason = _geometry_allows_translation(geometry_obj, "y")
+        translation_plan["use_y"] = bool(ok)
+        translation_plan["reasons"]["y"] = reason
+        if ok:
+            accept("translation_y", reason)
+        else:
+            drop("translation_y", reason)
+
+    z2_mode = str(getattr(args, "ed_z2_mode", ED_Z2_MODE)).strip().lower()
+    z2_kind_request = str(getattr(args, "ed_z2_kind", ED_Z2_KIND)).strip().lower()
+    z2_auto_default = bool(is_yao_lee_spin_orbital and actual_field_class in ("none", "hz"))
+    z2_requested = _ed_symmetry_mode_enabled(z2_mode, auto_default=z2_auto_default)
+    use_z2_block = False
+    z2_kind: str | None = None
+    if z2_requested:
+        if not is_yao_lee_spin_orbital:
+            drop("z2", "ED Z2 projector planning is currently specialized to spin-orbital Yao-Lee.")
+        else:
+            if z2_kind_request == "auto":
+                if engine_prefers_quspin_native:
+                    z2_kind = "spin_flip" if actual_field_class == "none" else None
+                else:
+                    z2_kind = "spin_pi_z" if actual_field_class in ("none", "hz") else None
+            else:
+                z2_kind = z2_kind_request
+            if actual_field_class == "h111":
+                drop("z2", "Pure spin-sector Z2 is not conserved for normalized H[111]; ED disables Z2.")
+                z2_kind = None
+            elif actual_field_class not in ("none", "hz"):
+                drop("z2", f"Pure spin-sector Z2 is not conserved for field_class={actual_field_class}.")
+                z2_kind = None
+            elif z2_kind == "spin_flip" and actual_field_class == "hz":
+                drop("z2", "spin_flip Z2 is broken by pure Hz; use spin_pi_z for the surviving parity.")
+                z2_kind = None
+            elif z2_kind == "spin_pi_z":
+                use_z2_block = True
+                accept("z2:spin_pi_z", "Rz(pi) spin parity is conserved for zero field and pure Hz.")
+            elif z2_kind == "spin_flip" and actual_field_class == "none":
+                use_z2_block = True
+                accept("z2:spin_flip", "spin_flip Z2 is conserved for the zero-field Yao-Lee Hamiltonian.")
+            else:
+                drop("z2", f"Unsupported ED Z2 kind {z2_kind_request!r} for field_class={actual_field_class}.")
+                z2_kind = None
+    else:
+        if is_yao_lee_spin_orbital and actual_field_class == "h111":
+            drop("z2", "Pure spin-sector Z2 is not conserved for normalized H[111]; ED disables Z2.")
+        elif is_yao_lee_spin_orbital and actual_field_class not in ("none", "hz"):
+            drop("z2", f"Pure spin-sector Z2 is not conserved for field_class={actual_field_class}.")
+        else:
+            drop("z2", "ED Z2 mode is off or auto did not select a conserved spin-sector parity.")
+
+    c3_mode = str(getattr(args, "ed_c3_mode", ED_C3_MODE)).strip().lower()
+    c3_auto_default = bool(is_yao_lee_spin_orbital and actual_field_class in ("none", "h111"))
+    c3_requested = _ed_symmetry_mode_enabled(c3_mode, auto_default=c3_auto_default)
+    use_c3_block = False
+    c3_reason = None
+    c3_gamma_momentum_reason = (
+        "combined C3 is implemented only in the Gamma momentum sector because translations "
+        "and C3 do not commute at generic momentum."
+    )
+    c3_strict = bool(getattr(args, "strict_symmetry_selection_rules", STRICT_SYMMETRY_SELECTION_RULES))
+    if c3_requested:
+        if not is_yao_lee_spin_orbital:
+            c3_reason = "combined spin-lattice C3 is currently defined only for spin-orbital Yao-Lee."
+            drop("combined_c3", c3_reason)
+        elif actual_field_class == "hz":
+            c3_reason = "pure Hz breaks combined spin-lattice C3; ED disables C3."
+            drop("combined_c3", c3_reason)
+        elif actual_field_class not in ("none", "h111"):
+            c3_reason = f"field_class={actual_field_class} does not preserve combined spin-lattice C3."
+            drop("combined_c3", c3_reason)
+        else:
+            geometry_ok, geometry_reason = _geometry_can_host_combined_c3(args, geometry_obj)
+            if geometry_ok:
+                if int(translation_plan["momentum_x"]) != 0 or int(translation_plan["momentum_y"]) != 0:
+                    c3_reason = c3_gamma_momentum_reason
+                    if c3_strict:
+                        raise ValueError(c3_reason)
+                    drop("combined_c3", c3_reason)
+                else:
+                    for axis in ("x", "y"):
+                        ok, reason = _geometry_allows_translation(geometry_obj, axis)
+                        if ok:
+                            translation_plan[f"use_{axis}"] = True
+                            translation_plan["reasons"][axis] = (
+                                "enabled automatically because combined C3 is applied only in the "
+                                "C3-invariant k=(0,0) translation sector."
+                            )
+                            accept(f"translation_{axis}", translation_plan["reasons"][axis])
+                        else:
+                            drop(f"translation_{axis}", reason)
+                    translation_plan["momentum_x"] = 0
+                    translation_plan["momentum_y"] = 0
+                    use_c3_block = bool(translation_plan["use_x"] and translation_plan["use_y"])
+                    c3_reason = (
+                        "combined spin-lattice C3 is allowed by the field class; "
+                        "standard projector ED verifies [H,C3] and applies q-sector projectors."
+                    )
+                    if use_c3_block:
+                        accept("combined_c3", c3_reason)
+                    else:
+                        drop("combined_c3", "combined C3 requires both x and y translation sectors at k=(0,0).")
+            else:
+                c3_reason = geometry_reason
+                drop("combined_c3", geometry_reason)
+    else:
+        if is_yao_lee_spin_orbital and actual_field_class == "hz":
+            c3_reason = "pure Hz breaks combined spin-lattice C3; ED disables C3."
+        elif is_yao_lee_spin_orbital and actual_field_class not in ("none", "h111"):
+            c3_reason = f"field_class={actual_field_class} does not preserve combined spin-lattice C3."
+        else:
+            c3_reason = "ED C3 mode is off or auto did not select C3 for this field class."
+        drop("combined_c3", c3_reason)
+
+    def remove_accepted(prefix: str) -> None:
+        accepted[:] = [item for item in accepted if not str(item).startswith(prefix)]
+
+    if use_c3_block and use_z2_block:
+        remove_accepted("z2:")
+        use_z2_block = False
+        dropped_z2_kind = z2_kind
+        z2_kind = None
+        reason = (
+            "ED does not currently implement the full group projector for simultaneous "
+            "spin-sector Z2 and true combined spin-lattice C3 labels.  The planner keeps "
+            "the C3 + Gamma-translation route and drops Z2; use C3 off for the Z2+translation route."
+        )
+        drop("z2", reason)
+        warnings_list.append(
+            f"Dropped Z2 ({dropped_z2_kind}) because combined C3 and Z2 are not treated as "
+            "independent commuting labels in the current ED projector implementation."
+        )
+
+    if (
+        requested_engine == "auto"
+        and actual_field_class == "none"
+        and use_z2_block
+        and z2_kind == "spin_pi_z"
+        and not translation_plan["use_x"]
+        and not translation_plan["use_y"]
+        and not use_c3_block
+    ):
+        remove_accepted("z2:")
+        z2_kind = "spin_flip"
+        accept(
+            "z2:spin_flip",
+            "auto selected QuSpin-native zero-field spin_flip because no projector-only ED symmetries are active.",
+        )
+
+    fused_translation_tz_reason = (
+        "QuSpin tensor_basis translation is not used with Tz because Yao-Lee translation must act "
+        "on fused spin-orbital physical sites."
+    )
+    experimental_fused_translation_requested = bool(
+        getattr(args, "ed_quspin_experimental_fused_translation", ED_QUSPIN_EXPERIMENTAL_FUSED_TRANSLATION)
+    )
+    quspin_requested_with_fused_tz_translation = bool(
+        use_tau_z_block
+        and (translation_plan["use_x"] or translation_plan["use_y"])
+        and (requested_backend == "quspin" or requested_engine == "quspin_native")
+    )
+    if use_tau_z_block and (translation_plan["use_x"] or translation_plan["use_y"]):
+        try:
+            import quspin_backend as quspin_fused_backend
+
+            quspin_experimental_fused_translation_report = (
+                quspin_fused_backend.quspin_fused_translation_api_support_report(
+                    geometry_obj,
+                    use_tau_z_block=bool(use_tau_z_block),
+                    use_z2_block=bool(use_z2_block),
+                    requested=bool(experimental_fused_translation_requested),
+                )
+            )
+        except Exception as exc:
+            quspin_experimental_fused_translation_report = {
+                "status": "checked",
+                "experimental": True,
+                "requested": bool(experimental_fused_translation_requested),
+                "implemented": False,
+                "available": False,
+                "api_error": str(exc),
+                "reason": "Could not validate QuSpin fused-translation API support.",
+            }
+    fused_translation_available = bool(
+        experimental_fused_translation_requested
+        and isinstance(quspin_experimental_fused_translation_report, dict)
+        and quspin_experimental_fused_translation_report.get("available", False)
+        and quspin_experimental_fused_translation_report.get("implemented", False)
+    )
+    if quspin_requested_with_fused_tz_translation:
+        if fused_translation_available:
+            warnings_list.append(
+                "Using experimental QuSpin fused-site translation path validated against standard_projector."
+            )
+        else:
+            warnings_list.append(fused_translation_tz_reason)
+
+    quspin_native_forces_subset = requested_engine == "quspin_experimental_c3"
+    if quspin_native_forces_subset:
+        if use_z2_block and z2_kind == "spin_pi_z":
+            remove_accepted("z2:")
+            use_z2_block = False
+            z2_kind = None
+            drop(
+                "z2",
+                "quspin_native cannot represent spin_pi_z in the current tensor-basis path; "
+                "use ED_SYMMETRY_ENGINE=standard_projector for this projector.",
+            )
+        if translation_plan["use_x"]:
+            remove_accepted("translation_x")
+            translation_plan["use_x"] = False
+            drop(
+                "translation_x",
+                "quspin_native does not use Tx because QuSpin tensor_basis would impose separate "
+                "spin/orbital translations, not the fused physical-site translation; "
+                "use standard_projector for production fused-site translation blocks.",
+            )
+        if translation_plan["use_y"]:
+            remove_accepted("translation_y")
+            translation_plan["use_y"] = False
+            drop(
+                "translation_y",
+                "quspin_native does not use Ty because QuSpin tensor_basis would impose separate "
+                "spin/orbital translations, not the fused physical-site translation; "
+                "use standard_projector for production fused-site translation blocks.",
+            )
+        if use_c3_block:
+            remove_accepted("combined_c3")
+            use_c3_block = False
+            c3_reason = (
+                "quspin_experimental_c3/native QuSpin pure site maps are not the physical "
+                "Yao-Lee combined C3 = lattice rotation times local spin rotation; "
+                "use standard_projector for combined C3."
+            )
+            drop("combined_c3", c3_reason)
+        if requested_engine == "quspin_experimental_c3":
+            experimental_reason = (
+                quspin_experimental_c3_report.get("reason")
+                if isinstance(quspin_experimental_c3_report, dict)
+                else None
+            )
+            drop(
+                "combined_c3",
+                str(
+                    experimental_reason
+                    or (
+                        "quspin_experimental_c3 rejects pure C3 site maps for Yao-Lee; "
+                        "combined C3 needs local spin rotation support."
+                    )
+                ),
+            )
+            warnings_list.append(
+                "quspin_experimental_c3 is experimental and currently disabled for Yao-Lee combined C3: "
+                "pure integer C3 maps are rejected; a user_basis/custom phase implementation or "
+                "spin-[111] basis encoding plus N=8 standard_projector validation is required."
+            )
+
+    needs_standard_projector = bool(
+        use_c3_block
+        or ((translation_plan["use_x"] or translation_plan["use_y"]) and not fused_translation_available)
+        or (use_z2_block and z2_kind == "spin_pi_z")
+    )
+    quspin_native_safe_subset = bool(
+        is_yao_lee_spin_orbital
+        and use_tau_z_block
+        and not use_sz_block
+        and not needs_standard_projector
+        and not use_c3_block
+        and (not translation_plan["use_x"] or fused_translation_available)
+        and (not translation_plan["use_y"] or fused_translation_available)
+        and (
+            not use_z2_block
+            or (z2_kind == "spin_flip" and actual_field_class == "none")
+        )
+    )
+    if requested_engine == "standard_projector":
+        effective_engine = "standard_projector"
+    elif needs_standard_projector:
+        effective_engine = "standard_projector"
+    elif requested_engine in ("quspin_native", "quspin_experimental_c3"):
+        effective_engine = requested_engine
+    elif quspin_native_safe_subset:
+        effective_engine = "quspin_native"
+    elif requested_backend == "quspin":
+        effective_engine = "quspin_native"
+    else:
+        effective_engine = "standard_projector"
+    actual_backend = "quspin" if effective_engine.startswith("quspin") else "standard"
+    spin_pi_z_quspin_reason = (
+        "QuSpin zblock supports only the tested zero-field spin_flip generator; "
+        "spin_pi_z parity requires standard_projector."
+    )
+    backend_override_reason = (
+        fused_translation_tz_reason
+        if quspin_requested_with_fused_tz_translation and actual_backend == "standard"
+        else (
+            spin_pi_z_quspin_reason
+            if (
+                use_z2_block
+                and z2_kind == "spin_pi_z"
+                and actual_backend == "standard"
+                and (requested_backend == "quspin" or requested_engine == "quspin_native")
+            )
+            else None
+        )
+    )
+    if not use_z2_block:
+        z2_selection_reason = reasons.get("z2", "No ED Z2 generator was selected.")
+    elif z2_kind == "spin_pi_z":
+        z2_selection_reason = (
+            "Using spin_pi_z/Rz(pi) parity. This generator is not implemented by the QuSpin "
+            "zblock path, so ED uses standard_projector."
+        )
+    elif z2_kind == "spin_flip" and actual_field_class == "none":
+        z2_selection_reason = (
+            "Using the tested zero-field spin_flip generator. QuSpin-native may use it only "
+            "when no fused-site translation/C3 projector is active."
+        )
+        if translation_plan["use_x"] or translation_plan["use_y"]:
+            z2_selection_reason += " Translation is requested, so the route is standard_projector."
+        elif actual_backend == "quspin":
+            z2_selection_reason += " QuSpin-native selected the spin_flip zblock."
+        else:
+            z2_selection_reason += " QuSpin-native was not selected by the requested backend/engine."
+    else:
+        z2_selection_reason = (
+            f"Z2 generator {z2_kind!r} is not supported for field_class={actual_field_class}."
+        )
+    quspin_z2_selection_reason = (
+        z2_selection_reason
+        if z2_kind == "spin_flip" and actual_field_class == "none"
+        else "QuSpin-native supports only zero-field spin_flip zblock; it does not implement spin_pi_z parity."
+    )
+    requested_symmetries: List[str] = [str(item) for item in getattr(args, "symmetry_reductions", ())]
+    if translation_plan["requested_x"]:
+        requested_symmetries.append("translation_x")
+    if translation_plan["requested_y"]:
+        requested_symmetries.append("translation_y")
+    if z2_requested:
+        requested_symmetries.append("z2")
+    if c3_requested:
+        requested_symmetries.append("combined_c3")
+
+    backend_support_status = {
+        "standard_projector": {
+            "u1_tz": bool(use_tau_z_block),
+            "spin_pi_z": True,
+            "spin_flip": False,
+            "translation": True,
+            "combined_c3": True,
+            "reason": (
+                "standard ED applies Tz first, then projector-based spin_pi_z and fused-site "
+                "translation blocks, then combined C3 q-sector projectors when requested."
+            ),
+        },
+        "quspin_native": {
+            "u1_tz": bool(use_tau_z_block),
+            "spin_flip": bool(use_z2_block and z2_kind == "spin_flip" and actual_field_class == "none"),
+            "spin_pi_z": False,
+            "translation": False,
+            "combined_c3": False,
+            "reason": (
+                "current QuSpin tensor-basis path can apply Tz and zero-field spin_flip; "
+                "spin_pi_z, fused physical-site translations, and combined C3 are handled by the standard projector engine."
+            ),
+            "z2_reason": quspin_z2_selection_reason,
+        },
+        "quspin_experimental_c3": {
+            "u1_tz": bool(use_tau_z_block),
+            "spin_flip": bool(use_z2_block and z2_kind == "spin_flip" and actual_field_class == "none"),
+            "spin_pi_z": False,
+            "translation": False,
+            "combined_c3": False,
+            "has_user_basis": (
+                bool(quspin_experimental_c3_report.get("has_user_basis", False))
+                if isinstance(quspin_experimental_c3_report, dict)
+                else None
+            ),
+            "combined_c3_implemented": (
+                bool(quspin_experimental_c3_report.get("combined_c3_implemented", False))
+                if isinstance(quspin_experimental_c3_report, dict)
+                else False
+            ),
+            "phase_scan_allowed": (
+                bool(quspin_experimental_c3_report.get("phase_scan_allowed", False))
+                if isinstance(quspin_experimental_c3_report, dict)
+                else False
+            ),
+            "reason": (
+                "experimental pure site C3 maps are rejected for Yao-Lee; physical combined C3 needs "
+                "lattice rotation times local spin rotation and N=8 standard_projector validation."
+            ),
+        },
+        "quspin_experimental_fused_translation": {
+            "u1_tz": bool(use_tau_z_block),
+            "translation": bool(fused_translation_available),
+            "spin_flip": bool(use_z2_block and z2_kind == "spin_flip" and actual_field_class == "none"),
+            "spin_pi_z": False,
+            "combined_c3": False,
+            "requested": bool(experimental_fused_translation_requested),
+            "available": bool(fused_translation_available),
+            "reason": (
+                quspin_experimental_fused_translation_report.get("reason")
+                if isinstance(quspin_experimental_fused_translation_report, dict)
+                else "QuSpin fused translation was not requested or not checked."
+            ),
+        },
+    }
+    if use_z2_block and z2_kind == "spin_pi_z":
+        warnings_list.append("ED plan accepts spin_pi_z parity; standard ED applies it with the projector engine.")
+    if translation_plan["use_x"] or translation_plan["use_y"]:
+        warnings_list.append("ED plan accepts fused-site translation symmetry; standard ED applies it with the projector engine.")
+    if use_c3_block:
+        warnings_list.append("ED plan accepts combined C3; standard ED applies q-sector projectors after commutator checks.")
+
+    return {
+        "status": "resolved",
+        "engine": effective_engine,
+        "symmetry_engine": effective_engine,
+        "requested_engine": requested_engine,
+        "effective_engine": effective_engine,
+        "requested_backend": requested_backend,
+        "actual_backend": actual_backend,
+        "effective_backend": actual_backend,
+        "backend_override_reason": backend_override_reason,
+        "engine_selection_reason": (
+            backend_override_reason
+            if backend_override_reason
+            else "projector-only symmetries require the in-repo standard projector path"
+            if effective_engine == "standard_projector" and needs_standard_projector
+            else (
+                "requested QuSpin-native/experimental engine uses only the supported native subset"
+                if requested_engine in ("quspin_native", "quspin_experimental_c3")
+                else (
+                    "auto selected quspin_native because the requested ED symmetries are within "
+                    "the validated QuSpin subset (Tz-only or zero-field Tz+spin_flip)"
+                    if effective_engine == "quspin_native" and quspin_native_safe_subset
+                    else "auto selected the backend-compatible ED symmetry route"
+                )
+            )
+        ),
+        "model_family": str(getattr(model_spec_obj, "model_family", "")),
+        "orbital_rep": str(getattr(model_spec_obj, "orbital_rep", "")),
+        "field_class": field_class,
+        "actual_hamiltonian_field_class": actual_field_class,
+        "field_classification": field_report,
+        "hamiltonian_field_terms": [(float(coefficient), str(op_name)) for coefficient, op_name in hamiltonian_field_terms],
+        "requested": {
+            "engine": requested_engine,
+            "backend": requested_backend,
+            "c3_mode": c3_mode,
+            "c3_q_blocks": str(getattr(args, "ed_c3_q_blocks", ED_C3_Q_BLOCKS)),
+            "z2_mode": z2_mode,
+            "z2_kind": z2_kind_request,
+            "translation_x": bool(translation_plan["requested_x"]),
+            "translation_y": bool(translation_plan["requested_y"]),
+            "momentum_x": int(translation_plan["momentum_x"]),
+            "momentum_y": int(translation_plan["momentum_y"]),
+        },
+        "requested_symmetries": requested_symmetries,
+        "accepted_symmetries": accepted,
+        "dropped_symmetries": dropped,
+        "reasons": reasons,
+        "use_sz_block": bool(use_sz_block),
+        "use_tau_z_block": bool(use_tau_z_block),
+        "use_z2_block": bool(use_z2_block),
+        "z2_kind": z2_kind,
+        "z2_generator": z2_kind,
+        "z2_generator_used": z2_kind if use_z2_block else None,
+        "z2_selection_reason": z2_selection_reason,
+        "quspin_z2_selection_reason": quspin_z2_selection_reason,
+        "z2_target_parity": int(z2_target_parity),
+        "use_translation_x_block": bool(translation_plan["use_x"]),
+        "use_translation_y_block": bool(translation_plan["use_y"]),
+        "momentum_x_block": int(translation_plan["momentum_x"]),
+        "momentum_y_block": int(translation_plan["momentum_y"]),
+        "translation": translation_plan,
+        "use_c3_block": bool(use_c3_block),
+        "c3_q_blocks": str(getattr(args, "ed_c3_q_blocks", ED_C3_Q_BLOCKS)),
+        "c3_commutator_check": {
+            "required": bool(use_c3_block),
+            "status": "pending_projector_application" if use_c3_block else "not_required",
+            "reason": c3_reason,
+        },
+        "quspin_experimental_c3": quspin_experimental_c3_report,
+        "quspin_experimental_fused_translation": quspin_experimental_fused_translation_report,
+        "target_sz2": int(target_sz2),
+        "target_tz2": int(target_tz2),
+        "backend_support_status": backend_support_status,
+        "warnings": warnings_list,
+    }
+
+
+def _ed_plan_requires_standard_projector(ed_plan: Dict[str, Any], model_spec_obj: Any) -> bool:
+    """Whether ED must use the bitwise projector path instead of QuSpin."""
+    if not isinstance(ed_plan, dict) or ed_plan.get("status") != "resolved":
+        return False
+    effective_engine = _normalize_ed_symmetry_engine(
+        ed_plan.get("effective_engine", ed_plan.get("engine", ED_SYMMETRY_ENGINE))
+    )
+    if effective_engine != "standard_projector":
+        return False
+    is_yao_lee_spin_orbital = bool(
+        str(getattr(model_spec_obj, "model_family", "")).strip().lower() == "yao_lee"
+        and str(getattr(model_spec_obj, "spin_rep", "")).strip() == "1/2"
+        and str(getattr(model_spec_obj, "orbital_rep", "")).strip() == "1/2"
+    )
+    if not is_yao_lee_spin_orbital or not bool(ed_plan.get("use_tau_z_block", False)):
+        return False
+    projector_z2 = bool(
+        ed_plan.get("use_z2_block", False)
+        and str(ed_plan.get("z2_kind")) == "spin_pi_z"
+    )
+    return bool(
+        projector_z2
+        or ed_plan.get("use_translation_x_block", False)
+        or ed_plan.get("use_translation_y_block", False)
+        or ed_plan.get("use_c3_block", False)
+    )
+
+
+def _ed_projector_reduction_factor_estimate(ed_plan: Dict[str, Any], geometry_obj: Any) -> int:
+    factor = 1
+    if bool(ed_plan.get("use_z2_block", False)) and str(ed_plan.get("z2_kind")) == "spin_pi_z":
+        factor *= 2
+    if bool(ed_plan.get("use_translation_x_block", False)):
+        factor *= max(1, int(getattr(geometry_obj, "length_x", 1) or 1))
+    if bool(ed_plan.get("use_translation_y_block", False)):
+        factor *= max(1, int(getattr(geometry_obj, "length_y", 1) or 1))
+    if bool(ed_plan.get("use_c3_block", False)):
+        factor *= 3
+    return int(max(1, factor))
+
+
+def _m2_values_for_spin_value(spin_value: float) -> List[int]:
+    two_s = int(round(2.0 * float(spin_value)))
+    if two_s <= 0:
+        return [0]
+    return [int(two_s - 2 * index) for index in range(two_s + 1)]
+
+
+def _charge_sector_dimension(single_site_charges: List[int], n_sites: int, target_charge: int) -> int:
+    counts: Dict[int, int] = {0: 1}
+    charges = [int(charge) for charge in single_site_charges]
+    for _site in range(max(0, int(n_sites))):
+        next_counts: Dict[int, int] = {}
+        for total_charge, count in counts.items():
+            for charge in charges:
+                new_total = int(total_charge + charge)
+                next_counts[new_total] = int(next_counts.get(new_total, 0) + count)
+        counts = next_counts
+    return int(counts.get(int(target_charge), 0))
+
+
+def _symmetry_hilbert_dimension_report(
+    geometry_obj: Any,
+    model_spec_obj: Any,
+    symmetry_settings: Dict[str, Any],
+) -> Dict[str, Any]:
+    n_sites = int(getattr(geometry_obj, "number_of_sites", 0))
+    spin_dim = int(getattr(model_spec_obj, "spin_dim", 1))
+    orbital_dim = int(getattr(model_spec_obj, "orbital_dim", 1))
+    local_dim = int(getattr(model_spec_obj, "physical_dim", max(1, spin_dim * orbital_dim)))
+    spin_full_dim = int(spin_dim ** n_sites)
+    orbital_full_dim = int(orbital_dim ** n_sites)
+    full_dim = int(local_dim ** n_sites)
+
+    use_sz_block = bool(symmetry_settings.get("use_sz_block", False))
+    use_tau_z_block = bool(symmetry_settings.get("use_tau_z_block", False))
+    use_z2_block = bool(symmetry_settings.get("use_z2_block", False))
+    target_sz2 = int(symmetry_settings.get("target_sz2", U1_TARGET_TOTAL_SZ2))
+    target_tz2 = int(symmetry_settings.get("target_tz2", U1_TARGET_TOTAL_TZ2))
+
+    spin_m2_values = _m2_values_for_spin_value(float(getattr(model_spec_obj, "spin_value", 0.0)))
+    orbital_m2_values = _m2_values_for_spin_value(float(getattr(model_spec_obj, "orbital_value", 0.0)))
+    spin_sector_dim = (
+        _charge_sector_dimension(spin_m2_values, n_sites, target_sz2)
+        if use_sz_block
+        else spin_full_dim
+    )
+    orbital_sector_dim = (
+        _charge_sector_dimension(orbital_m2_values, n_sites, target_tz2)
+        if use_tau_z_block
+        else orbital_full_dim
+    )
+    u1_effective_dim = int(spin_sector_dim * orbital_sector_dim)
+    effective_dim = u1_effective_dim
+    z2_dimension_note = None
+    if use_z2_block:
+        if u1_effective_dim > 0:
+            effective_dim = int((u1_effective_dim + 1) // 2)
+            z2_dimension_note = (
+                "Z2 dimension is reported as a conservative half-sector estimate; "
+                "backend-specific bases may record the exact dimension later."
+            )
+        else:
+            effective_dim = 0
+            z2_dimension_note = "Z2 was requested but the preceding U1 sector is unreachable."
+
+    reduction_factor = None if effective_dim <= 0 else float(full_dim) / float(effective_dim)
+    active_labels: List[str] = []
+    if use_sz_block:
+        active_labels.append(f"Sz={target_sz2}")
+    if use_tau_z_block:
+        active_labels.append(f"Tz={target_tz2}")
+    if use_z2_block:
+        active_labels.append(f"Z2={int(symmetry_settings.get('z2_target_parity', Z2_TARGET_PARITY)) % 2}")
+    return {
+        "number_of_sites": n_sites,
+        "local_dimension": local_dim,
+        "spin_full_dimension": spin_full_dim,
+        "orbital_full_dimension": orbital_full_dim,
+        "full_hilbert_dimension": full_dim,
+        "spin_sector_dimension": int(spin_sector_dim),
+        "orbital_sector_dimension": int(orbital_sector_dim),
+        "u1_effective_hilbert_dimension": int(u1_effective_dim),
+        "effective_hilbert_dimension": int(effective_dim),
+        "reduction_factor": reduction_factor,
+        "active_reductions": active_labels,
+        "basis_label": " x ".join(active_labels) if active_labels else "full dense Hilbert space",
+        "z2_dimension_note": z2_dimension_note,
+    }
+
+
+def _dimension_ratio_text(dimension_report: Dict[str, Any]) -> str:
+    ratio = dimension_report.get("reduction_factor")
+    if ratio is None:
+        return "unreachable"
+    if float(ratio) >= 1000.0:
+        return f"{float(ratio):.3e}x"
+    return f"{float(ratio):.3f}x"
+
+
+def _ed_plan_drop_reason(ed_plan: Dict[str, Any], name: str) -> str | None:
+    if not isinstance(ed_plan, dict):
+        return None
+    for item in ed_plan.get("dropped_symmetries", []):
+        if not isinstance(item, dict):
+            continue
+        item_name = str(item.get("name", ""))
+        if item_name == name or item_name.startswith(f"{name}:"):
+            return str(item.get("reason", "dropped"))
+    return None
+
+
+def _ed_actual_applied_reductions_from_spectrum(
+    planned_reductions: List[str],
+    spectrum: Dict[str, Any] | None,
+) -> List[str]:
+    """Prefer the completed ED spectrum over the pre-run plan.
+
+    The standard projector can drop combined C3 at runtime if a memory guard is
+    hit.  This keeps summaries from claiming a reduction that was only planned.
+    """
+    if not isinstance(spectrum, dict):
+        return list(planned_reductions)
+    applied: List[str] = []
+    if bool(spectrum.get("use_sz_block", False)):
+        applied.append("sz")
+    if bool(spectrum.get("use_tau_z_block", False)):
+        applied.append("tz")
+    if bool(spectrum.get("use_z2_block", False)):
+        applied.append("z2")
+    if bool(spectrum.get("use_translation_x_block", False)):
+        applied.append("translation_x")
+    if bool(spectrum.get("use_translation_y_block", False)):
+        applied.append("translation_y")
+    if bool(spectrum.get("use_c3_block", False)):
+        applied.append("combined_c3")
+    return applied or list(planned_reductions)
+
+
+def _ed_symmetry_status_text(
+    ed_plan: Dict[str, Any],
+    *,
+    spectrum: Dict[str, Any] | None = None,
+    max_reason_chars: int = 96,
+) -> str:
+    if not isinstance(ed_plan, dict):
+        return "unavailable"
+    completed = isinstance(spectrum, dict)
+
+    def reason_fragment(name: str) -> str:
+        reason = _ed_plan_drop_reason(ed_plan, name)
+        if not reason:
+            return ""
+        if len(reason) > int(max_reason_chars):
+            reason = reason[: int(max_reason_chars) - 3] + "..."
+        return f"({reason})"
+
+    def active(plan_key: str, spectrum_key: str | None = None) -> bool:
+        if completed and spectrum_key is not None:
+            return bool(spectrum.get(spectrum_key, False))
+        return bool(ed_plan.get(plan_key, False))
+
+    entries: List[str] = []
+    entries.append(
+        "Tz="
+        + (
+            f"{'applied' if completed else 'planned'}(target={int(ed_plan.get('target_tz2', 0))})"
+            if active("use_tau_z_block", "use_tau_z_block")
+            else f"dropped{reason_fragment('tz')}"
+        )
+    )
+    if active("use_sz_block", "use_sz_block"):
+        entries.append("Sz=" + ("applied" if completed else "planned"))
+    elif _ed_plan_drop_reason(ed_plan, "sz"):
+        entries.append(f"Sz=dropped{reason_fragment('sz')}")
+
+    if active("use_z2_block", "use_z2_block"):
+        z2_kind = (
+            spectrum.get("z2_kind")
+            if completed and spectrum is not None
+            else ed_plan.get("z2_kind")
+        )
+        entries.append(
+            "Z2="
+            + ("applied" if completed else "planned")
+            + (f"({z2_kind})" if z2_kind else "")
+        )
+    else:
+        entries.append(f"Z2=dropped{reason_fragment('z2')}")
+
+    for axis, label in (("x", "Tx"), ("y", "Ty")):
+        plan_key = f"use_translation_{axis}_block"
+        spectrum_key = f"use_translation_{axis}_block"
+        momentum_key = f"momentum_{axis}_block"
+        if active(plan_key, spectrum_key):
+            momentum = int(ed_plan.get(momentum_key, 0) or 0)
+            entries.append(f"{label}={'applied' if completed else 'planned'}(k={momentum})")
+        elif _ed_plan_drop_reason(ed_plan, f"translation_{axis}"):
+            entries.append(f"{label}=dropped{reason_fragment(f'translation_{axis}')}")
+
+    if active("use_c3_block", "use_c3_block"):
+        q_text = str(ed_plan.get("c3_q_blocks", "all"))
+        if completed and spectrum is not None:
+            selected_q = spectrum.get("selected_c3_q")
+            comm = (spectrum.get("commutator_norms") or {}).get("H_C3")
+            verify = "verified" if comm is not None else "applied"
+            if selected_q is not None:
+                q_text = f"selected_q={selected_q}"
+            if comm is not None:
+                entries.append(f"C3={verify}({q_text}, ||[H,C3]||={float(comm):.2e})")
+            else:
+                entries.append(f"C3={verify}({q_text})")
+        else:
+            entries.append(f"C3=planned(q={q_text}, commutator_check=pending)")
+    else:
+        entries.append(f"C3=dropped{reason_fragment('combined_c3')}")
+    return ", ".join(entries)
+
+
 def _record_output_status(
     summary: Dict[str, Any],
     key: str,
@@ -1810,6 +3549,39 @@ def _record_output_status(
         output_status[key]["error"] = error
     if reason is not None:
         output_status[key]["reason"] = reason
+
+
+PLOT_OUTPUT_WARNING_STATUSES = {"failed", "skipped_optional_dependency"}
+
+
+def _output_warning_keys(summary: Dict[str, Any]) -> List[str]:
+    output_status = summary.get("output_status", {})
+    if not isinstance(output_status, dict):
+        return []
+    return [
+        str(key)
+        for key, item in output_status.items()
+        if isinstance(item, dict) and str(item.get("status")) in PLOT_OUTPUT_WARNING_STATUSES
+    ]
+
+
+def _attach_plot_output_warnings(summary: Dict[str, Any], section_key: str | None = None) -> List[str]:
+    warning_keys = _output_warning_keys(summary)
+    if not warning_keys:
+        return []
+    warnings_payload = summary.setdefault("plot_output_warnings", {})
+    if isinstance(warnings_payload, dict):
+        warnings_payload["keys"] = warning_keys
+        warnings_payload["note"] = (
+            "One or more requested plots were not written. Install matplotlib in the active "
+            "environment or rerun with the relevant --no-plot-* flag."
+        )
+    if section_key is not None and isinstance(summary.get(section_key), dict):
+        section = summary[section_key]
+        section["plot_output_warnings"] = warning_keys
+        if str(section.get("status", "completed")) == "completed":
+            section["status"] = "completed_with_warnings"
+    return warning_keys
 
 
 def _all_plaquette_fluxes_from_payload(payload: Any) -> Dict[str, float]:
@@ -1848,6 +3620,42 @@ def _record_all_plaquette_fluxes(
     grouped_fluxes[str(method_key)] = fluxes
     outputs["all_plaquette_fluxes"] = grouped_fluxes
     return fluxes
+
+
+def _normalize_ipeps_result_schema(result: Any) -> Dict[str, Any]:
+    """Ensure the PEPS backend summary exposes the common solver fields."""
+    if not isinstance(result, dict):
+        result = {
+            "status": "failed",
+            "error": "PEPS backend returned a non-dictionary result.",
+        }
+    normalized = dict(result)
+    normalized["status"] = str(normalized.get("status", "failed"))
+    if "energy_per_site" not in normalized:
+        normalized["energy_per_site"] = normalized.get("ground_state_energy_per_site")
+    if "ground_state_energy_per_site" not in normalized:
+        normalized["ground_state_energy_per_site"] = normalized.get("energy_per_site")
+    plaquette_flux = normalized.get("plaquette_flux")
+    if not isinstance(plaquette_flux, dict):
+        plaquette_flux = {
+            "available": False,
+            "value": None,
+            "W_p": None,
+            "reason": "PEPS backend did not return a plaquette_flux payload.",
+        }
+    normalized["plaquette_flux"] = plaquette_flux
+    return normalized
+
+
+def _compact_ipeps_output(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Small mirror requested by downstream JSON consumers."""
+    return {
+        "status": str(result.get("status", "failed")),
+        "energy_per_site": result.get("energy_per_site"),
+        "ground_state_energy_per_site": result.get("ground_state_energy_per_site", result.get("energy_per_site")),
+        "plaquette_flux": result.get("plaquette_flux"),
+        "phase_label": result.get("phase_label"),
+    }
 
 
 def _record_phase_scan_plaquette_fluxes(
@@ -1894,7 +3702,36 @@ def _skip_plot_step(
 ) -> None:
     _record_output_status(summary, key, filename, "skipped_disabled", reason=reason)
     _save_summary_checkpoint(output_folder, summary)
-    print(f"[output] skip disabled: {filename} :: {reason}")
+    print(f"[output] skip disabled: {os.path.join(output_folder, filename)} :: {reason}")
+
+
+def _plot_step_status(summary: Dict[str, Any], key: str) -> str | None:
+    output_status = summary.get("output_status", {})
+    if not isinstance(output_status, dict):
+        return None
+    item = output_status.get(key)
+    if not isinstance(item, dict):
+        return None
+    status = item.get("status")
+    return str(status) if status is not None else None
+
+
+def _record_combined_plot_alias(
+    summary: Dict[str, Any],
+    output_folder: str,
+    key: str,
+    combined_filename: str,
+    reason: str,
+) -> None:
+    _record_output_status(
+        summary,
+        key,
+        combined_filename,
+        "saved_in_combined_plot",
+        reason=reason,
+    )
+    _save_summary_checkpoint(output_folder, summary)
+    print(f"[output] combined overlay: {os.path.join(output_folder, combined_filename)} :: {reason}")
 
 
 def _save_plot_step(
@@ -1910,19 +3747,36 @@ def _save_plot_step(
     if os.path.exists(filepath) and not overwrite_existing:
         _record_output_status(summary, key, filename, "skipped_exists")
         _save_summary_checkpoint(output_folder, summary)
-        print(f"[output] skip existing: {filename}")
+        print(f"[output] skip existing: {filepath}")
         return
 
     try:
-        save_callable(filepath)
+        with profile_stage("plotting"):
+            save_callable(filepath)
         _record_output_status(summary, key, filename, "saved")
         _save_summary_checkpoint(output_folder, summary)
-        print(f"[output] saved: {filename}")
+        print(f"[output] saved: {filepath}")
     except Exception as exc:
-        _record_output_status(summary, key, filename, "failed", str(exc))
+        optional_dependency_missing = isinstance(exc, (ImportError, ModuleNotFoundError))
+        status = "skipped_optional_dependency" if optional_dependency_missing else "failed"
+        _record_output_status(summary, key, filename, status, str(exc))
+        if optional_dependency_missing:
+            warnings_payload = summary.setdefault("plot_output_warnings", {})
+            if isinstance(warnings_payload, dict):
+                warnings_payload.setdefault("keys", [])
+                if isinstance(warnings_payload["keys"], list) and key not in warnings_payload["keys"]:
+                    warnings_payload["keys"].append(key)
+                warnings_payload["missing_dependency"] = exc.__class__.__name__
+                warnings_payload["note"] = (
+                    "A requested plot could not be written because an optional plotting "
+                    "dependency is unavailable in the active Python environment."
+                )
         _save_summary_checkpoint(output_folder, summary)
-        print(f"[output] failed: {filename} :: {exc}")
-        if not continue_on_plot_error:
+        if optional_dependency_missing:
+            print(f"[output] skip optional dependency: {filepath} :: {exc}")
+        else:
+            print(f"[output] failed: {filepath} :: {exc}")
+        if not continue_on_plot_error and not optional_dependency_missing:
             raise
 
 
@@ -1930,10 +3784,19 @@ _SPLIT_MODULE_BINDINGS_ACTIVE = False
 
 
 def _load_tenpy_backend_module() -> Any:
-    """Load the local TeNPy U(1) Yao-Lee backend/template."""
+    """Load the local TeNPy dense Yao-Lee backend/template."""
     import importlib
 
     return importlib.import_module("tenpy_backend")
+
+
+def _optional_dependency_missing_callable(symbol_name: str, module_name: str, reason: str) -> Callable[..., Any]:
+    def _missing(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError(
+            f"Optional module '{module_name}' is unavailable, so '{symbol_name}' cannot run: {reason}"
+        )
+
+    return _missing
 
 
 def _bind_split_module_implementations() -> None:
@@ -1944,15 +3807,58 @@ def _bind_split_module_implementations() -> None:
 
     try:
         import analysis as analysis_tools
-        import ed_backend as ed_backend_impl
         import models as model_defs
         import plot_outputs
         import tenax_backend as tenax_backend_impl
     except Exception as exc:
         raise RuntimeError(f"Could not import the split implementation modules: {exc}") from exc
 
+    ed_backend_impl = None
+    ed_backend_import_error: str | None = None
+    try:
+        import ed_backend as ed_backend_impl_candidate
+
+        ed_backend_impl = ed_backend_impl_candidate
+    except Exception as exc:
+        ed_backend_import_error = str(exc)
+        print(
+            "[optional] skip ed_backend.py import: "
+            f"{ed_backend_import_error}. Standard sparse ED / finite-temperature ED will be skipped if requested."
+        )
+
+    ed_backend_names = (
+        "estimate_sz_conserved_dimension",
+        "estimate_spin_orbital_u1_dimension",
+        "build_sz_conserved_basis",
+        "build_spin_orbital_u1_basis",
+        "build_sparse_hamiltonian_spin_orbital_u1",
+        "run_spin_orbital_u1_exact_spectrum",
+        "build_spin_pi_z_operator_in_spin_orbital_u1_basis",
+        "build_fused_translation_operator_in_spin_orbital_u1_basis",
+        "build_combined_c3_operator_in_spin_orbital_u1_basis",
+        "run_spin_orbital_projected_exact_spectrum",
+        "build_sparse_hamiltonian_sz_conserved",
+        "run_sz_conserved_exact_spectrum",
+        "plaquette_flux_from_spin_orbital_u1_ed_state",
+        "collect_correlation_matrices_from_spin_orbital_u1_ed",
+        "build_spin_orbital_u1_scalar_correlations",
+        "collect_uniform_z_observables_from_sz_conserved_ed_state",
+        "plaquette_flux_from_sz_conserved_ed_state",
+        "collect_correlation_matrices_from_sz_conserved_ed",
+        "build_sz_conserved_scalar_correlations",
+        "all_bond_energies_sz_conserved",
+        "build_exact_hamiltonian",
+        "run_small_cluster_exact_spectrum",
+        "run_small_cluster_exact_diagonalization",
+        "collect_uniform_z_observables_from_ed_state",
+        "plaquette_flux_from_ed_state",
+        "collect_correlation_matrices_from_ed",
+        "build_spin_orbital_scalar_correlations",
+        "all_bond_energies",
+        "run_finite_temperature_ed",
+    )
     bindings: Dict[str, Any] = {}
-    for module, names in (
+    module_bindings: List[Tuple[Any, Tuple[str, ...]]] = [
         (
             analysis_tools,
             (
@@ -1961,6 +3867,13 @@ def _bind_split_module_implementations() -> None:
                 "_make_progress_bar",
                 "_start_stage",
                 "_end_stage",
+                "configure_profiling_from_args",
+                "finalize_profiling",
+                "profile_stage",
+                "profiling_enabled",
+                "profile_scan_points_enabled",
+                "record_scan_point_timing",
+                "update_profile_metadata",
                 "_entropy_from_probabilities",
                 "_entropy_dict_from_singular_values",
                 "_summarize_entropy_values",
@@ -1994,6 +3907,8 @@ def _bind_split_module_implementations() -> None:
                 "_phase_scan_quantum_point",
                 "_phase_scan_classical_point",
                 "run_alpha_beta_phase_scan",
+                "validate_yao_lee_symmetry_case",
+                "validate_yao_lee_symmetry_rules",
             ),
         ),
         (
@@ -2030,6 +3945,10 @@ def _bind_split_module_implementations() -> None:
                 "_normalize_external_field_treatment",
                 "_normalize_external_field_axis",
                 "external_field_vector",
+                "resolve_field_vector",
+                "classify_external_field",
+                "yao_lee_conserved_symmetries",
+                "normalize_requested_symmetry_reductions",
                 "external_field_is_active",
                 "external_field_terms_for_model",
                 "validate_external_field_symmetry_compatibility",
@@ -2088,29 +4007,6 @@ def _bind_split_module_implementations() -> None:
             ),
         ),
         (
-            ed_backend_impl,
-            (
-                "estimate_sz_conserved_dimension",
-                "build_sz_conserved_basis",
-                "build_sparse_hamiltonian_sz_conserved",
-                "run_sz_conserved_exact_spectrum",
-                "collect_uniform_z_observables_from_sz_conserved_ed_state",
-                "plaquette_flux_from_sz_conserved_ed_state",
-                "collect_correlation_matrices_from_sz_conserved_ed",
-                "build_sz_conserved_scalar_correlations",
-                "all_bond_energies_sz_conserved",
-                "build_exact_hamiltonian",
-                "run_small_cluster_exact_spectrum",
-                "run_small_cluster_exact_diagonalization",
-                "collect_uniform_z_observables_from_ed_state",
-                "plaquette_flux_from_ed_state",
-                "collect_correlation_matrices_from_ed",
-                "build_spin_orbital_scalar_correlations",
-                "all_bond_energies",
-                "run_finite_temperature_ed",
-            ),
-        ),
-        (
             tenax_backend_impl,
             (
                 "_build_auto_mpo_from_terms",
@@ -2146,6 +4042,8 @@ def _bind_split_module_implementations() -> None:
                 "save_phase_representative_pattern",
                 "save_flux_crystal_pattern",
                 "save_multi_method_energy_comparison",
+                "plot_peps_vs_ed_comparison",
+                "save_peps_vs_ed_comparison",
                 "save_entropy_profiles_comparison",
                 "save_entropy_method_means_comparison",
                 "save_dmrg_ed_energy_comparison",
@@ -2157,9 +4055,20 @@ def _bind_split_module_implementations() -> None:
                 "save_finite_temperature_structure_factors_plot",
                 "save_phase_observable_heatmap",
                 "save_phase_diagram_plot",
+                "save_energy_b_scan_plot",
             ),
         ),
-    ):
+    ]
+    if ed_backend_impl is not None:
+        module_bindings.append((ed_backend_impl, ed_backend_names))
+    elif ed_backend_import_error is not None:
+        for name in ed_backend_names:
+            bindings.setdefault(
+                name,
+                _optional_dependency_missing_callable(name, "ed_backend.py", ed_backend_import_error),
+            )
+
+    for module, names in module_bindings:
         for name in names:
             if hasattr(module, name):
                 bindings[name] = getattr(module, name)
@@ -2171,7 +4080,18 @@ def _bind_split_module_implementations() -> None:
 def main() -> None:
     _bind_split_module_implementations()
     args = parse_command_line()
+    _validate_solver_resource_args(args)
+    args.backend = _normalize_backend(args.backend)
+    args.method = _normalize_calculation_method(getattr(args, "method", METHOD), args.backend)
+    args.ipeps_contraction_method = _normalize_ipeps_contraction_method(
+        getattr(args, "ipeps_contraction_method", IPEPS_CONTRACTION_METHOD)
+    )
     args.ed_backend = _normalize_ed_backend(args.ed_backend)
+    symmetry_request_from_cli = bool(
+        args.symmetry_reductions is not None
+        or args.symmetry_mode is not None
+        or getattr(args, "use_sz_conserved", None) is not None
+    )
     args.symmetry_reductions = _normalize_symmetry_reductions(
         args.symmetry_reductions,
         args.symmetry_mode,
@@ -2195,13 +4115,42 @@ def main() -> None:
         args.phase_scan_mode,
         args.phase_scan_quantum_methods,
     )
-    if args.run_phase_scan is None:
-        args.run_phase_scan = bool(args.phase_diagram)
-    if args.plot_phase_scan is None:
-        args.plot_phase_scan = bool(args.run_phase_scan)
     if bool(args.phase_scan_only):
+        # Phase-scan-only has priority: it is the scan/plot workflow, with the
+        # single-point workflow skipped later.
+        args.phase_diagram = True
         args.run_phase_scan = True
+        args.plot_phase_scan = True
+    if args.backend == "quimb" and args.method in ("peps", "ipeps"):
+        # quimb PEPS/iPEPS paths are benchmark workflows: always attempt the
+        # finite ED reference, then let the existing ED eligibility caps decide
+        # whether the selected cluster is feasible.
+        args.run_ed = True
+    elif bool(args.phase_diagram):
+        # The phase-diagram switch is the combined user-facing option. Turning
+        # it on always means calculate, plot, and save the phase diagrams.
+        args.run_phase_scan = True
+        args.plot_phase_scan = True
+    else:
+        if args.run_phase_scan is None:
+            args.run_phase_scan = False
+        if args.plot_phase_scan is None:
+            args.plot_phase_scan = bool(args.run_phase_scan)
+    args.output_folder = _resolve_output_folder(args.output_folder)
+    args.profile_output_folder = _resolve_output_folder(
+        getattr(args, "profile_output_folder", PROFILE_OUTPUT_FOLDER)
+    )
     ensure_folder_exists(args.output_folder)
+    configure_profiling_from_args(args)
+    update_profile_metadata(
+        requested_backend=args.backend,
+        requested_method=args.method,
+        requested_ed_backend=args.ed_backend,
+        requested_ed_symmetry_engine=args.ed_symmetry_engine,
+        output_folder=args.output_folder,
+        profile_output_folder=args.profile_output_folder,
+    )
+    print(f"[output] folder: {args.output_folder}")
     show_progress = bool(args.progress)
     overwrite_existing = bool(args.overwrite_plots)
     continue_on_plot_error = not bool(args.strict_plot_errors)
@@ -2212,6 +4161,7 @@ def main() -> None:
     calculate_real_space_patterns = bool(
         args.calculate_real_space_patterns
         or args.plot_real_space_patterns
+        or args.plot_bond_energies
     )
     calculate_correlations = bool(
         args.calculate_correlations
@@ -2230,7 +4180,8 @@ def main() -> None:
             "real_space_patterns": bool(calculate_real_space_patterns),
             "reference_site_idx": args.reference_site_idx,
             "note": (
-                "Bond energies, structure factors, and real-space patterns require correlation matrices, "
+                "Bond energies, structure factors, and real-space patterns require correlation matrices; "
+                "bond-energy plots also request the compact spin-vector overlay, "
                 "so calculate_correlations is promoted to true when any of them is enabled."
             ),
         },
@@ -2250,47 +4201,77 @@ def main() -> None:
             "enabled": bool(args.phase_diagram),
             "run": bool(args.run_phase_scan),
             "plot": bool(args.plot_phase_scan),
+            "channels": str(args.phase_scan_channels),
             "mode": str(args.phase_scan_mode),
             "quantum_methods": list(args.phase_scan_quantum_methods),
             "selected_outputs": list(args.phase_scan_methods),
-            "note": "The phase_diagram switch ties phase-scan calculation and phase-diagram plotting together by default.",
+            "note": (
+                "phase_scan_only has priority and promotes phase_diagram on; "
+                "phase_diagram=true always runs, plots, and saves the selected phase scans."
+            ),
         },
     }
     lattice_name = str(args.lattice).lower()
     circumference_x = bool(args.circumference_x)
     circumference_y = bool(args.circumference_y)
     args.symmetry_mode = _normalize_symmetry_mode(args.symmetry_mode)
-    model_spec = build_model_spec(
-        spin_rep=args.spin_rep,
-        orbital_rep=args.orbital_rep,
-        model_family=args.model_family,
-        ising_axis=args.ising_axis,
-    )
+    with profile_stage("model_spec construction"):
+        model_spec = build_model_spec(
+            spin_rep=args.spin_rep,
+            orbital_rep=args.orbital_rep,
+            model_family=args.model_family,
+            ising_axis=args.ising_axis,
+        )
     # Normalize legacy alias "1" -> "0" in recorded parameters.
     args.orbital_rep = model_spec.orbital_rep
-    args.external_field_treatment = _normalize_external_field_treatment(args.external_field_treatment)
-    args.external_field_axis = _normalize_external_field_axis(args.external_field_axis)
-    resolved_field_vector = external_field_vector(
-        axis=args.external_field_axis,
-        strength=args.external_field_strength,
-        hx=args.field_hx,
-        hy=args.field_hy,
-        hz=args.field_hz,
-    )
-    hamiltonian_external_field_terms = (
-        external_field_terms_for_model(
-            resolved_field_vector,
-            mu_b=args.mu_b,
-            field_sign=args.field_sign,
-            sigma_factor=args.field_sigma_factor,
+    with profile_stage("external field construction"):
+        args.external_field_treatment = _normalize_external_field_treatment(args.external_field_treatment)
+        args.external_field_axis = _normalize_external_field_axis(args.external_field_axis)
+        resolved_field_vector = external_field_vector(
+            axis=args.external_field_axis,
+            strength=args.external_field_strength,
+            hx=args.field_hx,
+            hy=args.field_hy,
+            hz=args.field_hz,
         )
-        if args.external_field_treatment == "hamiltonian"
-        else []
+        hamiltonian_external_field_terms = (
+            external_field_terms_for_model(
+                resolved_field_vector,
+                mu_b=args.mu_b,
+                field_sign=args.field_sign,
+                sigma_factor=args.field_sigma_factor,
+            )
+            if args.external_field_treatment == "hamiltonian"
+            else []
+        )
+    model_symmetry_selection = normalize_requested_symmetry_reductions(
+        args.symmetry_reductions,
+        model_spec,
+        args.external_field_treatment,
+        resolved_field_vector,
+        backend=args.backend,
+        strict=bool(args.strict_symmetry_selection_rules),
+        allow_dense_fallback=bool(args.symmetry_allow_dense_fallback),
+        requested_from_default=not symmetry_request_from_cli,
+        target_sz2=int(args.u1_target_sz2),
+        target_tz2=int(args.u1_target_tz2),
+        z2_target_parity=int(args.z2_target_parity),
     )
+    if model_symmetry_selection.get("errors"):
+        raise ValueError("; ".join(str(item) for item in model_symmetry_selection["errors"]))
+    args.model_symmetry_selection = model_symmetry_selection
+    args.symmetry_reductions = tuple(model_symmetry_selection.get("safe_reductions", ["none"]))
+    args.symmetry_mode = _normalize_symmetry_mode(_legacy_symmetry_mode_from_reductions(args.symmetry_reductions))
+    if show_progress:
+        for warning in model_symmetry_selection.get("warnings", []):
+            print(f"[symmetry] {warning}")
     try:
         validate_external_field_symmetry_compatibility(
             hamiltonian_external_field_terms,
             symmetry_mode=args.symmetry_mode,
+            model_family=model_spec.model_family,
+            external_field_treatment=args.external_field_treatment,
+            z2_generator=model_symmetry_selection.get("z2_generator"),
         )
     except ValueError as exc:
         if not bool(args.symmetry_allow_dense_fallback):
@@ -2305,6 +4286,12 @@ def main() -> None:
     args.momentum_x_block = int(args.momentum_x_block)
     args.momentum_y_block = int(args.momentum_y_block)
     args.reflection_block = int(args.reflection_block)
+    args.ed_symmetry_engine = _normalize_ed_symmetry_engine(args.ed_symmetry_engine)
+    args.ed_quspin_experimental_fused_translation = bool(args.ed_quspin_experimental_fused_translation)
+    args.ed_c3_mode = str(args.ed_c3_mode).strip().lower()
+    args.ed_c3_q_blocks = str(args.ed_c3_q_blocks).strip().lower()
+    args.ed_z2_mode = str(args.ed_z2_mode).strip().lower()
+    args.ed_z2_kind = str(args.ed_z2_kind).strip().lower()
     args.phase_scan_ed_max_sites = (
         int(args.max_ed_sites)
         if args.phase_scan_ed_max_sites is None
@@ -2316,8 +4303,10 @@ def main() -> None:
         else int(args.phase_scan_ed_max_hilbert_dim)
     )
     symmetry_reduction_settings = _symmetry_reduction_settings_from_report(args, None)
+    args.ed_symmetry_plan = {"status": "pending", "reason": "geometry has not been built yet"}
     quspin_ed_settings = {
         "symmetry_reductions": symmetry_reduction_settings,
+        "ed_symmetry_plan": args.ed_symmetry_plan,
         "check_symmetries": bool(args.quspin_check_symmetries),
         "check_hermiticity": bool(args.quspin_check_hermiticity),
         "check_particle_conservation": bool(args.quspin_check_particle_conservation),
@@ -2332,31 +4321,116 @@ def main() -> None:
         args.use_sz_conserved = bool(args.use_sz_block)
         quspin_ed_settings = {
             "symmetry_reductions": symmetry_reduction_settings,
+            "ed_symmetry_plan": getattr(args, "ed_symmetry_plan", {"status": "pending"}),
             "check_symmetries": bool(args.quspin_check_symmetries),
             "check_hermiticity": bool(args.quspin_check_hermiticity),
             "check_particle_conservation": bool(args.quspin_check_particle_conservation),
         }
         return symmetry_reduction_settings
 
+    def _geometry_cache_key(geometry_obj: Any) -> Tuple[Any, ...]:
+        cell_indices = tuple(
+            tuple(int(value) for value in cell)
+            for cell in list(getattr(geometry_obj, "cell_indices", []))
+        )
+        sublattice_indices = tuple(
+            int(value) for value in list(getattr(geometry_obj, "sublattice_indices", []))
+        )
+        return (
+            int(getattr(geometry_obj, "number_of_sites", 0)),
+            int(getattr(geometry_obj, "length_x", args.length_x)),
+            int(getattr(geometry_obj, "length_y", args.length_y)),
+            bool(getattr(geometry_obj, "circumference_x", circumference_x)),
+            bool(getattr(geometry_obj, "circumference_y", circumference_y)),
+            cell_indices,
+            sublattice_indices,
+        )
+
+    def _hashable_cache_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            return tuple(sorted((str(key), _hashable_cache_value(item)) for key, item in value.items()))
+        if isinstance(value, (list, tuple)):
+            return tuple(_hashable_cache_value(item) for item in value)
+        if isinstance(value, set):
+            return tuple(sorted(_hashable_cache_value(item) for item in value))
+        return value
+
+    ed_symmetry_plan_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+
+    def refresh_ed_symmetry_plan(geometry_obj: Any) -> Dict[str, Any]:
+        nonlocal quspin_ed_settings
+        with profile_stage("ED symmetry plan resolution"):
+            cache_key = (
+                _geometry_cache_key(geometry_obj),
+                model_spec,
+                tuple(args.symmetry_reductions),
+                str(args.ed_backend),
+                str(args.ed_symmetry_engine),
+                bool(args.ed_quspin_experimental_fused_translation),
+                str(args.ed_c3_mode),
+                str(args.ed_c3_q_blocks),
+                str(args.ed_z2_mode),
+                str(args.ed_z2_kind),
+                bool(args.use_translation_x_block),
+                bool(args.use_translation_y_block),
+                int(args.momentum_x_block),
+                int(args.momentum_y_block),
+                int(args.z2_target_parity),
+                int(args.u1_target_sz2),
+                int(args.u1_target_tz2),
+                tuple(float(value) for value in resolved_field_vector),
+                tuple((float(coefficient), str(op_name)) for coefficient, op_name in hamiltonian_external_field_terms),
+                _hashable_cache_value(symmetry_reduction_settings),
+            )
+            cached_plan = ed_symmetry_plan_cache.get(cache_key)
+            if cached_plan is None:
+                cached_plan = _resolve_ed_symmetry_plan(
+                    args=args,
+                    model_spec_obj=model_spec,
+                    geometry_obj=geometry_obj,
+                    resolved_field_vector=resolved_field_vector,
+                    hamiltonian_field_terms=hamiltonian_external_field_terms,
+                    shared_symmetry_settings=symmetry_reduction_settings,
+                )
+                ed_symmetry_plan_cache[cache_key] = copy.deepcopy(cached_plan)
+            args.ed_symmetry_plan = copy.deepcopy(cached_plan)
+            quspin_ed_settings = dict(quspin_ed_settings)
+            quspin_ed_settings["symmetry_reductions"] = symmetry_reduction_settings
+            quspin_ed_settings["ed_symmetry_plan"] = args.ed_symmetry_plan
+            return args.ed_symmetry_plan
+
+    def attach_symmetry_dimension_report(report: Dict[str, Any], geometry_obj: Any) -> Dict[str, Any]:
+        dimension_report = _symmetry_hilbert_dimension_report(
+            geometry_obj,
+            model_spec,
+            symmetry_reduction_settings,
+        )
+        report["hilbert_space_dimension"] = dimension_report
+        return dimension_report
+
     refresh_symmetry_reduction_settings(None)
     symmetry_preflight_report: Dict[str, Any] | None = None
     effective_symmetry_mode = str(args.symmetry_mode)
 
-    def run_symmetry_preflight_for_geometry(geometry_obj: Any) -> Dict[str, Any]:
+    def _run_symmetry_preflight_for_geometry_impl(geometry_obj: Any) -> Dict[str, Any]:
         if not bool(args.symmetry_precheck):
             disabled_effective = "none" if str(args.symmetry_mode) == "auto" else str(args.symmetry_mode)
             report = {
                 "status": "disabled",
                 "requested_mode": str(args.symmetry_mode),
                 "requested_reductions": list(args.symmetry_reductions),
+                "model_aware_selection": getattr(args, "model_symmetry_selection", None),
                 "effective_mode_for_tenax": disabled_effective,
             }
             refresh_symmetry_reduction_settings(report)
+            ed_plan = refresh_ed_symmetry_plan(geometry_obj)
+            attach_symmetry_dimension_report(report, geometry_obj)
             report["effective_reductions"] = {
                 "sz": bool(args.use_sz_block),
                 "tz": bool(args.use_tau_z_block),
                 "z2": bool(args.use_z2_block),
             }
+            report["ed_symmetry_plan"] = ed_plan
             return report
         report = analyze_hamiltonian_symmetries(
             geometry=geometry_obj,
@@ -2375,6 +4449,7 @@ def main() -> None:
         )
         report["status"] = "completed"
         report["requested_reductions"] = list(args.symmetry_reductions)
+        report["model_aware_selection"] = getattr(args, "model_symmetry_selection", None)
         failures: List[str] = []
         requested_mode = str(report.get("requested_mode", args.symmetry_mode))
         reduction_set = set(args.symmetry_reductions)
@@ -2402,28 +4477,72 @@ def main() -> None:
         report["effective_mode_for_tenax"] = effective_mode
         report["strict_precheck_failures"] = failures
         refresh_symmetry_reduction_settings(report)
+        ed_plan = refresh_ed_symmetry_plan(geometry_obj)
+        dimension_report = attach_symmetry_dimension_report(report, geometry_obj)
         report["effective_reductions"] = {
             "sz": bool(args.use_sz_block),
             "tz": bool(args.use_tau_z_block),
             "z2": bool(args.use_z2_block),
         }
+        report["ed_symmetry_plan"] = ed_plan
         if show_progress:
             u1_info = report.get("u1", {}) if isinstance(report.get("u1"), dict) else {}
             u1_sz_info = report.get("u1_sz", {}) if isinstance(report.get("u1_sz"), dict) else {}
             u1_tz_info = report.get("u1_tz", {}) if isinstance(report.get("u1_tz"), dict) else {}
             z2_info = report.get("z2", {}) if isinstance(report.get("z2"), dict) else {}
-            print(
-                "[symmetry] precheck: "
-                f"requested={list(args.symmetry_reductions)}, "
-                f"U1(Sz,tau_z)={bool(u1_info.get('conserved_total_Sz_and_total_Tz', False))}, "
-                f"U1_target_reachable={bool((u1_info.get('target_sector') or {}).get('reachable', False))}, "
-                f"U1_Sz={bool(u1_sz_info.get('conserved_total_Sz', False))}, "
-                f"U1_Tz={bool(u1_tz_info.get('conserved_total_Tz', False))}, "
-                f"Z2={bool(z2_info.get('conserved_global_parity', False))}, "
-                f"effective_reductions={report['effective_reductions']}, "
-                f"recommended_tenax={recommended_mode}, "
-                f"effective_tenax={effective_mode}"
+            applied_shared_reductions = [
+                name for name, enabled in report["effective_reductions"].items() if bool(enabled)
+            ]
+            dropped_shared_reductions = list(
+                model_symmetry_selection.get("dropped_reductions", [])
+                if isinstance(model_symmetry_selection, dict)
+                else []
             )
+            print(
+                "[symmetry] model rules: "
+                f"method={getattr(args, 'backend', 'auto')}/{getattr(args, 'method', 'auto')}, "
+                f"requested={list(args.symmetry_reductions)}, "
+                f"conserved={{Sz:{bool(u1_sz_info.get('conserved_total_Sz', False))}, "
+                f"Tz:{bool(u1_tz_info.get('conserved_total_Tz', False))}, "
+                f"Z2:{bool(z2_info.get('conserved_global_parity', False))}}}, "
+                f"eligible={applied_shared_reductions}, "
+                f"dropped_by_model={dropped_shared_reductions}, "
+                f"field_class={model_symmetry_selection.get('field_class') if isinstance(model_symmetry_selection, dict) else None}, "
+                f"full_dim={int(dimension_report['full_hilbert_dimension']):,}, "
+                f"model_effective_dim={int(dimension_report['effective_hilbert_dimension']):,}, "
+                f"model_reduction={_dimension_ratio_text(dimension_report)}, "
+                f"basis={dimension_report['basis_label']}"
+            )
+            if bool(ed_plan.get("use_tau_z_block", False)):
+                ed_u1_dim = _spin_orbital_symmetry_reduced_dimension(
+                    int(geometry_obj.number_of_sites),
+                    False,
+                    int(ed_plan.get("target_sz2", args.u1_target_sz2)),
+                    True,
+                    int(ed_plan.get("target_tz2", args.u1_target_tz2)),
+                )
+                ed_projector_factor = _ed_projector_reduction_factor_estimate(ed_plan, geometry_obj)
+                ed_projector_dim = int(max(1, int(ed_u1_dim) // max(1, ed_projector_factor)))
+                ed_total_reduction = (
+                    float(dimension_report["full_hilbert_dimension"]) / float(ed_projector_dim)
+                    if int(ed_projector_dim) > 0
+                    else None
+                )
+                ed_engine_label = str(ed_plan.get("effective_engine", ed_plan.get("engine", args.ed_symmetry_engine)))
+                ed_dropped = [item.get("name") for item in ed_plan.get("dropped_symmetries", [])]
+                print(
+                    "[ed-symmetry] plan: "
+                    f"backend={ed_engine_label}, "
+                    f"status={_ed_symmetry_status_text(ed_plan)}, "
+                    f"dropped={ed_dropped}, "
+                    f"field_class={ed_plan.get('actual_hamiltonian_field_class')}, "
+                    f"full_dim={int(dimension_report['full_hilbert_dimension']):,}, "
+                    f"Tz_parent_dim={int(ed_u1_dim):,}, "
+                    f"projected_dim_estimate={int(ed_projector_dim):,}, "
+                    f"Tz_reduction={float(dimension_report['full_hilbert_dimension']) / float(ed_u1_dim):.3f}x, "
+                    f"projector_reduction~={ed_projector_factor}x, "
+                    f"total_reduction~={(f'{ed_total_reduction:.3f}x' if ed_total_reduction is not None else 'unreachable')}"
+                )
             if failures:
                 print(f"[symmetry] strict precheck issue: {'; '.join(failures)}")
         if (
@@ -2438,6 +4557,10 @@ def main() -> None:
                 "or pass --symmetry-allow-dense-fallback to continue without symmetry speedup."
             )
         return report
+
+    def run_symmetry_preflight_for_geometry(geometry_obj: Any) -> Dict[str, Any]:
+        with profile_stage("symmetry precheck"):
+            return _run_symmetry_preflight_for_geometry_impl(geometry_obj)
 
     # Keep outputs consistent with current settings: if the output folder already
     # contains results from a different parameter set, auto-overwrite stale plots.
@@ -2456,35 +4579,36 @@ def main() -> None:
                 "auto-enabling overwrite for consistency."
             )
 
-    if args.backend == "tenpy" and lattice_name != "honeycomb":
-        raise ValueError(
-            "TeNPy backend currently supports only --lattice honeycomb. "
-            "Use --backend tenax for square/triangular lattices."
-        )
-    tenpy_transverse_field = any(
-        str(op_name) in ("Sx", "Sy")
-        for _coefficient, op_name in list(hamiltonian_external_field_terms or [])
-    )
-    tenpy_allowed_symmetry_modes = ("auto", "u1_sz", "none") if tenpy_transverse_field else ("auto", "u1_sz")
-    if args.backend == "tenpy" and args.symmetry_mode not in tenpy_allowed_symmetry_modes:
-        raise ValueError(
-            "The local TeNPy backend is the strict spin-U1 implementation and supports "
-            "only --symmetry-mode u1_sz (or auto), except transverse Hamiltonian fields may "
-            "use --symmetry-mode none. Use --backend tenax/--symmetry-mode none for dense "
-            "non-symmetric experiments."
-        )
-    if args.backend == "tenpy":
+    tenpy_allowed_symmetry_modes = ("auto", "u1_tz", "none")
+
+    def tenpy_backend_compatibility_issue() -> str | None:
+        if lattice_name != "honeycomb":
+            return (
+                "TeNPy backend currently supports only --lattice honeycomb."
+            )
+        if args.symmetry_mode not in tenpy_allowed_symmetry_modes:
+            return (
+                "The local TeNPy backend uses the Yao-Lee total-Tz U1 implementation and supports "
+                "only --symmetry-mode u1_tz, auto, or none."
+            )
         if not (
             model_spec.spin_rep == "1/2"
             and model_spec.orbital_rep == "1/2"
             and model_spec.model_family == "yao_lee"
             and model_spec.ising_axis == "z"
         ):
-            raise ValueError(
+            return (
                 "TeNPy backend currently supports only the legacy default model "
-                "(spin_rep=1/2, orbital_rep=1/2, model_family=yao_lee, ising_axis=z). "
-                "Use --backend tenax for other constructions."
+                "(spin_rep=1/2, orbital_rep=1/2, model_family=yao_lee, ising_axis=z)."
             )
+        return None
+
+    tenpy_backend_issue = tenpy_backend_compatibility_issue()
+    if args.backend == "tenpy" and tenpy_backend_issue is not None:
+        raise ValueError(
+            f"{tenpy_backend_issue} Use --backend tenax for unsupported lattices/models "
+            "or dense non-symmetric experiments."
+        )
 
     geometry = None
     dmrg_info: Dict[str, Any] = {}
@@ -2506,6 +4630,8 @@ def main() -> None:
     run_file_prefix: str | None = None
     run_plot_title_label: str | None = None
     run_summary_filename = "run_summary.json"
+    output_filename_cache: Dict[str, str] = {}
+    plot_title_cache: Dict[str, str] = {}
 
     def configure_run_output_names(geometry_obj: Any) -> None:
         nonlocal run_file_prefix, run_plot_title_label, run_summary_filename
@@ -2548,10 +4674,18 @@ def main() -> None:
     def output_filename(base_filename: str) -> str:
         if run_file_prefix is None:
             return base_filename
-        return labeled_output_filename(run_file_prefix, base_filename)
+        cached = output_filename_cache.get(base_filename)
+        if cached is None:
+            cached = labeled_output_filename(run_file_prefix, base_filename)
+            output_filename_cache[base_filename] = cached
+        return cached
 
     def plot_title(base_title: str) -> str:
-        return titled_for_run(base_title, run_plot_title_label)
+        cached = plot_title_cache.get(base_title)
+        if cached is None:
+            cached = titled_for_run(base_title, run_plot_title_label)
+            plot_title_cache[base_title] = cached
+        return cached
 
     def save_flux_crystal_output(
         summary_obj: Dict[str, Any],
@@ -2596,21 +4730,32 @@ def main() -> None:
         filepath = os.path.join(args.output_folder, filename)
         if not bool(args.plot_geometry):
             geometry_plot_status = "skipped_disabled"
-            print(f"[output] skip disabled: {filename} :: plot_geometry is false")
+            print(f"[geometry] plot disabled (plot_geometry=false); not writing {filepath}")
             return
         if os.path.exists(filepath) and not overwrite_existing:
             geometry_plot_status = "skipped_exists"
-            print(f"[output] skip existing: {filename}")
+            print(f"[output] skip existing: {filepath}")
             return
         try:
-            save_geometry_diagram(geometry_obj, filepath, lattice_name, title_label=run_plot_title_label)
+            with profile_stage("plotting"):
+                save_geometry_diagram(
+                    geometry_obj,
+                    filepath,
+                    lattice_name,
+                    title_label=run_plot_title_label,
+                    external_field_vector=resolved_field_vector,
+                )
             geometry_plot_status = "saved"
-            print(f"[output] saved: {filename}")
+            print(f"[output] saved: {filepath}")
         except Exception as exc:
-            geometry_plot_status = "failed"
+            optional_dependency_missing = isinstance(exc, (ImportError, ModuleNotFoundError))
+            geometry_plot_status = "skipped_optional_dependency" if optional_dependency_missing else "failed"
             geometry_plot_error = str(exc)
-            print(f"[output] failed: {filename} :: {exc}")
-            if not continue_on_plot_error:
+            if optional_dependency_missing:
+                print(f"[output] skip optional dependency: {filepath} :: {exc}")
+            else:
+                print(f"[output] failed: {filepath} :: {exc}")
+            if not continue_on_plot_error and not optional_dependency_missing:
                 raise
 
     def _phase_scan_representative_rows(
@@ -2651,6 +4796,13 @@ def main() -> None:
                 "row_index": int(row_index),
                 "alpha": float(representative_row["alpha"]),
                 "beta": float(representative_row["beta"]),
+                "model_beta": float(representative_row.get("model_beta", representative_row["beta"])),
+                "field_strength": (
+                    float(representative_row["field_strength"])
+                    if representative_row.get("field_strength") is not None
+                    else None
+                ),
+                "scan_axes": representative_row.get("scan_axes"),
                 "energy": (
                     float(representative_row["energy"])
                     if "energy" in representative_row and representative_row["energy"] is not None
@@ -2674,6 +4826,12 @@ def main() -> None:
     ) -> str:
         phase_token = _safe_filename_token(str(representative["phase_label"]).lower())
         alpha_token = _safe_filename_token(f"{float(representative['alpha']):.6g}")
+        if representative.get("field_strength") is not None:
+            field_token = _safe_filename_token(f"{float(representative['field_strength']):.6g}")
+            beta_token = _safe_filename_token(f"{float(representative.get('model_beta', representative['beta'])):.6g}")
+            return output_filename(
+                f"{mode_key}_{phase_token}_alpha_{alpha_token}_B_{field_token}_modelbeta_{beta_token}_{suffix}"
+            )
         beta_token = _safe_filename_token(f"{float(representative['beta']):.6g}")
         return output_filename(
             f"{mode_key}_{phase_token}_alpha_{alpha_token}_beta_{beta_token}_{suffix}"
@@ -2776,9 +4934,28 @@ def main() -> None:
         row: Dict[str, Any],
         alpha: float,
         beta: float,
+        field_terms: List[Tuple[float, str]] | None = None,
     ) -> Dict[str, Any]:
+        active_field_terms = list(hamiltonian_external_field_terms if field_terms is None else field_terms)
         ed_backend_name = str(row.get("ed_backend", args.ed_backend)).strip().lower()
         if ed_backend_name == "ed":
+            ed_backend_name = "standard"
+        row_ed_plan = (
+            row.get("ed_symmetry_plan")
+            if isinstance(row.get("ed_symmetry_plan"), dict)
+            else getattr(args, "ed_symmetry_plan", {})
+        )
+        row_uses_projector = bool(
+            str(row.get("basis_type", "")) == "bitwise_spin_orbital_tz_projector_block"
+            or row.get("use_translation_x_conserved", False)
+            or row.get("use_translation_y_conserved", False)
+            or row.get("use_c3_conserved", False)
+            or (
+                row.get("use_z2_conserved", False)
+                and str(row.get("z2_kind", row_ed_plan.get("z2_kind") if isinstance(row_ed_plan, dict) else "")) == "spin_pi_z"
+            )
+        )
+        if row_uses_projector and ed_backend_name == "quspin":
             ed_backend_name = "standard"
         if ed_backend_name == "quspin":
             import quspin_backend as quspin_ed_backend
@@ -2798,7 +4975,7 @@ def main() -> None:
                 jx=args.jx,
                 jy=args.jy,
                 jz=args.jz,
-                external_field_terms=hamiltonian_external_field_terms,
+                external_field_terms=active_field_terms,
                 show_progress=show_progress,
                 solver=args.ed_solver,
                 sparse_tol=float(args.ed_sparse_tol),
@@ -2808,6 +4985,7 @@ def main() -> None:
                 use_tau_z_block=use_tau_z_block,
                 target_tz2=int(symmetry_reduction_settings.get("target_tz2", args.u1_target_tz2)),
                 use_z2_block=use_z2_block,
+                z2_generator=symmetry_reduction_settings.get("z2_generator"),
                 z2_target_parity=int(args.z2_target_parity),
                 use_translation_block=bool(spatial_flags["use_translation_block"]),
                 use_translation_x_block=bool(spatial_flags["use_translation_x_block"]),
@@ -2833,6 +5011,7 @@ def main() -> None:
                 use_tau_z_block=use_tau_z_block,
                 target_tz2=int(symmetry_reduction_settings.get("target_tz2", args.u1_target_tz2)),
                 use_z2_block=basis_use_z2_block,
+                z2_generator=symmetry_reduction_settings.get("z2_generator"),
                 z2_target_parity=int(args.z2_target_parity),
                 use_translation_block=bool(spatial_flags["use_translation_block"]),
                 use_translation_x_block=bool(spatial_flags["use_translation_x_block"]),
@@ -2858,6 +5037,105 @@ def main() -> None:
             )
             energy = float(spectrum.get("ground_state_energy", np.nan))
             method_label = "quspin_representative_ed"
+        elif bool(symmetry_reduction_settings.get("use_tau_z_block", False)) and not bool(row.get("use_sz_conserved", False)):
+            if row_uses_projector:
+                spectrum, vectors, basis_list, basis_map = run_spin_orbital_projected_exact_spectrum(
+                    geometry=geometry_obj,
+                    model_spec=model_spec,
+                    alpha=float(alpha),
+                    beta=float(beta),
+                    coupling_j=args.coupling_j,
+                    eigenstate_count=max(3, min(int(args.ed_max_eigenstates), 8)),
+                    check_ground_state_degeneracy=False,
+                    jx=args.jx,
+                    jy=args.jy,
+                    jz=args.jz,
+                    external_field_terms=active_field_terms,
+                    show_progress=show_progress,
+                    sparse_tol=float(args.ed_sparse_tol),
+                    sparse_maxiter=(int(args.ed_sparse_maxiter) if int(args.ed_sparse_maxiter) > 0 else None),
+                    target_tz2=int(
+                        row.get(
+                            "selected_target_tz2",
+                            row_ed_plan.get("target_tz2", symmetry_reduction_settings.get("target_tz2", args.u1_target_tz2))
+                            if isinstance(row_ed_plan, dict)
+                            else symmetry_reduction_settings.get("target_tz2", args.u1_target_tz2),
+                        )
+                    ),
+                    use_spin_pi_z=bool(
+                        row.get("use_z2_conserved", False)
+                        and str(row.get("z2_kind", row_ed_plan.get("z2_kind") if isinstance(row_ed_plan, dict) else "")) == "spin_pi_z"
+                    ),
+                    z2_target_parity=int(
+                        row_ed_plan.get("z2_target_parity", args.z2_target_parity)
+                        if isinstance(row_ed_plan, dict)
+                        else args.z2_target_parity
+                    ),
+                    use_translation_x=bool(
+                        row.get(
+                            "use_translation_x_conserved",
+                            row_ed_plan.get("use_translation_x_block", False) if isinstance(row_ed_plan, dict) else False,
+                        )
+                    ),
+                    use_translation_y=bool(
+                        row.get(
+                            "use_translation_y_conserved",
+                            row_ed_plan.get("use_translation_y_block", False) if isinstance(row_ed_plan, dict) else False,
+                        )
+                    ),
+                    momentum_x=int(row_ed_plan.get("momentum_x_block", args.momentum_x_block)) if isinstance(row_ed_plan, dict) else int(args.momentum_x_block),
+                    momentum_y=int(row_ed_plan.get("momentum_y_block", args.momentum_y_block)) if isinstance(row_ed_plan, dict) else int(args.momentum_y_block),
+                    use_combined_c3=bool(
+                        row.get(
+                            "use_c3_conserved",
+                            row_ed_plan.get("use_c3_block", False) if isinstance(row_ed_plan, dict) else False,
+                        )
+                    ),
+                    c3_q_blocks=str(row_ed_plan.get("c3_q_blocks", args.ed_c3_q_blocks)) if isinstance(row_ed_plan, dict) else str(args.ed_c3_q_blocks),
+                    strict_projector_memory=False,
+                    allow_drop_c3_on_memory=True,
+                )
+                method_label = "standard_projector_representative_ed"
+            else:
+                spectrum, vectors, basis_list, basis_map = run_spin_orbital_u1_exact_spectrum(
+                    geometry=geometry_obj,
+                    model_spec=model_spec,
+                    alpha=float(alpha),
+                    beta=float(beta),
+                    coupling_j=args.coupling_j,
+                    eigenstate_count=max(3, min(int(args.ed_max_eigenstates), 8)),
+                    check_ground_state_degeneracy=False,
+                    jx=args.jx,
+                    jy=args.jy,
+                    jz=args.jz,
+                    external_field_terms=active_field_terms,
+                    show_progress=show_progress,
+                    sparse_tol=float(args.ed_sparse_tol),
+                    sparse_maxiter=(int(args.ed_sparse_maxiter) if int(args.ed_sparse_maxiter) > 0 else None),
+                    use_sz_block=False,
+                    target_sz2=int(symmetry_reduction_settings.get("target_sz2", args.u1_target_sz2)),
+                    use_tau_z_block=True,
+                    target_tz2=int(symmetry_reduction_settings.get("target_tz2", args.u1_target_tz2)),
+                )
+                method_label = "standard_tz_representative_ed"
+            correlations = collect_correlation_matrices_from_spin_orbital_u1_ed(
+                geometry_obj,
+                np.asarray(vectors[:, 0], dtype=np.complex128),
+                basis_list,
+                basis_map,
+                show_progress=show_progress,
+            )
+            scalar_correlations = build_spin_orbital_u1_scalar_correlations(correlations)
+            bond_rows = all_bond_energies_sz_conserved(
+                geometry_obj,
+                correlations,
+                float(alpha),
+                float(beta),
+                args.coupling_j,
+                show_progress=show_progress,
+                progress_desc="Tz-ED bond energies",
+            )
+            energy = float(spectrum.get("ground_state_energy", np.nan))
         elif bool(row.get("use_sz_conserved", False)):
             spectrum, vectors, basis_list, basis_map = run_sz_conserved_exact_spectrum(
                 geometry=geometry_obj,
@@ -2866,7 +5144,7 @@ def main() -> None:
                 coupling_j=args.coupling_j,
                 eigenstate_count=max(3, min(int(args.ed_max_eigenstates), 8)),
                 check_ground_state_degeneracy=False,
-                external_field_terms=hamiltonian_external_field_terms,
+                external_field_terms=active_field_terms,
                 show_progress=show_progress,
                 sparse_tol=float(args.ed_sparse_tol),
                 sparse_maxiter=(int(args.ed_sparse_maxiter) if int(args.ed_sparse_maxiter) > 0 else None),
@@ -2902,7 +5180,7 @@ def main() -> None:
                 jx=args.jx,
                 jy=args.jy,
                 jz=args.jz,
-                external_field_terms=hamiltonian_external_field_terms,
+                external_field_terms=active_field_terms,
                 show_progress=show_progress,
                 solver=args.ed_solver,
                 sparse_tol=float(args.ed_sparse_tol),
@@ -2944,7 +5222,9 @@ def main() -> None:
         geometry_obj: Any,
         alpha: float,
         beta: float,
+        field_terms: List[Tuple[float, str]] | None = None,
     ) -> Dict[str, Any]:
+        active_field_terms = list(hamiltonian_external_field_terms if field_terms is None else field_terms)
         yl_scan = _load_tenpy_backend_module()
         psi, _mpo, info = yl_scan.run_cylindrical_dmrg(
             geometry=geometry_obj,
@@ -2954,9 +5234,11 @@ def main() -> None:
             max_bond_dimension=args.max_bond_dimension,
             max_sweeps=args.max_sweeps,
             truncation_cutoff=args.truncation_cutoff,
+            svd_min=args.dmrg_svd_min,
             initial_state=None,
             compute_phase_observables=False,
-            external_field_terms=hamiltonian_external_field_terms,
+            external_field_terms=active_field_terms,
+            symmetry_reductions=symmetry_reduction_settings,
             show_progress=show_progress,
         )
         correlations = yl_scan.collect_correlation_matrices_from_dmrg(psi, show_progress=show_progress)
@@ -2983,7 +5265,9 @@ def main() -> None:
         geometry_obj: Any,
         alpha: float,
         beta: float,
+        field_terms: List[Tuple[float, str]] | None = None,
     ) -> Dict[str, Any]:
+        active_field_terms = list(hamiltonian_external_field_terms if field_terms is None else field_terms)
         yl_scan = _load_tenpy_backend_module()
         _rows, psi = yl_scan.run_alpha_scan_idmrg_with_adiabatic_state_passing(
             geometry=geometry_obj,
@@ -2993,8 +5277,10 @@ def main() -> None:
             max_bond_dimension=args.idmrg_max_bond_dimension,
             max_iterations=args.idmrg_max_iterations,
             truncation_cutoff=args.truncation_cutoff,
+            svd_min=args.idmrg_svd_min,
             initial_state=None,
             classifier_thresholds=phase_classifier_thresholds_from_args(args),
+            external_field_terms=active_field_terms,
             show_progress=show_progress,
             progress_bar=None,
         )
@@ -3019,6 +5305,63 @@ def main() -> None:
             "recalculation_method": "tenpy_idmrg_representative_rerun",
         }
 
+    def _quimb_peps_representative_payload(
+        geometry_obj: Any,
+        alpha: float,
+        beta: float,
+        field_terms: List[Tuple[float, str]] | None = None,
+    ) -> Dict[str, Any]:
+        active_field_terms = list(hamiltonian_external_field_terms if field_terms is None else field_terms)
+        import peps_backend as quimb_peps_backend
+
+        result = quimb_peps_backend.run_quimb_peps_calculation(
+            geometry=geometry_obj,
+            model_spec=model_spec,
+            lattice_name=lattice_name,
+            alpha=float(alpha),
+            beta=float(beta),
+            coupling_j=args.coupling_j,
+            jx=args.jx,
+            jy=args.jy,
+            jz=args.jz,
+            external_field_terms=active_field_terms,
+            max_sites=args.max_peps_sites,
+            max_bond_dimension=args.peps_max_bond_dimension,
+            max_sweeps=args.peps_max_sweeps,
+            truncation_cutoff=args.truncation_cutoff,
+            tau=args.peps_tau,
+            random_seed=args.phase_scan_random_seed,
+            initial_state_style=args.initial_state,
+            ctm_chi=args.peps_ctm_chi,
+            entanglement_max_dense_dim=args.peps_entanglement_max_dense_dim,
+            classifier_thresholds=phase_classifier_thresholds_from_args(args),
+            compute_correlations=True,
+            compute_bond_energies=True,
+            compute_structure_factors=False,
+            compute_uniform_observables=False,
+            compute_entanglement=False,
+            show_progress=show_progress,
+            args=args,
+            symmetry_reductions=symmetry_reduction_settings,
+            use_sz_conserved=bool(args.use_sz_conserved),
+            symmetric=False,
+            peps_symmetry_mode=args.peps_symmetry_mode,
+            peps_strict_symmetry=bool(args.peps_strict_symmetry),
+            peps_allow_dense_fallback=bool(args.peps_allow_dense_fallback),
+        )
+        info = result.get("info", {})
+        scalar_correlations = result.get("scalar_correlations", {})
+        return {
+            "bond_energies": result.get("bond_rows", []),
+            "real_space_patterns": build_reference_site_correlation_patterns(
+                geometry_obj,
+                scalar_correlations,
+                reference_site_idx=args.reference_site_idx,
+            ),
+            "energy": info.get("ground_state_energy", info.get("E")),
+            "recalculation_method": "quimb_peps_representative_rerun",
+        }
+
     def _recalculate_phase_representative_payload(
         geometry_obj: Any,
         mode_key: str,
@@ -3026,19 +5369,31 @@ def main() -> None:
         row: Dict[str, Any],
     ) -> Dict[str, Any]:
         alpha = float(representative["alpha"])
-        beta = float(representative["beta"])
+        beta = float(representative.get("model_beta", representative["beta"]))
+        field_terms = (
+            [(float(coefficient), str(op_name)) for coefficient, op_name in row.get("external_field_terms", [])]
+            if isinstance(row.get("external_field_terms"), list)
+            else None
+        )
+        field_text = (
+            f", B={float(representative['field_strength']):.6g}"
+            if representative.get("field_strength") is not None
+            else ""
+        )
         print(
             "[phase] representative recalculation: "
-            f"method={mode_key}, phase={representative['phase_label']}, alpha={alpha:.6g}, beta={beta:.6g}"
+            f"method={mode_key}, phase={representative['phase_label']}, alpha={alpha:.6g}, beta={beta:.6g}{field_text}"
         )
         if mode_key == "classical_product":
             return _classical_representative_payload(geometry_obj, row, alpha, beta)
         if mode_key == "quantum_ed":
-            return _quantum_ed_representative_payload(geometry_obj, row, alpha, beta)
+            return _quantum_ed_representative_payload(geometry_obj, row, alpha, beta, field_terms=field_terms)
         if mode_key == "tenpy_dmrg":
-            return _tenpy_dmrg_representative_payload(geometry_obj, alpha, beta)
+            return _tenpy_dmrg_representative_payload(geometry_obj, alpha, beta, field_terms=field_terms)
+        if mode_key == "quimb_peps":
+            return _quimb_peps_representative_payload(geometry_obj, alpha, beta, field_terms=field_terms)
         if mode_key == "tenpy_idmrg":
-            return _tenpy_idmrg_representative_payload(geometry_obj, alpha, beta)
+            return _tenpy_idmrg_representative_payload(geometry_obj, alpha, beta, field_terms=field_terms)
         raise ValueError(f"Unsupported representative recalculation method '{mode_key}'.")
 
     def _save_phase_representative_outputs(
@@ -3052,10 +5407,23 @@ def main() -> None:
         phase_label = str(representative["phase_label"])
         alpha = float(representative["alpha"])
         beta = float(representative["beta"])
+        model_beta = float(representative.get("model_beta", beta))
+        field_strength = representative.get("field_strength")
+        row_field_vector = row.get("external_field_vector")
+        representative_field_vector = (
+            tuple(float(value) for value in row_field_vector)
+            if isinstance(row_field_vector, (list, tuple)) and len(row_field_vector) == 3
+            else resolved_field_vector
+        )
         phase_token = _safe_filename_token(phase_label.lower())
         output_key_prefix = f"{mode_key}_{phase_token}_{int(representative['row_index'])}"
         row_bond_rows = row.get("bond_energies") if isinstance(row.get("bond_energies"), list) else None
-        recalculation_supported = mode_key in ("classical_product", "quantum_ed", "tenpy_dmrg", "tenpy_idmrg")
+        recalculation_mode_key = (
+            mode_key[len("external_"):]
+            if str(mode_key).startswith("external_")
+            else mode_key
+        )
+        recalculation_supported = recalculation_mode_key in ("classical_product", "quantum_ed", "tenpy_dmrg", "quimb_peps", "tenpy_idmrg")
         needs_recalculation = bool(
             recalculation_supported
             and (args.plot_real_space_patterns or args.plot_bond_energies)
@@ -3065,7 +5433,7 @@ def main() -> None:
             try:
                 payload = _recalculate_phase_representative_payload(
                     geometry_obj,
-                    mode_key,
+                    recalculation_mode_key,
                     representative,
                     row,
                 )
@@ -3118,7 +5486,7 @@ def main() -> None:
                 args.output_folder,
                 f"{output_key_prefix}_representative_pattern_png",
                 filename,
-                lambda path, values=correlations["S"], ref_idx=int(reference_site_idx), rows_for_plot=bond_rows, title_phase=phase_label, title_alpha=alpha, title_beta=beta: save_phase_representative_pattern(
+                lambda path, values=correlations["S"], ref_idx=int(reference_site_idx), rows_for_plot=bond_rows, title_phase=phase_label, title_alpha=alpha, title_beta=model_beta, title_field=field_strength, field_vector=representative_field_vector: save_phase_representative_pattern(
                     geometry_obj,
                     np.asarray(values, dtype=float),
                     ref_idx,
@@ -3126,16 +5494,22 @@ def main() -> None:
                     path,
                     plot_title(
                         f"{mode_key} {title_phase} spin pattern + resolved bonds "
-                        f"(alpha={title_alpha:.6g}, beta={title_beta:.6g})"
+                        + (
+                            f"(alpha={title_alpha:.6g}, B={float(title_field):.6g}, beta={title_beta:.6g})"
+                            if title_field is not None
+                            else f"(alpha={title_alpha:.6g}, beta={title_beta:.6g})"
+                        )
                     ),
+                    external_field_vector=field_vector,
                 ),
                 overwrite_existing,
                 continue_on_plot_error,
             )
             outputs["representative_pattern_png"] = filename
             outputs["representative_pattern_note"] = (
-                "Single combined plot: spin arrows use C_S[j]=<S_ref.S_j>; "
-                "bond overlays use resolved spin/orbital channel energies when available."
+                "Single combined plot: spin arrows show the relative sign pattern "
+                "projected onto a chosen horizontal direction; bond overlays use "
+                "resolved spin/orbital channel energies when available."
             )
         elif isinstance(correlations, dict):
             outputs["representative_pattern_note"] = "representative combined plotting is disabled"
@@ -3150,33 +5524,85 @@ def main() -> None:
         summary_obj: Dict[str, Any],
         phase_scan_data: Dict[str, Any],
         geometry_obj: Any,
+        mode_keys: set[str] | None = None,
     ) -> None:
+        selected_mode_keys = set(mode_keys) if mode_keys is not None else None
         _record_phase_scan_plaquette_fluxes(summary_obj, phase_scan_data)
         phase_scan_filename = output_filename("phase_scan_summary.json")
         phase_scan_filepath = os.path.join(args.output_folder, phase_scan_filename)
         write_json(phase_scan_filepath, phase_scan_data)
         _record_output_status(summary_obj, "phase_scan_summary_json", phase_scan_filename, "saved")
         _save_summary_checkpoint(args.output_folder, summary_obj)
-        print(f"[output] saved: {phase_scan_filename}")
+        print(f"[output] saved: {phase_scan_filepath}")
+
+        if selected_mode_keys is None or "energy_b_scan" in selected_mode_keys:
+            energy_b_data = phase_scan_data.get("energy_b_scan")
+            if isinstance(energy_b_data, dict):
+                base_name = "energy_b_scan.png"
+                output_key = "energy_b_scan_png"
+                if not bool(args.plot_phase_scan):
+                    _skip_plot_step(
+                        summary_obj,
+                        args.output_folder,
+                        output_key,
+                        output_filename(base_name),
+                        "plot_phase_scan is false",
+                    )
+                elif len(list(energy_b_data.get("rows", []))) == 0:
+                    _record_output_status(
+                        summary_obj,
+                        output_key,
+                        output_filename(base_name),
+                        "skipped",
+                        str(energy_b_data.get("reason", "No Energy-B scan rows available.")),
+                    )
+                    _save_summary_checkpoint(args.output_folder, summary_obj)
+                else:
+                    _save_plot_step(
+                        summary_obj,
+                        args.output_folder,
+                        output_key,
+                        output_filename(base_name),
+                        lambda path, scan_payload=energy_b_data: save_energy_b_scan_plot(
+                            scan_payload,
+                            path,
+                            title="DMRG Ground State and ED Bands vs External Field",
+                            title_label=run_plot_title_label,
+                        ),
+                        overwrite_existing,
+                        continue_on_plot_error,
+                    )
 
         for mode_key, title in (
             ("classical_product", "Classical Product-State Phase Diagram"),
             ("quantum_ed", "Quantum ED Phase Diagram"),
+            ("external_classical_product", "External-Field Classical Alpha-B Phase Diagram"),
+            ("external_quantum_ed", "External-Field Quantum ED Alpha-B Phase Diagram"),
             ("tenax_dmrg", "Tenax Finite-DMRG Phase Diagram"),
             ("tenpy_dmrg", "TeNPy Finite-DMRG Phase Diagram"),
             ("tenax_idmrg", "Tenax iDMRG Phase Diagram"),
             ("tenpy_idmrg", "TeNPy iDMRG Phase Diagram"),
+            ("quimb_peps", "quimb PEPS Phase Diagram"),
+            ("quimb_ipeps", "quimb iPEPS Phase Diagram"),
         ):
+            if selected_mode_keys is not None and mode_key not in selected_mode_keys:
+                continue
             mode_data = phase_scan_data.get(mode_key)
             if not isinstance(mode_data, dict):
                 continue
+            scan_axes = mode_data.get("scan_axes") if isinstance(mode_data.get("scan_axes"), dict) else {}
+            is_alpha_b_scan = str(scan_axes.get("y", "")).lower() in ("field_strength", "b")
             base_name = (
-                "classical_phase_diagram.png"
+                (
+                    "classical_alpha_b_phase_diagram.png"
+                    if is_alpha_b_scan
+                    else "classical_phase_diagram.png"
+                )
                 if mode_key == "classical_product"
                 else (
-                    "quantum_phase_diagram.png"
+                    ("quantum_alpha_b_phase_diagram.png" if is_alpha_b_scan else "quantum_phase_diagram.png")
                     if mode_key == "quantum_ed"
-                    else f"{mode_key}_phase_diagram.png"
+                    else f"{mode_key}_{'alpha_b_' if is_alpha_b_scan else ''}phase_diagram.png"
                 )
             )
             output_key = f"{mode_key}_phase_diagram_png"
@@ -3206,17 +5632,20 @@ def main() -> None:
                 _save_summary_checkpoint(args.output_folder, summary_obj)
                 continue
             representative_pairs = _phase_scan_representative_rows(rows)
-            mode_data["phase_representatives"] = [
-                representative for representative, _row in representative_pairs
-            ]
-            for representative, representative_row in representative_pairs:
-                _save_phase_representative_outputs(
-                    summary_obj,
-                    geometry_obj,
-                    mode_key,
-                    representative,
-                    representative_row,
-                )
+            representative_outputs_saved = bool(mode_data.get("representative_outputs_saved", False))
+            if not representative_outputs_saved:
+                mode_data["phase_representatives"] = [
+                    representative for representative, _row in representative_pairs
+                ]
+                for representative, representative_row in representative_pairs:
+                    _save_phase_representative_outputs(
+                        summary_obj,
+                        geometry_obj,
+                        mode_key,
+                        representative,
+                        representative_row,
+                    )
+                mode_data["representative_outputs_saved"] = True
             if not bool(args.plot_phase_scan):
                 _skip_plot_step(
                     summary_obj,
@@ -3231,11 +5660,12 @@ def main() -> None:
                 args.output_folder,
                 output_key,
                 output_filename(base_name),
-                lambda path, scan_rows=completed_rows, scan_title=title: save_phase_diagram_plot(
+                lambda path, scan_rows=completed_rows, scan_title=title, alpha_b=bool(is_alpha_b_scan): save_phase_diagram_plot(
                     scan_rows,
                     path,
-                    scan_title,
+                    ("Alpha-B " + scan_title) if alpha_b else scan_title,
                     title_label=run_plot_title_label,
+                    y_label=(r"External field strength $B$" if alpha_b else r"$\beta$"),
                 ),
                 overwrite_existing,
                 continue_on_plot_error,
@@ -3244,7 +5674,11 @@ def main() -> None:
         for mode_key, title_prefix in (
             ("tenpy_dmrg", "TeNPy finite-DMRG"),
             ("tenpy_idmrg", "TeNPy iDMRG"),
+            ("quimb_peps", "quimb PEPS"),
+            ("quimb_ipeps", "quimb iPEPS"),
         ):
+            if selected_mode_keys is not None and mode_key not in selected_mode_keys:
+                continue
             mode_data = phase_scan_data.get(mode_key)
             if not isinstance(mode_data, dict):
                 continue
@@ -3305,7 +5739,10 @@ def main() -> None:
             return [float(axis_min)]
         return [float(value) for value in np.linspace(float(axis_min), float(axis_max), int(points))]
 
-    def run_requested_phase_scan_for_geometry(geometry_obj: Any) -> Dict[str, Any]:
+    def run_requested_phase_scan_for_geometry(
+        geometry_obj: Any,
+        incremental_summary_obj: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         methods = list(args.phase_scan_methods)
         alpha_values = phase_scan_axis_values(
             args.phase_scan_alpha_min,
@@ -3318,6 +5755,51 @@ def main() -> None:
             args.phase_scan_beta_points,
         )
         classifier_thresholds = phase_classifier_thresholds_from_args(args)
+        scan_points_profiled = profile_scan_points_enabled()
+
+        def _attach_scan_point_profile(
+            row: Dict[str, Any],
+            mode: str,
+            alpha: float | None,
+            beta: float | None,
+            point_index: int,
+            elapsed: float,
+            extra: Dict[str, Any] | None = None,
+        ) -> None:
+            if not scan_points_profiled:
+                return
+            profile_extra: Dict[str, Any] = dict(extra or {})
+            diagnostics = row.get("diagnostics") if isinstance(row, dict) else None
+            flux_candidates: List[Any] = []
+            if isinstance(row, dict):
+                flux_candidates.extend([row.get("plaquette_flux"), row.get("observables")])
+            if isinstance(diagnostics, dict):
+                flux_candidates.extend([diagnostics.get("plaquette_flux"), diagnostics])
+            for flux_candidate in flux_candidates:
+                if not isinstance(flux_candidate, dict):
+                    continue
+                flux_value = flux_candidate.get("W_p", flux_candidate.get("value"))
+                if flux_value is None:
+                    continue
+                try:
+                    profile_extra.setdefault("W_p", float(flux_value))
+                except Exception:
+                    profile_extra.setdefault("W_p", flux_value)
+                break
+            profile_extra.setdefault("backend", row.get("backend") if isinstance(row, dict) else None)
+            profile_entry = record_scan_point_timing(
+                mode=mode,
+                alpha=alpha,
+                beta=beta,
+                status=str(row.get("status", "unknown")),
+                wall_time_seconds=float(elapsed),
+                point_index=int(point_index),
+                extra=profile_extra,
+            )
+            row_profile = row.setdefault("profiling", {})
+            if isinstance(row_profile, dict):
+                row_profile["wall_time_seconds"] = float(elapsed)
+                row_profile["scan_point_timing"] = profile_entry
 
         def _tenax_phase_scan_row(
             alpha: float,
@@ -3337,6 +5819,8 @@ def main() -> None:
                     external_field_terms=hamiltonian_external_field_terms,
                     max_bond_dimension=args.max_bond_dimension,
                     max_sweeps=args.max_sweeps,
+                    truncation_cutoff=args.truncation_cutoff,
+                    svd_min=args.dmrg_svd_min,
                     random_seed=point_seed,
                     jx=args.jx,
                     jy=args.jy,
@@ -3438,7 +5922,24 @@ def main() -> None:
             point_index = 0
             for beta_index, beta in enumerate(beta_values):
                 for alpha_index, alpha in enumerate(alpha_values):
-                    rows.append(_tenax_phase_scan_row(alpha, beta, alpha_index, beta_index, point_index))
+                    point_start = time.perf_counter() if scan_points_profiled else None
+                    row = _tenax_phase_scan_row(alpha, beta, alpha_index, beta_index, point_index)
+                    if scan_points_profiled and point_start is not None:
+                        point_elapsed = time.perf_counter() - point_start
+                        _attach_scan_point_profile(
+                            row,
+                            "tenax_dmrg",
+                            float(alpha),
+                            float(beta),
+                            point_index,
+                            point_elapsed,
+                            {
+                                "alpha_index": int(alpha_index),
+                                "beta_index": int(beta_index),
+                                "symmetry_engine": "tenax",
+                            },
+                        )
+                    rows.append(row)
                     point_index += 1
                     if progress_bar is not None:
                         progress_bar.update(1)
@@ -3463,9 +5964,37 @@ def main() -> None:
 
         def _run_selected_dmrg_phase_scan() -> Tuple[str, Dict[str, Any]]:
             backend_request = str(args.backend).strip().lower()
+            tenpy_scan_issue = tenpy_backend_compatibility_issue()
             n_sites = int(geometry_obj.number_of_sites)
+            if backend_request == "quimb":
+                reason = (
+                    "phase_scan_methods=dmrg now means finite DMRG only. "
+                    "Use phase_scan_methods=peps for finite quimb PEPS."
+                )
+                if show_progress:
+                    print(f"[phase-scan] skip finite DMRG with backend=quimb: {reason}")
+                return "tenpy_dmrg", {
+                    "status": "skipped",
+                    "backend": "quimb",
+                    "scan_type": "finite_dmrg_observable_scan",
+                    "requested_backend": str(args.backend),
+                    "selected_via": "phase_scan_method_dmrg",
+                    "reason": reason,
+                    "symmetry_mode": str(effective_symmetry_mode),
+                    "symmetry_reductions": symmetry_reduction_settings,
+                    "alpha_values": [float(value) for value in alpha_values],
+                    "beta_values": [float(value) for value in beta_values],
+                    "rows": [],
+                    "completed_points": 0,
+                    "failed_points": 0,
+                    "skipped_points": int(len(alpha_values) * len(beta_values)),
+                }
             if n_sites > int(args.max_dmrg_sites):
-                output_key = "tenpy_dmrg" if backend_request == "tenpy" else "tenax_dmrg"
+                output_key = (
+                    "tenpy_dmrg"
+                    if backend_request == "tenpy" or (backend_request == "auto" and tenpy_scan_issue is None)
+                    else "tenax_dmrg"
+                )
                 return output_key, {
                     "status": "skipped",
                     "backend": backend_request,
@@ -3484,46 +6013,903 @@ def main() -> None:
                     "failed_points": 0,
                     "skipped_points": int(len(alpha_values) * len(beta_values)),
                 }
-            if backend_request in ("tenax", "auto"):
-                tenax_data = _run_tenax_dmrg_phase_scan()
-                if backend_request == "tenax" or int(tenax_data.get("completed_points", 0)) > 0:
-                    return "tenax_dmrg", tenax_data
-                if show_progress:
-                    print("[phase-scan] Tenax DMRG scan produced no completed points; trying TeNPy fallback.")
-            if lattice_name != "honeycomb":
-                raise ValueError("TeNPy DMRG phase scans currently support only honeycomb geometry.")
-            if not (
-                model_spec.spin_rep == "1/2"
-                and model_spec.orbital_rep == "1/2"
-                and model_spec.model_family == "yao_lee"
-                and model_spec.ising_axis == "z"
-            ):
-                raise ValueError(
-                    "TeNPy DMRG phase scans use the U(1) Sz-conserved YaoLeeSite and require "
-                    "spin_rep=1/2, orbital_rep=1/2, model_family=yao_lee, ising_axis=z."
+
+            def _run_tenpy_dmrg_phase_scan() -> Tuple[str, Dict[str, Any]]:
+                if tenpy_scan_issue is not None:
+                    raise ValueError(f"TeNPy DMRG phase scan is not compatible: {tenpy_scan_issue}")
+                yl_scan = _load_tenpy_backend_module()
+                tenpy_data = yl_scan.run_alpha_beta_dmrg_observable_scan(
+                    geometry=geometry_obj,
+                    alpha_values=alpha_values,
+                    beta_values=beta_values,
+                    coupling_j=args.coupling_j,
+                    max_bond_dimension=args.max_bond_dimension,
+                    max_sweeps=args.max_sweeps,
+                    truncation_cutoff=args.truncation_cutoff,
+                    svd_min=args.dmrg_svd_min,
+                    carry_state_between_betas=False,
+                    classifier_thresholds=classifier_thresholds,
+                    external_field_terms=hamiltonian_external_field_terms,
+                    symmetry_reductions=symmetry_reduction_settings,
+                    show_progress=show_progress,
                 )
-            yl_scan = _load_tenpy_backend_module()
-            tenpy_data = yl_scan.run_alpha_beta_dmrg_observable_scan(
-                geometry=geometry_obj,
-                alpha_values=alpha_values,
-                beta_values=beta_values,
-                coupling_j=args.coupling_j,
-                max_bond_dimension=args.max_bond_dimension,
-                max_sweeps=args.max_sweeps,
-                truncation_cutoff=args.truncation_cutoff,
-                carry_state_between_betas=False,
-                classifier_thresholds=classifier_thresholds,
-                external_field_terms=hamiltonian_external_field_terms,
-                show_progress=show_progress,
+                tenpy_data["requested_backend"] = str(args.backend)
+                tenpy_data["symmetry_reductions"] = symmetry_reduction_settings
+                tenpy_data["symmetry_note"] = (
+                    "TeNPy scan uses the real total-Tz U1 YaoLeeSite."
+                    if bool(symmetry_reduction_settings.get("use_tau_z_block", False))
+                    else "TeNPy scan uses dense/no-symmetry YaoLeeSite tensors."
+                )
+                return "tenpy_dmrg", tenpy_data
+
+            if backend_request == "tenpy":
+                return _run_tenpy_dmrg_phase_scan()
+            if backend_request == "auto" and tenpy_scan_issue is None:
+                try:
+                    return _run_tenpy_dmrg_phase_scan()
+                except Exception as tenpy_exc:
+                    if show_progress:
+                        print(f"[phase-scan] TeNPy DMRG scan failed; trying Tenax fallback. Reason: {tenpy_exc}")
+                    tenax_data = _run_tenax_dmrg_phase_scan()
+                    tenax_data["fallback_from"] = "tenpy"
+                    tenax_data["fallback_reason"] = str(tenpy_exc)
+                    return "tenax_dmrg", tenax_data
+            if backend_request == "auto" and tenpy_scan_issue is not None and show_progress:
+                print(f"[phase-scan] auto selects Tenax DMRG because TeNPy is not compatible: {tenpy_scan_issue}")
+            if backend_request in ("tenax", "auto"):
+                return "tenax_dmrg", _run_tenax_dmrg_phase_scan()
+            raise ValueError(f"Unsupported DMRG phase-scan backend: {args.backend}")
+
+        def _run_quimb_peps_phase_scan() -> Tuple[str, Dict[str, Any]]:
+            try:
+                import peps_backend as quimb_peps_backend
+
+                peps_data = quimb_peps_backend.run_quimb_peps_scan(
+                    geometry=geometry_obj,
+                    alpha_values=alpha_values,
+                    beta_values=beta_values,
+                    coupling_j=args.coupling_j,
+                    max_sites=args.max_peps_sites,
+                    max_bond_dimension=args.peps_max_bond_dimension,
+                    max_sweeps=args.peps_max_sweeps,
+                    truncation_cutoff=args.truncation_cutoff,
+                    tau=args.peps_tau,
+                    carry_state_between_betas=False,
+                    classifier_thresholds=classifier_thresholds,
+                    external_field_terms=hamiltonian_external_field_terms,
+                    show_progress=show_progress,
+                    model_spec=model_spec,
+                    lattice_name=lattice_name,
+                    jx=args.jx,
+                    jy=args.jy,
+                    jz=args.jz,
+                    random_seed=args.phase_scan_random_seed,
+                    initial_state_style=args.initial_state,
+                    ctm_chi=args.peps_ctm_chi,
+                    entanglement_max_dense_dim=args.peps_entanglement_max_dense_dim,
+                    symmetry_reductions=symmetry_reduction_settings,
+                    args=args,
+                    use_sz_conserved=bool(args.use_sz_conserved),
+                    symmetric=False,
+                    peps_symmetry_mode=args.peps_symmetry_mode,
+                    peps_strict_symmetry=bool(args.peps_strict_symmetry),
+                    peps_allow_dense_fallback=bool(args.peps_allow_dense_fallback),
+                )
+                peps_data["requested_backend"] = str(args.backend)
+                peps_data["phase_scan_method"] = "peps"
+                peps_data["selected_via"] = "phase_scan_method_peps"
+                return "quimb_peps", peps_data
+            except Exception as peps_exc:
+                error_text = str(peps_exc) or peps_exc.__class__.__name__
+                optional_dependency_missing = isinstance(peps_exc, (ImportError, ModuleNotFoundError))
+                if show_progress:
+                    detail = (
+                        f"optional package unavailable :: {error_text}"
+                        if optional_dependency_missing
+                        else error_text
+                    )
+                    print(f"[phase-scan] skip quimb PEPS: {detail}")
+                return "quimb_peps", {
+                    "status": "skipped" if optional_dependency_missing else "failed",
+                    "backend": "quimb_peps",
+                    "requested_backend": str(args.backend),
+                    "scan_type": "finite_peps_observable_scan",
+                    "phase_scan_method": "peps",
+                    "selected_via": "phase_scan_method_peps",
+                    "reason": error_text,
+                    "error": error_text,
+                    "alpha_values": [float(value) for value in alpha_values],
+                    "beta_values": [float(value) for value in beta_values],
+                    "rows": [],
+                    "completed_points": 0,
+                    "failed_points": 0 if optional_dependency_missing else int(len(alpha_values) * len(beta_values)),
+                    "skipped_points": int(len(alpha_values) * len(beta_values)) if optional_dependency_missing else 0,
+                    "energy_per_site": None,
+                    "ground_state_energy_per_site": None,
+                    "plaquette_flux": {"available": False, "value": None, "W_p": None, "reason": error_text},
+                    "phase_label": "Weak/undetermined",
+                    "all_plaquette_fluxes": {},
+                    "symmetry_reductions": symmetry_reduction_settings,
+                }
+
+        def _run_quimb_ipeps_phase_scan() -> Tuple[str, Dict[str, Any]]:
+            try:
+                import peps_backend as quimb_ipeps_backend
+
+                ipeps_data = quimb_ipeps_backend.run_quimb_ipeps_scan(
+                    geometry=geometry_obj,
+                    alpha_values=alpha_values,
+                    beta_values=beta_values,
+                    coupling_j=args.coupling_j,
+                    max_unit_cell_sites=args.max_ipeps_unit_cell_sites,
+                    max_bond_dimension=args.ipeps_max_bond_dimension,
+                    max_iterations=args.ipeps_max_iterations,
+                    truncation_cutoff=args.truncation_cutoff,
+                    carry_state_between_betas=False,
+                    classifier_thresholds=classifier_thresholds,
+                    external_field_terms=hamiltonian_external_field_terms,
+                    show_progress=show_progress,
+                    model_spec=model_spec,
+                    lattice_name=lattice_name,
+                    random_seed=args.phase_scan_random_seed,
+                    initial_state_style=args.initial_state,
+                    tau=args.ipeps_tau,
+                    ctm_chi=args.ipeps_ctm_chi,
+                    symmetry_reductions=symmetry_reduction_settings,
+                    args=args,
+                    use_sz_conserved=bool(args.use_sz_conserved),
+                    symmetric=False,
+                    ipeps_symmetry_mode=args.ipeps_symmetry_mode,
+                    ipeps_strict_symmetry=bool(args.ipeps_strict_symmetry),
+                    ipeps_allow_dense_fallback=bool(args.ipeps_allow_dense_fallback),
+                    unit_cell_kind=args.ipeps_unit_cell_kind,
+                    use_translation_symmetry=bool(args.ipeps_use_translation_symmetry),
+                    contraction_method=args.ipeps_contraction_method,
+                )
+                ipeps_data["requested_backend"] = str(args.backend)
+                ipeps_data["phase_scan_method"] = "ipeps"
+                ipeps_data["selected_via"] = "phase_scan_method_ipeps"
+                return "quimb_ipeps", ipeps_data
+            except Exception as ipeps_exc:
+                error_text = str(ipeps_exc) or ipeps_exc.__class__.__name__
+                optional_dependency_missing = isinstance(ipeps_exc, (ImportError, ModuleNotFoundError))
+                if show_progress and optional_dependency_missing:
+                    print(f"[phase-scan] skip quimb iPEPS: optional package unavailable :: {error_text}")
+                return "quimb_ipeps", {
+                    "status": "skipped" if optional_dependency_missing else "failed",
+                    "backend": "quimb_ipeps",
+                    "requested_backend": str(args.backend),
+                    "scan_type": "ipeps_observable_scan",
+                    "phase_scan_method": "ipeps",
+                    "selected_via": "phase_scan_method_ipeps",
+                    "alpha_values": [float(value) for value in alpha_values],
+                    "beta_values": [float(value) for value in beta_values],
+                    "rows": [],
+                    "completed_points": 0,
+                    "failed_points": 0 if optional_dependency_missing else int(len(alpha_values) * len(beta_values)),
+                    "skipped_points": int(len(alpha_values) * len(beta_values)) if optional_dependency_missing else 0,
+                    "energy_per_site": None,
+                    "ground_state_energy_per_site": None,
+                    "plaquette_flux": {"available": False, "value": None, "W_p": None, "reason": error_text},
+                    "phase_label": "Weak/undetermined",
+                    "all_plaquette_fluxes": {},
+                    "reason": error_text,
+                    "error": error_text,
+                    "symmetry_reductions": symmetry_reduction_settings,
+                }
+
+        def _external_scan_field_values() -> List[float]:
+            return phase_scan_axis_values(
+                float(args.external_scan_field_min),
+                float(args.external_scan_field_max),
+                int(args.external_scan_field_points),
             )
-            tenpy_data["requested_backend"] = str(args.backend)
-            tenpy_data["symmetry_reductions"] = symmetry_reduction_settings
-            tenpy_data["symmetry_note"] = "TeNPy scan uses the fixed total-Sz U(1) YaoLeeSite backend."
-            return "tenpy_dmrg", tenpy_data
+
+        def _external_scan_field_vector(field_strength: float) -> Tuple[float, float, float]:
+            axis_mode = str(args.external_field_axis).strip().lower()
+            if axis_mode in ("111", "001"):
+                return external_field_vector(
+                    axis=axis_mode,
+                    strength=float(field_strength),
+                    hx=0.0,
+                    hy=0.0,
+                    hz=0.0,
+                )
+            base = np.asarray(resolved_field_vector, dtype=float)
+            norm = float(np.linalg.norm(base))
+            if norm <= 1.0e-14:
+                base = np.asarray([0.0, 0.0, 1.0], dtype=float)
+                norm = 1.0
+            scaled = base * (float(field_strength) / norm)
+            return float(scaled[0]), float(scaled[1]), float(scaled[2])
+
+        def _external_scan_field_terms(field_strength: float) -> List[Tuple[float, str]]:
+            if str(args.external_field_treatment) != "hamiltonian":
+                return []
+            return list(
+                external_field_terms_for_model(
+                    _external_scan_field_vector(field_strength),
+                    mu_b=args.mu_b,
+                    field_sign=args.field_sign,
+                    sigma_factor=args.field_sigma_factor,
+                )
+            )
+
+        def _annotate_alpha_b_row(
+            row: Dict[str, Any],
+            *,
+            model_beta: float,
+            field_strength: float,
+            field_terms: List[Tuple[float, str]],
+            alpha_index: int,
+            field_index: int,
+            method_key: str,
+        ) -> Dict[str, Any]:
+            row["alpha_index"] = int(alpha_index)
+            row["beta_index"] = int(field_index)
+            row["field_index"] = int(field_index)
+            row["field_strength"] = float(field_strength)
+            row["B"] = float(field_strength)
+            row["model_beta"] = float(model_beta)
+            row["beta"] = float(field_strength)
+            row["external_field_vector"] = [float(value) for value in _external_scan_field_vector(field_strength)]
+            row["external_field_terms"] = [(float(coefficient), str(op_name)) for coefficient, op_name in field_terms]
+            row["scan_axes"] = {"x": "alpha", "y": "field_strength", "model_beta": float(model_beta)}
+            row["phase_scan_method"] = str(method_key)
+            return row
+
+        def _external_alpha_b_modes() -> List[str]:
+            mode = str(args.external_scan_mode)
+            if mode == "alpha_b_classical":
+                return ["classical_product"]
+            if mode == "alpha_b_quantum":
+                return ["quantum_ed"]
+            if mode in ("alpha_b_both", "alpha_b_all"):
+                return ["quantum_ed", "classical_product"]
+            return []
+
+        def _run_external_alpha_b_phase_scan() -> Dict[str, Any]:
+            field_values = _external_scan_field_values()
+            selected_modes = _external_alpha_b_modes()
+            model_beta = float(args.beta)
+            output_alpha_b: Dict[str, Any] = {
+                "status": "running",
+                "mode": str(args.external_scan_mode),
+                "external_scan_mode": str(args.external_scan_mode),
+                "selected_outputs": list(selected_modes),
+                "grid": {
+                    "alpha_min": float(min(alpha_values)),
+                    "alpha_max": float(max(alpha_values)),
+                    "alpha_points": int(len(alpha_values)),
+                    "alpha_values": [float(value) for value in alpha_values],
+                    "field_min": float(min(field_values)),
+                    "field_max": float(max(field_values)),
+                    "field_points": int(len(field_values)),
+                    "field_values": [float(value) for value in field_values],
+                    "model_beta": float(model_beta),
+                },
+                "solver_controls": {
+                    "external_scan_mode": str(args.external_scan_mode),
+                    "external_field_treatment": str(args.external_field_treatment),
+                    "external_field_axis": str(args.external_field_axis),
+                    "external_scan_field_min": float(args.external_scan_field_min),
+                    "external_scan_field_max": float(args.external_scan_field_max),
+                    "external_scan_field_points": int(args.external_scan_field_points),
+                    "model_beta": float(model_beta),
+                    "quantum_ed_max_sites": int(args.phase_scan_ed_max_sites),
+                    "quantum_ed_max_hilbert_dimension": int(args.phase_scan_ed_max_hilbert_dim),
+                    "classifier_thresholds": classifier_thresholds,
+                },
+            }
+            progress_bar = _make_progress_bar(
+                enabled=show_progress,
+                total=len(selected_modes) * len(alpha_values) * len(field_values),
+                desc="alpha-B scan",
+                unit="point",
+                leave=False,
+            )
+            point_index = 0
+            for mode_key in selected_modes:
+                rows: List[Dict[str, Any]] = []
+                for field_index, field_strength in enumerate(field_values):
+                    field_terms = _external_scan_field_terms(field_strength)
+                    for alpha_index, alpha in enumerate(alpha_values):
+                        point_start = time.perf_counter() if scan_points_profiled else None
+                        try:
+                            if mode_key == "quantum_ed":
+                                row = _phase_scan_quantum_point(
+                                    geometry_obj,
+                                    model_spec,
+                                    lattice_name,
+                                    float(alpha),
+                                    model_beta,
+                                    args,
+                                    field_terms,
+                                    classifier_thresholds,
+                                    show_progress=False,
+                                )
+                            else:
+                                row = _phase_scan_classical_point(
+                                    geometry_obj,
+                                    model_spec,
+                                    lattice_name,
+                                    float(alpha),
+                                    model_beta,
+                                    args,
+                                    point_index,
+                                    field_terms,
+                                    classifier_thresholds,
+                                )
+                            row = _annotate_alpha_b_row(
+                                row,
+                                model_beta=model_beta,
+                                field_strength=float(field_strength),
+                                field_terms=field_terms,
+                                alpha_index=alpha_index,
+                                field_index=field_index,
+                                method_key=mode_key,
+                            )
+                        except Exception as exc:
+                            row = _annotate_alpha_b_row(
+                                {
+                                    "status": "failed",
+                                    "alpha": float(alpha),
+                                    "error": str(exc),
+                                },
+                                model_beta=model_beta,
+                                field_strength=float(field_strength),
+                                field_terms=field_terms,
+                                alpha_index=alpha_index,
+                                field_index=field_index,
+                                method_key=mode_key,
+                            )
+                        if scan_points_profiled and point_start is not None:
+                            point_elapsed = time.perf_counter() - point_start
+                            _attach_scan_point_profile(
+                                row,
+                                str(mode_key),
+                                float(alpha),
+                                float(model_beta),
+                                point_index,
+                                point_elapsed,
+                                {
+                                    "alpha_index": int(alpha_index),
+                                    "field_index": int(field_index),
+                                    "field_strength": float(field_strength),
+                                    "B": float(field_strength),
+                                },
+                            )
+                        rows.append(row)
+                        point_index += 1
+                        if progress_bar is not None:
+                            progress_bar.update(1)
+                failed_count = int(sum(1 for row in rows if row.get("status") == "failed"))
+                output_alpha_b[mode_key] = {
+                    "status": "completed_with_warnings" if failed_count > 0 else "completed",
+                    "scan_type": "alpha_b_phase_scan",
+                    "scan_axes": {"x": "alpha", "y": "field_strength", "model_beta": float(model_beta)},
+                    "rows": rows,
+                    "completed_points": int(sum(1 for row in rows if row.get("status") == "completed")),
+                    "failed_points": failed_count,
+                    "skipped_points": int(sum(1 for row in rows if row.get("status") == "skipped")),
+                    "alpha_values": [float(value) for value in alpha_values],
+                    "field_values": [float(value) for value in field_values],
+                    "beta_values": [float(value) for value in field_values],
+                    "model_beta": float(model_beta),
+                }
+            if progress_bar is not None:
+                progress_bar.close()
+            child_statuses = [
+                item.get("status")
+                for item in output_alpha_b.values()
+                if isinstance(item, dict) and "status" in item
+            ]
+            output_alpha_b["status"] = (
+                "completed_with_warnings"
+                if any(status in ("failed", "completed_with_warnings") for status in child_statuses)
+                else "completed"
+            )
+            return output_alpha_b
+
+        def _run_energy_b_ed_point(field_strength: float, field_terms: List[Tuple[float, str]]) -> Dict[str, Any]:
+            if int(geometry_obj.number_of_sites) > int(args.phase_scan_ed_max_sites):
+                return {
+                    "status": "skipped",
+                    "reason": f"ED Energy-B scan limited to {int(args.phase_scan_ed_max_sites)} sites.",
+                    "energies": [],
+                }
+            ed_plan_for_point = (
+                getattr(args, "ed_symmetry_plan", {})
+                if isinstance(getattr(args, "ed_symmetry_plan", None), dict)
+                else {}
+            )
+            if _ed_plan_requires_standard_projector(ed_plan_for_point, model_spec):
+                parent_dim = _spin_orbital_symmetry_reduced_dimension(
+                    int(geometry_obj.number_of_sites),
+                    False,
+                    int(ed_plan_for_point.get("target_sz2", args.u1_target_sz2)),
+                    True,
+                    int(ed_plan_for_point.get("target_tz2", args.u1_target_tz2)),
+                )
+                projector_factor = _ed_projector_reduction_factor_estimate(ed_plan_for_point, geometry_obj)
+                projected_dim_estimate = int(max(1, int(parent_dim) // max(1, projector_factor)))
+                if projected_dim_estimate > int(args.phase_scan_ed_max_hilbert_dim):
+                    return {
+                        "status": "skipped",
+                        "reason": (
+                            "ED Energy-B standard projector dimension estimate "
+                            f"{projected_dim_estimate} exceeds {int(args.phase_scan_ed_max_hilbert_dim)}."
+                        ),
+                        "solver_mode": "spin_orbital_tz_projector",
+                        "basis_type": "bitwise_spin_orbital_tz_projector_block",
+                        "hilbert_dim": int(projected_dim_estimate),
+                        "u1_parent_hilbert_dim": int(parent_dim),
+                        "energies": [],
+                    }
+                spectrum, _vectors, _basis_list, _basis_map = run_spin_orbital_projected_exact_spectrum(
+                    geometry=geometry_obj,
+                    model_spec=model_spec,
+                    alpha=float(args.alpha),
+                    beta=float(args.beta),
+                    coupling_j=args.coupling_j,
+                    eigenstate_count=max(1, int(args.external_scan_ed_bands)),
+                    check_ground_state_degeneracy=False,
+                    jx=args.jx,
+                    jy=args.jy,
+                    jz=args.jz,
+                    external_field_terms=field_terms,
+                    show_progress=False,
+                    ground_manifold_abs_tol=float(args.ed_ground_manifold_abs_tol),
+                    ground_manifold_rel_tol=float(args.ed_ground_manifold_rel_tol),
+                    sparse_tol=float(args.ed_sparse_tol),
+                    sparse_maxiter=(int(args.ed_sparse_maxiter) if int(args.ed_sparse_maxiter) > 0 else None),
+                    target_tz2=int(ed_plan_for_point.get("target_tz2", args.u1_target_tz2)),
+                    use_spin_pi_z=bool(
+                        ed_plan_for_point.get("use_z2_block", False)
+                        and str(ed_plan_for_point.get("z2_kind")) == "spin_pi_z"
+                    ),
+                    z2_target_parity=int(ed_plan_for_point.get("z2_target_parity", args.z2_target_parity)),
+                    use_translation_x=bool(ed_plan_for_point.get("use_translation_x_block", False)),
+                    use_translation_y=bool(ed_plan_for_point.get("use_translation_y_block", False)),
+                    momentum_x=int(ed_plan_for_point.get("momentum_x_block", args.momentum_x_block)),
+                    momentum_y=int(ed_plan_for_point.get("momentum_y_block", args.momentum_y_block)),
+                    use_combined_c3=bool(ed_plan_for_point.get("use_c3_block", False)),
+                    c3_q_blocks=str(ed_plan_for_point.get("c3_q_blocks", args.ed_c3_q_blocks)),
+                    strict_projector_memory=False,
+                    allow_drop_c3_on_memory=True,
+                )
+                energies = [float(value) for value in list(spectrum.get("energies", []))]
+                return {
+                    "status": "completed",
+                    "ed_backend": "standard",
+                    "requested_ed_backend": str(args.ed_backend),
+                    "backend_override_reason": (
+                        "Energy-B ED used standard projector symmetries because the ED plan "
+                        "contains fused translations/C3 or spin_pi_z."
+                    ),
+                    "solver_mode": spectrum.get("solver_mode"),
+                    "basis_type": spectrum.get("basis_type", "bitwise_spin_orbital_tz_projector_block"),
+                    "hilbert_dim": spectrum.get("hilbert_dim", projected_dim_estimate),
+                    "u1_parent_hilbert_dim": int(parent_dim),
+                    "projector_reduced_dimension": spectrum.get("projector_reduced_dimension"),
+                    "projector_strategy": spectrum.get("projector_strategy"),
+                    "memory_estimate_MB": spectrum.get("memory_estimate_MB"),
+                    "dropped_symmetries": spectrum.get("dropped_symmetries", []),
+                    "drop_reasons": spectrum.get("drop_reasons", {}),
+                    "applied_reductions": [
+                        name
+                        for name, active in (
+                            ("tz", spectrum.get("use_tau_z_block", True)),
+                            ("z2", spectrum.get("use_z2_block", False)),
+                            ("translation_x", spectrum.get("use_translation_x_block", False)),
+                            ("translation_y", spectrum.get("use_translation_y_block", False)),
+                            ("combined_c3", spectrum.get("use_c3_block", False)),
+                        )
+                        if bool(active)
+                    ],
+                    "commutator_norms": spectrum.get("commutator_norms", {}),
+                    "selected_c3_q": spectrum.get("selected_c3_q"),
+                    "c3_sector_energies": spectrum.get("c3_sector_energies"),
+                    "energies": energies,
+                    "energies_per_site": [
+                        float(value) / float(max(1, int(geometry_obj.number_of_sites)))
+                        for value in energies
+                    ],
+                }
+            if str(ed_plan_for_point.get("effective_engine", "")).startswith("quspin"):
+                try:
+                    import quspin_backend as quspin_ed_backend
+                except Exception as exc:
+                    return {
+                        "status": "skipped",
+                        "reason": f"QuSpin-native Energy-B ED requested but quspin_backend is unavailable: {exc}",
+                        "energies": [],
+                    }
+                use_quspin_z2 = bool(
+                    ed_plan_for_point.get("use_z2_block", False)
+                    and ed_plan_for_point.get("z2_kind") == "spin_flip"
+                )
+                spectrum, _vectors = quspin_ed_backend.run_small_cluster_exact_spectrum(
+                    geometry=geometry_obj,
+                    model_spec=model_spec,
+                    alpha=float(args.alpha),
+                    beta=float(args.beta),
+                    coupling_j=args.coupling_j,
+                    eigenstate_count=max(1, int(args.external_scan_ed_bands)),
+                    check_ground_state_degeneracy=False,
+                    jx=args.jx,
+                    jy=args.jy,
+                    jz=args.jz,
+                    external_field_terms=field_terms,
+                    show_progress=False,
+                    solver=args.ed_solver,
+                    sparse_tol=float(args.ed_sparse_tol),
+                    sparse_maxiter=(int(args.ed_sparse_maxiter) if int(args.ed_sparse_maxiter) > 0 else None),
+                    use_sz_block=False,
+                    target_sz2=int(ed_plan_for_point.get("target_sz2", args.u1_target_sz2)),
+                    use_tau_z_block=bool(ed_plan_for_point.get("use_tau_z_block", False)),
+                    target_tz2=int(ed_plan_for_point.get("target_tz2", args.u1_target_tz2)),
+                    use_z2_block=use_quspin_z2,
+                    z2_generator=("spin_flip" if use_quspin_z2 else None),
+                    z2_target_parity=int(ed_plan_for_point.get("z2_target_parity", args.z2_target_parity)),
+                    use_translation_block=False,
+                    use_translation_x_block=False,
+                    use_translation_y_block=False,
+                    momentum_block_1=0,
+                    momentum_block_2=0,
+                    momentum_x_block=0,
+                    momentum_y_block=0,
+                    use_reflection_block=False,
+                    reflection_block=0,
+                    check_symm=bool(args.quspin_check_symmetries),
+                    check_herm=bool(args.quspin_check_hermiticity),
+                    check_pcon=bool(args.quspin_check_particle_conservation),
+                )
+                energies = [float(value) for value in list(spectrum.get("energies", []))]
+                return {
+                    "status": "completed",
+                    "ed_backend": "quspin",
+                    "symmetry_engine": ed_plan_for_point.get("effective_engine", "quspin_native"),
+                    "solver_mode": spectrum.get("solver_mode"),
+                    "basis_type": spectrum.get("basis_type"),
+                    "hilbert_dim": spectrum.get("hilbert_dim", spectrum.get("hilbert_dimension")),
+                    "use_tau_z_block": bool(spectrum.get("use_tau_z_block", ed_plan_for_point.get("use_tau_z_block", False))),
+                    "use_z2_block": bool(spectrum.get("use_z2_block", use_quspin_z2)),
+                    "z2_kind": spectrum.get("z2_kind", "spin_flip" if use_quspin_z2 else None),
+                    "metadata_note": (
+                        "QuSpin-native Energy-B ED uses only the supported subset; "
+                        "fused translations and combined C3 are not represented by this path."
+                    ),
+                    "energies": energies,
+                    "energies_per_site": [
+                        float(value) / float(max(1, int(geometry_obj.number_of_sites)))
+                        for value in energies
+                    ],
+                }
+            spectrum, _vectors = run_small_cluster_exact_spectrum(
+                geometry=geometry_obj,
+                model_spec=model_spec,
+                alpha=float(args.alpha),
+                beta=float(args.beta),
+                coupling_j=args.coupling_j,
+                eigenstate_count=max(1, int(args.external_scan_ed_bands)),
+                check_ground_state_degeneracy=False,
+                jx=args.jx,
+                jy=args.jy,
+                jz=args.jz,
+                external_field_terms=field_terms,
+                show_progress=False,
+                solver=args.ed_solver,
+                sparse_tol=float(args.ed_sparse_tol),
+                sparse_maxiter=(int(args.ed_sparse_maxiter) if int(args.ed_sparse_maxiter) > 0 else None),
+            )
+            energies = [float(value) for value in list(spectrum.get("energies", []))]
+            return {
+                "status": "completed",
+                "solver_mode": spectrum.get("solver_mode"),
+                "hilbert_dim": spectrum.get("hilbert_dim"),
+                "energies": energies,
+                "energies_per_site": [
+                    float(value) / float(max(1, int(geometry_obj.number_of_sites)))
+                    for value in energies
+                ],
+            }
+
+        def _run_energy_b_dmrg_point(field_strength: float, field_terms: List[Tuple[float, str]], point_index: int) -> Dict[str, Any]:
+            if int(geometry_obj.number_of_sites) > int(args.max_dmrg_sites):
+                return {
+                    "status": "skipped",
+                    "reason": f"DMRG Energy-B scan limited to {int(args.max_dmrg_sites)} sites.",
+                }
+            backend_request = str(args.backend).strip().lower()
+            if backend_request == "quimb":
+                return {"status": "skipped", "reason": "backend=quimb does not run finite DMRG; use backend=auto/tenpy/tenax."}
+            tenpy_scan_issue = tenpy_backend_compatibility_issue()
+            try:
+                if backend_request == "tenpy" or (backend_request == "auto" and tenpy_scan_issue is None):
+                    yl_scan = _load_tenpy_backend_module()
+                    _psi, _mpo, info = yl_scan.run_cylindrical_dmrg(
+                        geometry=geometry_obj,
+                        alpha=float(args.alpha),
+                        beta=float(args.beta),
+                        coupling_j=args.coupling_j,
+                        max_bond_dimension=args.max_bond_dimension,
+                        max_sweeps=args.max_sweeps,
+                        truncation_cutoff=args.truncation_cutoff,
+                        svd_min=args.dmrg_svd_min,
+                        random_seed=int(args.phase_scan_random_seed) + int(point_index),
+                        product_state_style=args.initial_state,
+                        compute_phase_observables=False,
+                        external_field_terms=field_terms,
+                        symmetry_reductions=symmetry_reduction_settings,
+                        show_progress=False,
+                    )
+                    energy = float(info.get("E", info.get("energy", np.nan)))
+                    return {
+                        "status": "completed",
+                        "backend": "tenpy",
+                        "energy": energy,
+                        "energy_per_site": energy / float(max(1, int(geometry_obj.number_of_sites))),
+                    }
+                mps, _mpo, info = run_tenax_cylindrical_dmrg(
+                    geometry=geometry_obj,
+                    model_spec=model_spec,
+                    alpha=float(args.alpha),
+                    beta=float(args.beta),
+                    coupling_j=args.coupling_j,
+                    external_field_terms=field_terms,
+                    max_bond_dimension=args.max_bond_dimension,
+                    max_sweeps=args.max_sweeps,
+                    truncation_cutoff=args.truncation_cutoff,
+                    svd_min=args.dmrg_svd_min,
+                    random_seed=int(args.phase_scan_random_seed) + int(point_index),
+                    jx=args.jx,
+                    jy=args.jy,
+                    jz=args.jz,
+                    symmetry_mode=effective_symmetry_mode,
+                    u1_target_total_sz2=args.u1_target_sz2,
+                    u1_target_total_tz2=args.u1_target_tz2,
+                    z2_target_parity=args.z2_target_parity,
+                    strict_symmetry_selection_rules=args.strict_symmetry_selection_rules,
+                    allow_symmetry_fallback_to_dense=args.symmetry_allow_dense_fallback,
+                    initial_state_style=args.initial_state,
+                    show_progress=False,
+                )
+                del mps
+                energy = float(info.get("E", info.get("energy", np.nan)))
+                return {
+                    "status": "completed",
+                    "backend": "tenax",
+                    "energy": energy,
+                    "energy_per_site": energy / float(max(1, int(geometry_obj.number_of_sites))),
+                }
+            except Exception as exc:
+                return {"status": "failed", "error": str(exc)}
+
+        def _run_external_energy_b_scan() -> Dict[str, Any]:
+            field_values = _external_scan_field_values()
+            rows: List[Dict[str, Any]] = []
+            progress_bar = _make_progress_bar(
+                enabled=show_progress,
+                total=len(field_values),
+                desc="Energy-B scan",
+                unit="point",
+                leave=False,
+            )
+            for field_index, field_strength in enumerate(field_values):
+                field_terms = _external_scan_field_terms(field_strength)
+                point_start = time.perf_counter() if scan_points_profiled else None
+                ed_result = _run_energy_b_ed_point(float(field_strength), field_terms)
+                dmrg_result = _run_energy_b_dmrg_point(float(field_strength), field_terms, field_index)
+                row = {
+                    "status": (
+                        "completed"
+                        if ed_result.get("status") == "completed" or dmrg_result.get("status") == "completed"
+                        else "skipped"
+                    ),
+                    "field_index": int(field_index),
+                    "field_strength": float(field_strength),
+                    "B": float(field_strength),
+                    "alpha": float(args.alpha),
+                    "beta": float(args.beta),
+                    "model_beta": float(args.beta),
+                    "external_field_vector": [float(value) for value in _external_scan_field_vector(field_strength)],
+                    "external_field_terms": [(float(coefficient), str(op_name)) for coefficient, op_name in field_terms],
+                    "ed_status": ed_result.get("status"),
+                    "ed_energies": ed_result.get("energies", []),
+                    "ed_energies_per_site": ed_result.get("energies_per_site", []),
+                    "ed": ed_result,
+                    "dmrg_status": dmrg_result.get("status"),
+                    "dmrg_energy": dmrg_result.get("energy"),
+                    "dmrg_energy_per_site": dmrg_result.get("energy_per_site"),
+                    "dmrg": dmrg_result,
+                }
+                if row["status"] == "skipped":
+                    row["reason"] = "; ".join(
+                        str(item.get("reason", item.get("error", "")))
+                        for item in (ed_result, dmrg_result)
+                        if item.get("reason") or item.get("error")
+                    )
+                if scan_points_profiled and point_start is not None:
+                    point_elapsed = time.perf_counter() - point_start
+                    _attach_scan_point_profile(
+                        row,
+                        "energy_b",
+                        float(args.alpha),
+                        float(args.beta),
+                        field_index,
+                        point_elapsed,
+                        {
+                            "field_index": int(field_index),
+                            "field_strength": float(field_strength),
+                            "B": float(field_strength),
+                            "ed_status": ed_result.get("status"),
+                            "dmrg_status": dmrg_result.get("status"),
+                        },
+                    )
+                rows.append(row)
+                if progress_bar is not None:
+                    progress_bar.update(1)
+            if progress_bar is not None:
+                progress_bar.close()
+            completed_count = int(sum(1 for row in rows if row.get("status") == "completed"))
+            return {
+                "status": "completed" if completed_count > 0 else "skipped",
+                "external_scan_mode": "e_b",
+                "scan_type": "energy_b_scan",
+                "rows": rows,
+                "completed_points": completed_count,
+                "failed_points": int(sum(1 for row in rows if row.get("status") == "failed")),
+                "skipped_points": int(sum(1 for row in rows if row.get("status") == "skipped")),
+                "field_values": [float(value) for value in field_values],
+                "alpha": float(args.alpha),
+                "beta": float(args.beta),
+                "ed_bands": int(args.external_scan_ed_bands),
+                "note": "DMRG ground-state energy and the lowest ED bands are plotted together versus external field strength B.",
+            }
+
+        def _external_field_phase_scan_is_available() -> bool:
+            return bool(
+                external_field_is_active(args.external_field_treatment, resolved_field_vector)
+                and str(args.external_field_treatment) != "off"
+                and str(args.external_scan_mode) != "none"
+            )
+
+        def _run_selected_external_phase_scan() -> Dict[str, Any]:
+            if str(args.external_scan_mode) == "e_b":
+                return {
+                    "status": "completed",
+                    "mode": "external_e_b",
+                    "external_scan_mode": str(args.external_scan_mode),
+                    "selected_outputs": ["energy_b_scan"],
+                    "energy_b_scan": _run_external_energy_b_scan(),
+                }
+            return _run_external_alpha_b_phase_scan()
+
+        def _copy_external_phase_scan_into_output(
+            output_obj: Dict[str, Any],
+            external_data: Dict[str, Any],
+        ) -> List[str]:
+            """Attach external scan payloads using non-conflicting output keys."""
+            output_obj["external_scan"] = {
+                "status": str(external_data.get("status", "unknown")),
+                "mode": str(external_data.get("mode", "external")),
+                "external_scan_mode": str(external_data.get("external_scan_mode", args.external_scan_mode)),
+                "selected_outputs": list(external_data.get("selected_outputs", [])),
+                "reason": external_data.get("reason"),
+            }
+            copied_keys: List[str] = ["external_scan"]
+            if isinstance(external_data.get("energy_b_scan"), dict):
+                output_obj["energy_b_scan"] = external_data["energy_b_scan"]
+                copied_keys.append("energy_b_scan")
+            for source_key, target_key in (
+                ("quantum_ed", "external_quantum_ed"),
+                ("classical_product", "external_classical_product"),
+            ):
+                if isinstance(external_data.get(source_key), dict):
+                    mode_payload = external_data[source_key]
+                    mode_payload["external_scan_mode"] = str(external_data.get("external_scan_mode", args.external_scan_mode))
+                    mode_payload["phase_scan_channels"] = str(external_data.get("phase_scan_channels", "external"))
+                    output_obj[target_key] = mode_payload
+                    copied_keys.append(target_key)
+            output_obj["selected_outputs"] = list(dict.fromkeys(
+                list(output_obj.get("selected_outputs", []))
+                + [
+                    key
+                    for key in ("energy_b_scan", "external_quantum_ed", "external_classical_product")
+                    if isinstance(output_obj.get(key), dict)
+                ]
+            ))
+            return copied_keys
+
+        external_scan_available = _external_field_phase_scan_is_available()
+        requested_phase_scan_channels = str(args.phase_scan_channels)
+        if requested_phase_scan_channels == "auto":
+            resolved_phase_scan_channels = "external" if external_scan_available else "normal"
+        else:
+            resolved_phase_scan_channels = requested_phase_scan_channels
+
+        if resolved_phase_scan_channels == "none":
+            return {
+                "status": "skipped",
+                "mode": str(args.phase_scan_mode),
+                "phase_scan_channels": "none",
+                "external_scan_mode": str(args.external_scan_mode),
+                "selected_outputs": [],
+                "reason": "phase_scan_channels=none disables both normal and external phase-scan calculations.",
+            }
+
+        external_phase_scan_data: Dict[str, Any] | None = None
+        if resolved_phase_scan_channels in ("external", "both"):
+            if external_scan_available:
+                external_phase_scan_data = _run_selected_external_phase_scan()
+            else:
+                external_phase_scan_data = {
+                    "status": "skipped",
+                    "mode": "external",
+                    "external_scan_mode": str(args.external_scan_mode),
+                    "selected_outputs": [],
+                    "reason": (
+                        "External phase scan requested, but no active external scan is available "
+                        "(requires nonzero field, treatment != off, and external_scan_mode != none)."
+                    ),
+                }
+            external_phase_scan_data["phase_scan_channels"] = str(resolved_phase_scan_channels)
+            external_phase_scan_data["requested_phase_scan_channels"] = str(args.phase_scan_channels)
+            if resolved_phase_scan_channels == "external":
+                return external_phase_scan_data
+            if resolved_phase_scan_channels == "both" and incremental_summary_obj is not None:
+                external_checkpoint_output: Dict[str, Any] = {
+                    "status": str(external_phase_scan_data.get("status", "unknown")),
+                    "mode": str(args.phase_scan_mode),
+                    "phase_scan_channels": str(resolved_phase_scan_channels),
+                    "requested_phase_scan_channels": str(args.phase_scan_channels),
+                    "quantum_methods": list(args.phase_scan_quantum_methods),
+                    "selected_outputs": [],
+                    "grid": {
+                        "alpha_min": float(min(alpha_values)),
+                        "alpha_max": float(max(alpha_values)),
+                        "alpha_points": int(len(alpha_values)),
+                        "alpha_values": [float(value) for value in alpha_values],
+                    },
+                    "solver_controls": {
+                        "phase_scan_channels": str(args.phase_scan_channels),
+                        "external_scan_mode": str(args.external_scan_mode),
+                        "external_scan_field_min": float(args.external_scan_field_min),
+                        "external_scan_field_max": float(args.external_scan_field_max),
+                        "external_scan_field_points": int(args.external_scan_field_points),
+                        "external_scan_ed_bands": int(args.external_scan_ed_bands),
+                        "symmetry_reductions": symmetry_reduction_settings,
+                    },
+                    "note": (
+                        "External phase-scan checkpoint saved immediately after the alpha-B/Energy-B "
+                        "calculation finished; normal alpha-beta scans may continue afterward."
+                    ),
+                }
+                copied_external_keys = _copy_external_phase_scan_into_output(
+                    external_checkpoint_output,
+                    external_phase_scan_data,
+                )
+                if show_progress:
+                    print(
+                        "[phase-scan] checkpoint: external scan finished; saving plots and "
+                        "representative outputs before starting normal phase scan."
+                    )
+                incremental_summary_obj["phase_scan"] = external_checkpoint_output
+                incremental_summary_obj.setdefault("stages", {})["phase_scan"] = "running"
+                save_phase_scan_outputs(
+                    incremental_summary_obj,
+                    external_checkpoint_output,
+                    geometry_obj,
+                    mode_keys={key for key in copied_external_keys if key != "external_scan"},
+                )
+                _save_summary_checkpoint(args.output_folder, incremental_summary_obj)
 
         output: Dict[str, Any] = {
-            "status": "completed",
+            "status": "running",
             "mode": str(args.phase_scan_mode),
+            "phase_scan_channels": str(resolved_phase_scan_channels),
+            "requested_phase_scan_channels": str(args.phase_scan_channels),
             "quantum_methods": list(args.phase_scan_quantum_methods),
             "selected_outputs": methods,
             "grid": {
@@ -3537,12 +6923,14 @@ def main() -> None:
                 "beta_values": beta_values,
             },
             "solver_controls": {
+                "phase_scan_channels": str(args.phase_scan_channels),
                 "mode": str(args.phase_scan_mode),
                 "quantum_methods": list(args.phase_scan_quantum_methods),
                 "selected_outputs": methods,
                 "ed_max_sites": int(args.phase_scan_ed_max_sites),
                 "ed_max_hilbert_dimension": int(args.phase_scan_ed_max_hilbert_dim),
                 "ed_backend": str(args.ed_backend),
+                "ed_symmetry_plan": getattr(args, "ed_symmetry_plan", {"status": "pending"}),
                 "dmrg_backend": str(args.backend),
                 "dmrg_effective_symmetry_mode": str(effective_symmetry_mode),
                 "symmetry_reductions": symmetry_reduction_settings,
@@ -3554,13 +6942,71 @@ def main() -> None:
                 },
                 "dmrg_max_bond_dimension": int(args.max_bond_dimension),
                 "dmrg_max_sweeps": int(args.max_sweeps),
+                "peps_max_sites": int(args.max_peps_sites),
+                "peps_max_bond_dimension": int(args.peps_max_bond_dimension),
+                "peps_bond_dimension_cap": int(args.peps_bond_dimension_cap),
+                "peps_max_sweeps": int(args.peps_max_sweeps),
+                "peps_sweep_cap": int(args.peps_sweep_cap),
+                "peps_ctm_chi": int(args.peps_ctm_chi),
+                "peps_ctm_chi_cap": int(args.peps_ctm_chi_cap),
+                "peps_tau": float(args.peps_tau),
+                "peps_entanglement_max_dense_dim": int(args.peps_entanglement_max_dense_dim),
+                "peps_symmetry_mode": str(args.peps_symmetry_mode),
+                "peps_strict_symmetry": bool(args.peps_strict_symmetry),
+                "peps_allow_dense_fallback": bool(args.peps_allow_dense_fallback),
                 "idmrg_max_bond_dimension": int(args.idmrg_max_bond_dimension),
                 "idmrg_max_iterations": int(args.idmrg_max_iterations),
+                "idmrg_use_translation_symmetry": bool(args.idmrg_use_translation_symmetry),
+                "ipeps_max_unit_cell_sites": int(args.max_ipeps_unit_cell_sites),
+                "ipeps_max_bond_dimension": int(args.ipeps_max_bond_dimension),
+                "ipeps_bond_dimension_cap": int(args.ipeps_bond_dimension_cap),
+                "ipeps_max_iterations": int(args.ipeps_max_iterations),
+                "ipeps_iteration_cap": int(args.ipeps_iteration_cap),
+                "ipeps_ctm_chi": int(args.ipeps_ctm_chi),
+                "ipeps_ctm_chi_cap": int(args.ipeps_ctm_chi_cap),
+                "ipeps_tau": float(args.ipeps_tau),
+                "ipeps_symmetry_mode": str(args.ipeps_symmetry_mode),
+                "ipeps_strict_symmetry": bool(args.ipeps_strict_symmetry),
+                "ipeps_allow_dense_fallback": bool(args.ipeps_allow_dense_fallback),
+                "ipeps_unit_cell_kind": str(args.ipeps_unit_cell_kind),
+                "ipeps_use_translation_symmetry": bool(args.ipeps_use_translation_symmetry),
+                "ipeps_contraction_method": str(args.ipeps_contraction_method),
+                "ipeps_ctmrg_enabled": str(args.ipeps_contraction_method) == "ctmrg",
+                "external_scan_mode": str(args.external_scan_mode),
+                "external_scan_field_min": float(args.external_scan_field_min),
+                "external_scan_field_max": float(args.external_scan_field_max),
+                "external_scan_field_points": int(args.external_scan_field_points),
+                "external_scan_ed_bands": int(args.external_scan_ed_bands),
                 "truncation_cutoff": float(args.truncation_cutoff),
-                "tenpy_symmetry_mode": "u1_sz",
+                "tenpy_symmetry_mode": str(effective_symmetry_mode),
                 "classifier_thresholds": classifier_thresholds,
             },
         }
+
+        def _save_incremental_completed_modes(completed_mode_keys: List[str], note: str) -> None:
+            if incremental_summary_obj is None:
+                return
+            mode_key_set = {
+                str(key)
+                for key in completed_mode_keys
+                if isinstance(output.get(str(key)), dict)
+            }
+            if len(mode_key_set) == 0:
+                return
+            if show_progress:
+                print(
+                    "[phase-scan] checkpoint: saving completed "
+                    f"{', '.join(sorted(mode_key_set))} outputs before continuing to {note}."
+                )
+            incremental_summary_obj["phase_scan"] = output
+            incremental_summary_obj.setdefault("stages", {})["phase_scan"] = "running"
+            save_phase_scan_outputs(
+                incremental_summary_obj,
+                output,
+                geometry_obj,
+                mode_keys=mode_key_set,
+            )
+
         legacy_mode = _phase_scan_legacy_mode_from_methods(methods)
         if legacy_mode is not None:
             args_for_legacy = argparse.Namespace(**vars(args))
@@ -3573,9 +7019,14 @@ def main() -> None:
                 hamiltonian_external_field_terms=hamiltonian_external_field_terms,
                 show_progress=show_progress,
             )
+            completed_legacy_keys: List[str] = []
             for key in ("quantum_ed", "classical_product"):
                 if key in legacy_data:
                     output[key] = legacy_data[key]
+                    completed_legacy_keys.append(key)
+            remaining_after_legacy = [method for method in methods if method not in ("ed", "classical")]
+            if remaining_after_legacy:
+                _save_incremental_completed_modes(completed_legacy_keys, "quantum tensor-network scans")
         elif "ed" in methods or "classical" in methods:
             ed_classical_methods = [method for method in methods if method in ("ed", "classical")]
             args_for_legacy = argparse.Namespace(**vars(args))
@@ -3588,16 +7039,71 @@ def main() -> None:
                 hamiltonian_external_field_terms=hamiltonian_external_field_terms,
                 show_progress=show_progress,
             )
+            completed_legacy_keys = []
             for key in ("quantum_ed", "classical_product"):
                 if key in legacy_data:
                     output[key] = legacy_data[key]
+                    completed_legacy_keys.append(key)
+            remaining_after_legacy = [method for method in methods if method not in ("ed", "classical")]
+            if remaining_after_legacy:
+                _save_incremental_completed_modes(completed_legacy_keys, "quantum tensor-network scans")
 
         if "dmrg" in methods:
             dmrg_key, dmrg_data = _run_selected_dmrg_phase_scan()
             output[dmrg_key] = dmrg_data
+            if any(method in methods for method in ("peps", "idmrg", "ipeps")):
+                _save_incremental_completed_modes([dmrg_key], "remaining phase scans")
+
+        if "peps" in methods:
+            peps_key, peps_data = _run_quimb_peps_phase_scan()
+            output[peps_key] = peps_data
+            if any(method in methods for method in ("idmrg", "ipeps")):
+                _save_incremental_completed_modes([peps_key], "remaining phase scans")
 
         if "idmrg" in methods:
-            if str(args.backend).strip().lower() == "tenax":
+            backend_request = str(args.backend).strip().lower()
+            tenpy_scan_issue = tenpy_backend_compatibility_issue()
+            if not bool(args.idmrg_use_translation_symmetry):
+                reason = "iDMRG translation symmetry was disabled by --no-idmrg-use-translation-symmetry."
+                output["tenpy_idmrg"] = {
+                    "status": "skipped",
+                    "backend": backend_request,
+                    "requested_backend": str(args.backend),
+                    "scan_type": "idmrg_observable_scan",
+                    "selected_via": "phase_scan_method_idmrg",
+                    "rows": [],
+                    "completed_points": 0,
+                    "failed_points": 0,
+                    "skipped_points": int(len(alpha_values) * len(beta_values)),
+                    "reason": reason,
+                    "translation_symmetry": {"enabled": False},
+                    "symmetry_reductions": symmetry_reduction_settings,
+                    "symmetry_mode": str(effective_symmetry_mode),
+                }
+                _save_incremental_completed_modes(["tenpy_idmrg"], "final output collation")
+            elif backend_request == "quimb":
+                reason = (
+                    "phase_scan_methods=idmrg now means tensor-network iDMRG only. "
+                    "Use phase_scan_methods=ipeps for quimb iPEPS."
+                )
+                if show_progress:
+                    print(f"[phase-scan] skip iDMRG with backend=quimb: {reason}")
+                output["tenpy_idmrg"] = {
+                    "status": "skipped",
+                    "backend": "quimb",
+                    "requested_backend": str(args.backend),
+                    "scan_type": "idmrg_observable_scan",
+                    "selected_via": "phase_scan_method_idmrg",
+                    "rows": [],
+                    "completed_points": 0,
+                    "failed_points": 0,
+                    "skipped_points": int(len(alpha_values) * len(beta_values)),
+                    "reason": reason,
+                    "symmetry_reductions": symmetry_reduction_settings,
+                    "symmetry_mode": str(effective_symmetry_mode),
+                }
+                _save_incremental_completed_modes(["tenpy_idmrg"], "final output collation")
+            elif backend_request == "tenax" or (backend_request == "auto" and tenpy_scan_issue is not None):
                 output["tenax_idmrg"] = {
                     "status": "skipped",
                     "backend": "tenax",
@@ -3607,42 +7113,57 @@ def main() -> None:
                     "failed_points": 0,
                     "skipped_points": int(len(alpha_values) * len(beta_values)),
                     "reason": (
-                        "Tenax iDMRG phase-scan classification is not implemented yet; "
-                        "the single-point iDMRG workflow still uses Tenax when the finite DMRG backend is Tenax."
+                        "Tenax iDMRG phase-scan classification is not implemented yet. "
+                        + (
+                            f"Auto selected this skip because TeNPy is not compatible: {tenpy_scan_issue}"
+                            if backend_request == "auto" and tenpy_scan_issue is not None
+                            else "The single-point iDMRG workflow still uses Tenax when the finite DMRG backend is Tenax."
+                        )
                     ),
                     "symmetry_reductions": symmetry_reduction_settings,
                     "symmetry_mode": str(effective_symmetry_mode),
                 }
+                _save_incremental_completed_modes(["tenax_idmrg"], "final output collation")
             else:
-                if lattice_name != "honeycomb":
-                    raise ValueError("TeNPy iDMRG phase scans currently support only honeycomb geometry.")
-                if not (
-                    model_spec.spin_rep == "1/2"
-                    and model_spec.orbital_rep == "1/2"
-                    and model_spec.model_family == "yao_lee"
-                    and model_spec.ising_axis == "z"
-                ):
-                    raise ValueError(
-                        "TeNPy iDMRG phase scans use the U(1) Sz-conserved YaoLeeSite and require "
-                        "spin_rep=1/2, orbital_rep=1/2, model_family=yao_lee, ising_axis=z."
-                    )
+                if tenpy_scan_issue is not None:
+                    raise ValueError(f"TeNPy iDMRG phase scan is not compatible: {tenpy_scan_issue}")
                 yl_scan = _load_tenpy_backend_module()
                 output["tenpy_idmrg"] = yl_scan.run_alpha_beta_idmrg_observable_scan(
                     geometry=geometry_obj,
                     alpha_values=alpha_values,
                     beta_values=beta_values,
                     coupling_j=args.coupling_j,
+                    max_unit_cell_sites=args.max_ipeps_unit_cell_sites,
                     max_bond_dimension=args.idmrg_max_bond_dimension,
                     max_iterations=args.idmrg_max_iterations,
                     truncation_cutoff=args.truncation_cutoff,
+                    svd_min=args.idmrg_svd_min,
                     carry_state_between_betas=False,
                     classifier_thresholds=classifier_thresholds,
                     external_field_terms=hamiltonian_external_field_terms,
+                    symmetry_reductions=symmetry_reduction_settings,
                     show_progress=show_progress,
                 )
                 output["tenpy_idmrg"]["requested_backend"] = str(args.backend)
                 output["tenpy_idmrg"]["symmetry_reductions"] = symmetry_reduction_settings
-                output["tenpy_idmrg"]["symmetry_note"] = "TeNPy scan uses the fixed total-Sz U(1) YaoLeeSite backend."
+                output["tenpy_idmrg"]["translation_symmetry"] = {
+                    "enabled": bool(args.idmrg_use_translation_symmetry),
+                    "implemented_as": "infinite repeated MPS unit cell along x",
+                }
+                output["tenpy_idmrg"]["symmetry_note"] = (
+                    "TeNPy iDMRG scan uses the real total-Tz U1 YaoLeeSite."
+                    if bool(symmetry_reduction_settings.get("use_tau_z_block", False))
+                    else "TeNPy iDMRG scan uses dense/no-symmetry YaoLeeSite tensors."
+                )
+                _save_incremental_completed_modes(["tenpy_idmrg"], "final output collation")
+
+        if "ipeps" in methods:
+            ipeps_key, ipeps_data = _run_quimb_ipeps_phase_scan()
+            output[ipeps_key] = ipeps_data
+            _save_incremental_completed_modes([ipeps_key], "final output collation")
+
+        if external_phase_scan_data is not None:
+            _copy_external_phase_scan_into_output(output, external_phase_scan_data)
         child_statuses = [
             value.get("status")
             for value in output.values()
@@ -3650,16 +7171,35 @@ def main() -> None:
         ]
         if any(status in ("failed", "completed_with_warnings") for status in child_statuses):
             output["status"] = "completed_with_warnings"
+        else:
+            output["status"] = "completed"
         return output
 
-    if args.phase_scan_only:
-        geometry = build_lattice_geometry(
-            lattice=lattice_name,
-            length_x=args.length_x,
-            length_y=args.length_y,
-            circumference_x=circumference_x,
-            circumference_y=circumference_y,
+    def finalize_summary_with_profiling(summary_obj: Dict[str, Any]) -> None:
+        if not profiling_enabled():
+            return
+        update_profile_metadata(
+            actual_backend=backend_used,
+            actual_method=args.method,
+            actual_ed_backend=args.ed_backend,
+            symmetry_engine=getattr(args, "ed_symmetry_engine", None),
         )
+        profiling_payload = finalize_profiling(
+            summary_obj,
+            output_folder=args.profile_output_folder,
+        )
+        if profiling_payload:
+            summary_obj["profiling"] = profiling_payload
+
+    if args.phase_scan_only:
+        with profile_stage("geometry construction"):
+            geometry = build_lattice_geometry(
+                lattice=lattice_name,
+                length_x=args.length_x,
+                length_y=args.length_y,
+                circumference_x=circumference_x,
+                circumference_y=circumference_y,
+            )
         symmetry_preflight_report = run_symmetry_preflight_for_geometry(geometry)
         effective_symmetry_mode = str(
             symmetry_preflight_report.get("effective_mode_for_tenax", effective_symmetry_mode)
@@ -3690,16 +7230,25 @@ def main() -> None:
             "model_construction_annotations": {
                 "phase_scan": {
                     "phase_diagram_enabled": bool(args.phase_diagram),
+                    "channels": str(args.phase_scan_channels),
                     "mode": str(args.phase_scan_mode),
                     "quantum_methods": list(args.phase_scan_quantum_methods),
                     "selected_outputs": list(args.phase_scan_methods),
                     "alpha_points": int(args.phase_scan_alpha_points),
                     "beta_points": int(args.phase_scan_beta_points),
+                    "external_scan_mode": str(args.external_scan_mode),
+                    "external_scan_field_min": float(args.external_scan_field_min),
+                    "external_scan_field_max": float(args.external_scan_field_max),
+                    "external_scan_field_points": int(args.external_scan_field_points),
+                    "external_scan_ed_bands": int(args.external_scan_ed_bands),
                     "quantum_ed_max_sites": int(args.phase_scan_ed_max_sites),
                     "quantum_ed_max_hilbert_dimension": int(args.phase_scan_ed_max_hilbert_dim),
                     "quantum_ed_solver": str(args.ed_solver),
                     "quantum_ed_use_sz_block": bool(args.use_sz_block),
                     "dmrg_backend": str(args.backend),
+                    "dmrg_svd_min": float(args.dmrg_svd_min),
+                    "idmrg_svd_min": float(args.idmrg_svd_min),
+                    "truncation_cutoff": float(args.truncation_cutoff),
                     "dmrg_effective_symmetry_mode": str(effective_symmetry_mode),
                     "symmetry_reductions": symmetry_reduction_settings,
                     "quantum_ed_sparse_tol": float(args.ed_sparse_tol),
@@ -3719,8 +7268,8 @@ def main() -> None:
                         "plaquette_flux_tolerance": float(args.phase_scan_plaquette_flux_tolerance),
                     },
                     "note": (
-                        "Phase-scan mode chooses quantum, classical, or both. Quantum methods choose ED, "
-                        "finite-DMRG, iDMRG, or all quantum outputs."
+                        "Phase-scan mode chooses quantum, classical, or both. Quantum methods are explicit: "
+                        "ed, dmrg, idmrg, peps, ipeps, or all. PEPS/iPEPS are requested directly."
                     ),
                 },
                 "symmetry": {
@@ -3770,30 +7319,32 @@ def main() -> None:
         )
         _save_summary_checkpoint(args.output_folder, scan_summary)
         try:
-            phase_scan_data = run_requested_phase_scan_for_geometry(geometry)
+            phase_scan_data = run_requested_phase_scan_for_geometry(
+                geometry,
+                incremental_summary_obj=scan_summary,
+            )
             scan_summary["phase_scan"] = phase_scan_data
             scan_summary["stages"]["phase_scan"] = "completed"
             save_phase_scan_outputs(scan_summary, phase_scan_data, geometry)
+            if _attach_plot_output_warnings(scan_summary, "phase_scan"):
+                scan_summary["stages"]["phase_scan"] = "completed_with_warnings"
         except Exception as exc:
             scan_summary["phase_scan"] = {"status": "failed", "error": str(exc)}
             scan_summary["stages"]["phase_scan"] = "failed"
             _save_summary_checkpoint(args.output_folder, scan_summary)
             if not continue_on_plot_error:
                 raise
-        failed_outputs = [
-            key
-            for key, item in scan_summary.get("output_status", {}).items()
-            if isinstance(item, dict) and item.get("status") == "failed"
-        ]
+        output_warning_keys = _attach_plot_output_warnings(scan_summary, "phase_scan")
         scan_summary["run_status"] = (
             "completed_with_warnings"
-            if failed_outputs
+            if output_warning_keys
             or (
                 isinstance(scan_summary.get("phase_scan"), dict)
                 and scan_summary["phase_scan"].get("status") in ("failed", "completed_with_warnings")
             )
             else "completed"
         )
+        finalize_summary_with_profiling(scan_summary)
         _save_summary_checkpoint(args.output_folder, scan_summary)
         print(
             "[run] phase-scan finished: "
@@ -3801,9 +7352,18 @@ def main() -> None:
         )
         return
 
-    # Try Tenax first unless user forces tenpy.
-    if args.backend in ("auto", "tenax"):
-        try:
+    def run_tenax_dmrg_path() -> None:
+        nonlocal geometry, tenax_mpo, dmrg_info, dmrg_energy, dmrg_state_obj
+        nonlocal dmrg_scalar_correlations, dmrg_bond_rows, dmrg_structure_factor_rows
+        nonlocal dmrg_uniform_observables, dmrg_real_space_patterns
+        nonlocal backend_used, symmetry_preflight_report, effective_symmetry_mode
+
+        dmrg_scalar_correlations = {}
+        dmrg_bond_rows = []
+        dmrg_structure_factor_rows = []
+        dmrg_uniform_observables = {}
+        dmrg_real_space_patterns = {}
+        with profile_stage("geometry construction"):
             geometry = build_lattice_geometry(
                 lattice=lattice_name,
                 length_x=args.length_x,
@@ -3811,43 +7371,46 @@ def main() -> None:
                 circumference_x=circumference_x,
                 circumference_y=circumference_y,
             )
-            if geometry.number_of_sites > args.max_dmrg_sites:
-                raise ValueError(
-                    f"Finite DMRG safety cap for profile '{ACTIVE_RESOURCE_PROFILE}' is N <= {args.max_dmrg_sites}, "
-                    f"but requested N={geometry.number_of_sites}. Increase --max-dmrg-sites "
-                    "only for aragorn/beehive or a dedicated run."
-                )
-            symmetry_preflight_report = run_symmetry_preflight_for_geometry(geometry)
-            effective_symmetry_mode = str(
-                symmetry_preflight_report.get("effective_mode_for_tenax", effective_symmetry_mode)
+        if geometry.number_of_sites > args.max_dmrg_sites:
+            raise ValueError(
+                f"Finite DMRG safety cap for profile '{ACTIVE_RESOURCE_PROFILE}' is N <= {args.max_dmrg_sites}, "
+                f"but requested N={geometry.number_of_sites}. Increase --max-dmrg-sites "
+                "only for aragorn/beehive or a dedicated run."
             )
-            if geometry_plot_status == "not_attempted":
-                save_geometry_before_sweep(geometry)
-            tenax_mps, tenax_mpo, dmrg_info = run_tenax_cylindrical_dmrg(
-                geometry=geometry,
-                model_spec=model_spec,
-                alpha=args.alpha,
-                beta=args.beta,
-                coupling_j=args.coupling_j,
-                external_field_terms=hamiltonian_external_field_terms,
-                max_bond_dimension=args.max_bond_dimension,
-                max_sweeps=args.max_sweeps,
-                random_seed=args.seed,
-                jx=args.jx,
-                jy=args.jy,
-                jz=args.jz,
-                symmetry_mode=effective_symmetry_mode,
-                u1_target_total_sz2=args.u1_target_sz2,
-                u1_target_total_tz2=args.u1_target_tz2,
-                z2_target_parity=args.z2_target_parity,
-                strict_symmetry_selection_rules=args.strict_symmetry_selection_rules,
-                allow_symmetry_fallback_to_dense=args.symmetry_allow_dense_fallback,
-                initial_state_style=args.initial_state,
-                show_progress=show_progress,
-            )
-            dmrg_energy = float(dmrg_info["E"])
-            dmrg_state_obj = tenax_mps
-            dmrg_correlations: Dict[str, np.ndarray] = {}
+        symmetry_preflight_report = run_symmetry_preflight_for_geometry(geometry)
+        effective_symmetry_mode = str(
+            symmetry_preflight_report.get("effective_mode_for_tenax", effective_symmetry_mode)
+        )
+        if geometry_plot_status == "not_attempted":
+            save_geometry_before_sweep(geometry)
+        tenax_mps, tenax_mpo, dmrg_info = run_tenax_cylindrical_dmrg(
+            geometry=geometry,
+            model_spec=model_spec,
+            alpha=args.alpha,
+            beta=args.beta,
+            coupling_j=args.coupling_j,
+            external_field_terms=hamiltonian_external_field_terms,
+            max_bond_dimension=args.max_bond_dimension,
+            max_sweeps=args.max_sweeps,
+            truncation_cutoff=args.truncation_cutoff,
+            svd_min=args.dmrg_svd_min,
+            random_seed=args.seed,
+            jx=args.jx,
+            jy=args.jy,
+            jz=args.jz,
+            symmetry_mode=effective_symmetry_mode,
+            u1_target_total_sz2=args.u1_target_sz2,
+            u1_target_total_tz2=args.u1_target_tz2,
+            z2_target_parity=args.z2_target_parity,
+            strict_symmetry_selection_rules=args.strict_symmetry_selection_rules,
+            allow_symmetry_fallback_to_dense=args.symmetry_allow_dense_fallback,
+            initial_state_style=args.initial_state,
+            show_progress=show_progress,
+        )
+        dmrg_energy = float(dmrg_info["E"])
+        dmrg_state_obj = tenax_mps
+        dmrg_correlations: Dict[str, np.ndarray] = {}
+        with profile_stage("observables"):
             if calculate_correlations:
                 dmrg_correlations = collect_correlation_matrices_from_tenax(
                     tenax_mps,
@@ -3889,150 +7452,346 @@ def main() -> None:
                     dmrg_uniform_observables = {
                         "warning": f"Failed to compute DMRG uniform z observables: {exc}"
                     }
-            backend_used = "tenax"
-        except Exception as tenax_exc:
-            if args.backend == "tenax":
-                raise
-            if effective_symmetry_mode != "none" and not bool(args.symmetry_allow_dense_fallback):
-                raise RuntimeError(
-                    f"Tenax failed while using symmetry_mode={effective_symmetry_mode}, and dense fallback is disabled. "
-                    f"Original Tenax error: {tenax_exc}"
-                ) from tenax_exc
-            if effective_symmetry_mode != "none":
-                backend_warning = (
-                    f"Tenax failed after using symmetry_mode={effective_symmetry_mode}; "
-                    "continuing to dense TeNPy fallback if compatible. "
-                    f"Original Tenax error: {tenax_exc}"
-                )
-                if show_progress:
-                    print(f"[symmetry] {backend_warning}")
-            if lattice_name != "honeycomb":
-                raise RuntimeError(
-                    f"Tenax backend failed on lattice='{lattice_name}', and TeNPy fallback only supports honeycomb. "
-                    f"Original Tenax error: {tenax_exc}"
-                ) from tenax_exc
-            if show_progress:
-                print(f"[backend] Tenax failed; switching to TeNPy fallback. Reason: {tenax_exc}")
-            if backend_warning is None:
-                backend_warning = f"Tenax backend failed, fallback to TeNPy: {tenax_exc}"
+        backend_used = "tenax"
 
-    # TeNPy path via the local U(1)-symmetric Yao-Lee template.
-    if backend_used is None:
-        tenpy_path_label = "TeNPy backend" if args.backend == "tenpy" else "TeNPy fallback"
-        if lattice_name != "honeycomb":
-            raise RuntimeError(
-                f"{tenpy_path_label} does not support lattice='{lattice_name}'. "
-                "Only honeycomb is supported in tenpy_backend.py."
-            )
-        if not (
-            model_spec.spin_rep == "1/2"
-            and model_spec.orbital_rep == "1/2"
-            and model_spec.model_family == "yao_lee"
-            and model_spec.ising_axis == "z"
-        ):
-            raise RuntimeError(
-                f"{tenpy_path_label} only supports the legacy default model "
-                "(spin_rep=1/2, orbital_rep=1/2, model_family=yao_lee, ising_axis=z)."
-            )
+    def run_tenpy_dmrg_path(tenpy_path_label: str, backend_label: str) -> None:
+        nonlocal geometry, dmrg_info, dmrg_energy, dmrg_state_obj
+        nonlocal dmrg_scalar_correlations, dmrg_bond_rows, dmrg_structure_factor_rows
+        nonlocal dmrg_uniform_observables, dmrg_real_space_patterns
+        nonlocal backend_used, symmetry_preflight_report, effective_symmetry_mode
+
+        compatibility_issue = tenpy_backend_compatibility_issue()
+        if compatibility_issue is not None:
+            raise RuntimeError(f"{tenpy_path_label} is not compatible: {compatibility_issue}")
+        dmrg_scalar_correlations = {}
+        dmrg_bond_rows = []
+        dmrg_structure_factor_rows = []
+        dmrg_uniform_observables = {}
+        dmrg_real_space_patterns = {}
         yl = _load_tenpy_backend_module()
         stage_start = _start_stage(f"{tenpy_path_label} DMRG", show_progress)
-        geometry = yl.build_honeycomb_cylinder_geometry(
-            length_x=args.length_x,
-            length_y=args.length_y,
-            circumference_x=circumference_x,
-            circumference_y=circumference_y,
+        try:
+            with profile_stage("geometry construction"):
+                geometry = yl.build_honeycomb_cylinder_geometry(
+                    length_x=args.length_x,
+                    length_y=args.length_y,
+                    circumference_x=circumference_x,
+                    circumference_y=circumference_y,
+                )
+            if geometry.number_of_sites > args.max_dmrg_sites:
+                raise ValueError(
+                    f"Finite DMRG safety cap for profile '{ACTIVE_RESOURCE_PROFILE}' is N <= {args.max_dmrg_sites}, "
+                    f"but requested N={geometry.number_of_sites}. Increase --max-dmrg-sites "
+                    "only for aragorn/beehive or a dedicated run."
+                )
+            if symmetry_preflight_report is None:
+                symmetry_preflight_report = run_symmetry_preflight_for_geometry(geometry)
+                effective_symmetry_mode = str(
+                    symmetry_preflight_report.get("effective_mode_for_tenax", effective_symmetry_mode)
+                )
+            if geometry_plot_status == "not_attempted":
+                save_geometry_before_sweep(geometry)
+            psi, _, dmrg_info = yl.run_cylindrical_dmrg(
+                geometry=geometry,
+                alpha=args.alpha,
+                beta=args.beta,
+                coupling_j=args.coupling_j,
+                max_bond_dimension=args.max_bond_dimension,
+                max_sweeps=args.max_sweeps,
+                truncation_cutoff=args.truncation_cutoff,
+                svd_min=args.dmrg_svd_min,
+                random_seed=args.seed,
+                product_state_style=args.initial_state,
+                external_field_terms=hamiltonian_external_field_terms,
+                symmetry_reductions=symmetry_reduction_settings,
+                show_progress=show_progress,
+            )
+            dmrg_energy = float(dmrg_info["E"])
+            dmrg_state_obj = psi
+            with profile_stage("observables"):
+                if calculate_correlations:
+                    dmrg_correlations = yl.collect_correlation_matrices_from_dmrg(psi, show_progress=show_progress)
+                    scalar_native = yl.build_spin_orbital_scalar_correlations(dmrg_correlations)
+                    dmrg_scalar_correlations = {
+                        "S": scalar_native["spin_scalar"],
+                        "T": scalar_native["orbital_scalar"],
+                        "ST": scalar_native["mixed_scalar"],
+                    }
+                    if calculate_bond_energies:
+                        dmrg_bond_rows = yl.all_bond_energies(
+                            geometry,
+                            dmrg_correlations,
+                            args.alpha,
+                            args.beta,
+                            args.coupling_j,
+                            show_progress=show_progress,
+                        )
+                    if calculate_structure_factors:
+                        dmrg_structure_factor_rows = yl.all_high_symmetry_structure_factors(
+                            scalar_native,
+                            geometry,
+                            show_progress=show_progress,
+                        )
+            backend_used = backend_label
+        finally:
+            _end_stage(f"{tenpy_path_label} DMRG", stage_start, show_progress)
+
+    def run_quimb_peps_path() -> None:
+        nonlocal geometry, dmrg_info, dmrg_energy, dmrg_state_obj, tenax_mpo
+        nonlocal dmrg_scalar_correlations, dmrg_bond_rows, dmrg_structure_factor_rows
+        nonlocal dmrg_uniform_observables, dmrg_real_space_patterns
+        nonlocal backend_used, symmetry_preflight_report, effective_symmetry_mode
+        nonlocal entanglement_warning
+
+        dmrg_scalar_correlations = {}
+        dmrg_bond_rows = []
+        dmrg_structure_factor_rows = []
+        dmrg_uniform_observables = {}
+        dmrg_real_space_patterns = {}
+        tenax_mpo = None
+        with profile_stage("geometry construction"):
+            geometry = build_lattice_geometry(
+                lattice=lattice_name,
+                length_x=args.length_x,
+                length_y=args.length_y,
+                circumference_x=circumference_x,
+                circumference_y=circumference_y,
+            )
+        symmetry_preflight_report = run_symmetry_preflight_for_geometry(geometry)
+        effective_symmetry_mode = str(
+            symmetry_preflight_report.get("effective_mode_for_tenax", effective_symmetry_mode)
         )
-        if geometry.number_of_sites > args.max_dmrg_sites:
-            raise ValueError(
-                f"Finite DMRG safety cap for profile '{ACTIVE_RESOURCE_PROFILE}' is N <= {args.max_dmrg_sites}, "
-                f"but requested N={geometry.number_of_sites}. Increase --max-dmrg-sites "
-                "only for aragorn/beehive or a dedicated run."
-            )
-        if symmetry_preflight_report is None:
-            symmetry_preflight_report = run_symmetry_preflight_for_geometry(geometry)
-            effective_symmetry_mode = str(
-                symmetry_preflight_report.get("effective_mode_for_tenax", effective_symmetry_mode)
-            )
         if geometry_plot_status == "not_attempted":
             save_geometry_before_sweep(geometry)
-        psi, _, dmrg_info = yl.run_cylindrical_dmrg(
+        import peps_backend as quimb_peps_backend
+
+        peps_result = quimb_peps_backend.run_quimb_peps_calculation(
             geometry=geometry,
-            alpha=args.alpha,
-            beta=args.beta,
-            coupling_j=args.coupling_j,
-            max_bond_dimension=args.max_bond_dimension,
-            max_sweeps=args.max_sweeps,
-            truncation_cutoff=args.truncation_cutoff,
-            random_seed=args.seed,
-            product_state_style=args.initial_state,
+            model_spec=model_spec,
+            lattice_name=lattice_name,
+            alpha=float(args.alpha),
+            beta=float(args.beta),
+            coupling_j=float(args.coupling_j),
+            jx=float(args.jx),
+            jy=float(args.jy),
+            jz=float(args.jz),
             external_field_terms=hamiltonian_external_field_terms,
+            max_sites=int(args.max_peps_sites),
+            max_bond_dimension=int(args.peps_max_bond_dimension),
+            max_sweeps=int(args.peps_max_sweeps),
+            truncation_cutoff=float(args.truncation_cutoff),
+            tau=float(args.peps_tau),
+            random_seed=int(args.seed),
+            initial_state_style=str(args.initial_state),
+            ctm_chi=int(args.peps_ctm_chi),
+            entanglement_max_dense_dim=int(args.peps_entanglement_max_dense_dim),
+            classifier_thresholds=phase_classifier_thresholds_from_args(args),
+            compute_correlations=bool(calculate_correlations),
+            compute_bond_energies=bool(calculate_bond_energies),
+            compute_structure_factors=bool(calculate_structure_factors),
+            compute_uniform_observables=bool(calculate_uniform_observables),
+            compute_entanglement=bool(calculate_entanglement),
+            entropy_orders=ENTROPY_ORDERS,
+            show_progress=show_progress,
+            args=args,
+            symmetry_reductions=symmetry_reduction_settings,
+            use_sz_conserved=bool(args.use_sz_conserved),
+            symmetric=False,
+            peps_symmetry_mode=args.peps_symmetry_mode,
+            peps_strict_symmetry=bool(args.peps_strict_symmetry),
+            peps_allow_dense_fallback=bool(args.peps_allow_dense_fallback),
+        )
+        dmrg_info = dict(peps_result["info"])
+        dmrg_info["finite_reference_key"] = "peps"
+        dmrg_energy = float(dmrg_info.get("ground_state_energy", dmrg_info.get("E")))
+        dmrg_state_obj = None
+        dmrg_scalar_correlations = dict(peps_result.get("scalar_correlations", {}))
+        dmrg_bond_rows = list(peps_result.get("bond_rows", []))
+        dmrg_structure_factor_rows = list(peps_result.get("structure_factor_rows", []))
+        dmrg_uniform_observables = dict(peps_result.get("uniform_observables", {}))
+        peps_entropy = peps_result.get("entanglement")
+        if isinstance(peps_entropy, dict):
+            if peps_entropy.get("status") == "completed":
+                entropy_profiles["PEPS"] = peps_entropy
+            elif calculate_entanglement:
+                entanglement_warning = str(
+                    peps_entropy.get("warning")
+                    or peps_entropy.get("reason")
+                    or "PEPS entanglement profile was not produced."
+                )
+        backend_used = "quimb_peps"
+
+    def run_quimb_ipeps_primary_path() -> None:
+        nonlocal geometry, dmrg_info, dmrg_energy, dmrg_state_obj, tenax_mpo
+        nonlocal dmrg_scalar_correlations, dmrg_bond_rows, dmrg_structure_factor_rows
+        nonlocal dmrg_uniform_observables, dmrg_real_space_patterns
+        nonlocal backend_used, symmetry_preflight_report, effective_symmetry_mode
+
+        dmrg_scalar_correlations = {}
+        dmrg_bond_rows = []
+        dmrg_structure_factor_rows = []
+        dmrg_uniform_observables = {}
+        dmrg_real_space_patterns = {}
+        tenax_mpo = None
+        with profile_stage("geometry construction"):
+            geometry = build_lattice_geometry(
+                lattice=lattice_name,
+                length_x=args.length_x,
+                length_y=args.length_y,
+                circumference_x=circumference_x,
+                circumference_y=circumference_y,
+            )
+        symmetry_preflight_report = run_symmetry_preflight_for_geometry(geometry)
+        effective_symmetry_mode = str(
+            symmetry_preflight_report.get("effective_mode_for_tenax", effective_symmetry_mode)
+        )
+        if geometry_plot_status == "not_attempted":
+            save_geometry_before_sweep(geometry)
+        import peps_backend as quimb_ipeps_backend
+
+        ipeps_info = quimb_ipeps_backend.run_quimb_ipeps_scan(
+            geometry=geometry,
+            model_spec=model_spec,
+            lattice_name=lattice_name,
+            alpha=float(args.alpha),
+            beta=float(args.beta),
+            alpha_values=[float(args.alpha)],
+            beta_values=[float(args.beta)],
+            coupling_j=float(args.coupling_j),
+            jx=float(args.jx),
+            jy=float(args.jy),
+            jz=float(args.jz),
+            external_field_terms=hamiltonian_external_field_terms,
+            max_unit_cell_sites=int(args.max_ipeps_unit_cell_sites),
+            max_bond_dimension=int(args.ipeps_max_bond_dimension),
+            max_iterations=int(args.ipeps_max_iterations),
+            truncation_cutoff=float(args.truncation_cutoff),
+            random_seed=int(args.seed),
+            initial_state_style=str(args.initial_state),
+            tau=float(args.ipeps_tau),
+            ctm_chi=int(args.ipeps_ctm_chi),
+            symmetry_reductions=symmetry_reduction_settings,
+            args=args,
+            use_sz_conserved=bool(args.use_sz_conserved),
+            symmetric=False,
+            ipeps_symmetry_mode=args.ipeps_symmetry_mode,
+            ipeps_strict_symmetry=bool(args.ipeps_strict_symmetry),
+            ipeps_allow_dense_fallback=bool(args.ipeps_allow_dense_fallback),
+            unit_cell_kind=args.ipeps_unit_cell_kind,
+            use_translation_symmetry=bool(args.ipeps_use_translation_symmetry),
+            contraction_method=args.ipeps_contraction_method,
+            classifier_thresholds=phase_classifier_thresholds_from_args(args),
             show_progress=show_progress,
         )
-        dmrg_energy = float(dmrg_info["E"])
-        dmrg_state_obj = psi
-        if calculate_correlations:
-            dmrg_correlations = yl.collect_correlation_matrices_from_dmrg(psi, show_progress=show_progress)
-            scalar_native = yl.build_spin_orbital_scalar_correlations(dmrg_correlations)
-            dmrg_scalar_correlations = {
-                "S": scalar_native["spin_scalar"],
-                "T": scalar_native["orbital_scalar"],
-                "ST": scalar_native["mixed_scalar"],
-            }
-            if calculate_bond_energies:
-                dmrg_bond_rows = yl.all_bond_energies(
-                    geometry,
-                    dmrg_correlations,
-                    args.alpha,
-                    args.beta,
-                    args.coupling_j,
-                    show_progress=show_progress,
-                )
-            if calculate_structure_factors:
-                dmrg_structure_factor_rows = yl.all_high_symmetry_structure_factors(
-                    scalar_native,
-                    geometry,
-                    show_progress=show_progress,
-                )
-        backend_used = "tenpy" if args.backend == "tenpy" else "tenpy_fallback"
-        _end_stage(f"{tenpy_path_label} DMRG", stage_start, show_progress)
+        ipeps_info = _normalize_ipeps_result_schema(ipeps_info)
+        ipeps_info["requested_backend"] = "quimb"
+        ipeps_info["finite_reference_key"] = "ipeps"
+        energy_per_site = _finite_float_from_mapping(ipeps_info, "ground_state_energy_per_site", "energy_per_site")
+        if energy_per_site is None:
+            raise RuntimeError(f"quimb iPEPS did not produce a finite energy_per_site: {ipeps_info}")
+        dmrg_energy = float(energy_per_site) * float(max(1, geometry.number_of_sites))
+        ipeps_info["E"] = dmrg_energy
+        ipeps_info["ground_state_energy"] = dmrg_energy
+        dmrg_info = ipeps_info
+        dmrg_state_obj = None
+        dmrg_bond_rows = list(ipeps_info.get("bond_energies", []))
+        dmrg_uniform_observables = dict(ipeps_info.get("local_observables", {}))
+        backend_used = "quimb_ipeps"
 
-    try:
-        if calculate_entanglement and dmrg_state_obj is not None:
-            if backend_used == "tenax":
-                dmrg_entropy_profile = compute_tenax_finite_mps_entropy_profile(
-                    dmrg_state_obj,
-                    orders=ENTROPY_ORDERS,
-                    show_progress=show_progress,
-                )
-            else:
-                dmrg_entropy_profile = compute_tenpy_finite_mps_entropy_profile(
-                    dmrg_state_obj,
-                    orders=ENTROPY_ORDERS,
-                    show_progress=show_progress,
-                )
-            entropy_profiles["DMRG"] = dmrg_entropy_profile
-        elif not calculate_entanglement:
-            entanglement_warning = "DMRG entanglement entropy calculation skipped by calculate_entanglement=false."
-    except Exception as exc:
-        entanglement_warning = f"Failed to compute DMRG entanglement profile: {exc}"
+    backend_request = str(args.backend).strip().lower()
+    if backend_request == "tenax":
+        run_tenax_dmrg_path()
+    elif backend_request == "tenpy":
+        run_tenpy_dmrg_path("TeNPy backend", "tenpy")
+    elif backend_request == "quimb":
+        if str(args.method) == "ipeps":
+            run_quimb_ipeps_primary_path()
+        else:
+            try:
+                run_quimb_peps_path()
+            except Exception as peps_exc:
+                backend_warning = f"quimb PEPS backend skipped; fallback to DMRG: {peps_exc}"
+                if show_progress:
+                    print(f"[backend] {backend_warning}")
+                if tenpy_backend_issue is None:
+                    run_tenpy_dmrg_path("TeNPy fallback after quimb PEPS skip", "tenpy_fallback_after_quimb_peps")
+                    dmrg_info["requested_backend"] = "quimb"
+                    dmrg_info["fallback_from"] = "quimb_peps"
+                    dmrg_info["fallback_reason"] = str(peps_exc)
+                else:
+                    if show_progress:
+                        print(f"[backend] TeNPy fallback is not compatible: {tenpy_backend_issue}; trying Tenax.")
+                    run_tenax_dmrg_path()
+                    backend_used = "tenax_fallback_after_quimb_peps"
+                    dmrg_info["requested_backend"] = "quimb"
+                    dmrg_info["fallback_from"] = "quimb_peps"
+                    dmrg_info["fallback_reason"] = str(peps_exc)
+                    dmrg_info["tenpy_fallback_skip_reason"] = str(tenpy_backend_issue)
+    elif backend_request == "auto":
+        if tenpy_backend_issue is None:
+            try:
+                run_tenpy_dmrg_path("TeNPy auto-primary backend", "tenpy")
+            except Exception as tenpy_exc:
+                backend_warning = f"TeNPy primary backend failed; fallback to Tenax: {tenpy_exc}"
+                if show_progress:
+                    print(f"[backend] {backend_warning}")
+                try:
+                    run_tenax_dmrg_path()
+                    backend_used = "tenax_fallback_after_tenpy"
+                    dmrg_info["requested_backend"] = "auto"
+                    dmrg_info["fallback_from"] = "tenpy"
+                    dmrg_info["fallback_reason"] = str(tenpy_exc)
+                except Exception as tenax_exc:
+                    raise RuntimeError(
+                        "Auto backend failed: TeNPy primary path failed, and Tenax fallback "
+                        f"also failed. TeNPy error: {tenpy_exc}; Tenax error: {tenax_exc}"
+                    ) from tenax_exc
+        else:
+            if show_progress:
+                print(f"[backend] auto selects Tenax because TeNPy is not compatible: {tenpy_backend_issue}")
+            run_tenax_dmrg_path()
+            backend_used = "tenax_auto"
+            dmrg_info["requested_backend"] = "auto"
+            dmrg_info["tenpy_primary_skip_reason"] = str(tenpy_backend_issue)
 
-    if calculate_real_space_patterns and len(dmrg_scalar_correlations) > 0:
+    with profile_stage("observables"):
         try:
-            dmrg_real_space_patterns = build_reference_site_correlation_patterns(
-                geometry,
-                dmrg_scalar_correlations,
-                reference_site_idx=args.reference_site_idx,
-            )
+            if calculate_entanglement and dmrg_state_obj is not None:
+                if str(backend_used).startswith("tenax"):
+                    dmrg_entropy_profile = compute_tenax_finite_mps_entropy_profile(
+                        dmrg_state_obj,
+                        orders=ENTROPY_ORDERS,
+                        show_progress=show_progress,
+                    )
+                else:
+                    dmrg_entropy_profile = compute_tenpy_finite_mps_entropy_profile(
+                        dmrg_state_obj,
+                        orders=ENTROPY_ORDERS,
+                        show_progress=show_progress,
+                    )
+                entropy_profiles["DMRG"] = dmrg_entropy_profile
+            elif not calculate_entanglement:
+                entanglement_warning = "DMRG entanglement entropy calculation skipped by calculate_entanglement=false."
         except Exception as exc:
+            entanglement_warning = f"Failed to compute DMRG entanglement profile: {exc}"
+
+        if calculate_real_space_patterns and len(dmrg_scalar_correlations) > 0:
+            try:
+                dmrg_real_space_patterns = build_reference_site_correlation_patterns(
+                    geometry,
+                    dmrg_scalar_correlations,
+                    reference_site_idx=args.reference_site_idx,
+                )
+            except Exception as exc:
+                dmrg_real_space_patterns = {
+                    "status": "failed",
+                    "warning": f"Failed to extract DMRG reference-site patterns: {exc}",
+                }
+        elif calculate_real_space_patterns:
             dmrg_real_space_patterns = {
-                "status": "failed",
-                "warning": f"Failed to extract DMRG reference-site patterns: {exc}",
+                "status": "skipped",
+                "reason": "No DMRG scalar correlations were computed.",
             }
-    elif calculate_real_space_patterns:
-        dmrg_real_space_patterns = {
-            "status": "skipped",
-            "reason": "No DMRG scalar correlations were computed.",
-        }
 
     configure_run_output_names(geometry)
     lattice_label = lattice_display_name(lattice_name)
@@ -4065,9 +7824,17 @@ def main() -> None:
         sigma_factor=args.field_sigma_factor,
         field_terms=hamiltonian_external_field_terms,
     )
+    finite_is_peps = str(backend_used).startswith("quimb_peps")
+    primary_is_ipeps = str(backend_used).startswith("quimb_ipeps")
+    finite_method_label = "iPEPS" if primary_is_ipeps else ("PEPS" if finite_is_peps else "DMRG")
+    finite_method_long_label = (
+        "quimb infinite iPEPS"
+        if primary_is_ipeps
+        else ("quimb finite PEPS" if finite_is_peps else "finite DMRG")
+    )
 
     summary: Dict[str, Any] = {
-        "model_name": f"{lattice_label} spin-orbital model ({model_label})",
+        "model_name": f"{lattice_label} spin-orbital model ({model_label}, {finite_method_long_label})",
         "model_simplified_name": model_short_label,
         "model_size_name": size_short_label,
         "run_output_prefix": run_file_prefix,
@@ -4086,6 +7853,8 @@ def main() -> None:
                     "max_sites": int(args.max_dmrg_sites),
                     "max_bond_dimension": int(args.max_bond_dimension),
                     "max_sweeps": int(args.max_sweeps),
+                    "svd_min": float(args.dmrg_svd_min),
+                    "truncation_cutoff": float(args.truncation_cutoff),
                     "excited_state_search": {
                         "method": "finite_dmrg_penalty_excited_state",
                         "overlap_tol": float(args.dmrg_excited_overlap_tol),
@@ -4096,6 +7865,24 @@ def main() -> None:
                     },
                     "note": "Default geometry N=8 is chosen so DMRG, ED, and iDMRG can all be compared.",
                 },
+                "finite_peps": {
+                    "max_sites": int(args.max_peps_sites),
+                    "max_bond_dimension": int(args.peps_max_bond_dimension),
+                    "bond_dimension_cap": int(args.peps_bond_dimension_cap),
+                    "max_sweeps": int(args.peps_max_sweeps),
+                    "sweep_cap": int(args.peps_sweep_cap),
+                    "ctm_chi": int(args.peps_ctm_chi),
+                    "ctm_chi_cap": int(args.peps_ctm_chi_cap),
+                    "tau": float(args.peps_tau),
+                    "entanglement_max_dense_dim": int(args.peps_entanglement_max_dense_dim),
+                    "symmetry_mode": str(args.peps_symmetry_mode),
+                    "strict_symmetry": bool(args.peps_strict_symmetry),
+                    "allow_dense_fallback": bool(args.peps_allow_dense_fallback),
+                    "note": (
+                        "Finite PEPS controls are independent of finite-DMRG chi/sweeps. "
+                        "The current quimb implementation records U(1)_Tz requests but uses dense tensors unless symmetric tensor support is enabled later."
+                    ),
+                },
                 "ed": {
                     "backend": str(args.ed_backend),
                     "max_sites": int(args.max_ed_sites),
@@ -4104,6 +7891,14 @@ def main() -> None:
                     "solver": str(args.ed_solver),
                     "use_sz_conserved": bool(args.use_sz_conserved),
                     "symmetry_reductions": symmetry_reduction_settings,
+                    "ed_symmetry_plan": getattr(args, "ed_symmetry_plan", {"status": "pending"}),
+                    "ed_symmetry_controls": {
+                        "engine": str(args.ed_symmetry_engine),
+                        "c3_mode": str(args.ed_c3_mode),
+                        "c3_q_blocks": str(args.ed_c3_q_blocks),
+                        "z2_mode": str(args.ed_z2_mode),
+                        "z2_kind": str(args.ed_z2_kind),
+                    },
                     "sz_conserved_eigenstates": int(SZ_CONSERVED_ED_EIGENSTATES),
                     "sparse_tol": float(args.ed_sparse_tol),
                     "sparse_maxiter": (
@@ -4126,8 +7921,8 @@ def main() -> None:
                         else "available_for_ed_backend_selection"
                     ),
                     "note": (
-                        "QuSpin uses the shared SYMMETRY_REDUCTIONS and U1/Z2 target-sector controls; "
-                        "backend-specific flags here are construction checks only."
+                        "QuSpin receives the ED-specific symmetry plan. Existing basis builders apply the "
+                        "supported subset and record any projector-only symmetries as planned."
                     ),
                 },
                 "finite_temperature_ed": {
@@ -4158,6 +7953,11 @@ def main() -> None:
                     "beta_min": float(args.phase_scan_beta_min),
                     "beta_max": float(args.phase_scan_beta_max),
                     "beta_points": int(args.phase_scan_beta_points),
+                    "external_scan_mode": str(args.external_scan_mode),
+                    "external_scan_field_min": float(args.external_scan_field_min),
+                    "external_scan_field_max": float(args.external_scan_field_max),
+                    "external_scan_field_points": int(args.external_scan_field_points),
+                    "external_scan_ed_bands": int(args.external_scan_ed_bands),
                     "quantum_ed_max_sites": int(args.phase_scan_ed_max_sites),
                     "quantum_ed_max_hilbert_dimension": int(args.phase_scan_ed_max_hilbert_dim),
                     "quantum_ed_solver": str(args.ed_solver),
@@ -4189,24 +7989,55 @@ def main() -> None:
                 "idmrg": {
                     "max_bond_dimension": int(args.idmrg_max_bond_dimension),
                     "max_iterations": int(args.idmrg_max_iterations),
+                    "svd_min": float(args.idmrg_svd_min),
+                    "truncation_cutoff": float(args.truncation_cutoff),
                     "bulk_kind": str(args.idmrg_bulk_kind),
                     "max_local_dim": int(args.idmrg_max_local_dim),
+                    "use_translation_symmetry": bool(args.idmrg_use_translation_symmetry),
+                    "translation_symmetry": {
+                        "enabled": bool(args.idmrg_use_translation_symmetry),
+                        "implemented_as": "infinite repeated MPS unit cell along x",
+                    },
                     "note": "iDMRG chi is intentionally independent of finite-DMRG chi to avoid workstation OOM.",
+                },
+                "ipeps": {
+                    "max_unit_cell_sites": int(args.max_ipeps_unit_cell_sites),
+                    "max_bond_dimension": int(args.ipeps_max_bond_dimension),
+                    "bond_dimension_cap": int(args.ipeps_bond_dimension_cap),
+                    "max_iterations": int(args.ipeps_max_iterations),
+                    "iteration_cap": int(args.ipeps_iteration_cap),
+                    "ctm_chi": int(args.ipeps_ctm_chi),
+                    "ctm_chi_cap": int(args.ipeps_ctm_chi_cap),
+                    "tau": float(args.ipeps_tau),
+                    "symmetry_mode": str(args.ipeps_symmetry_mode),
+                    "strict_symmetry": bool(args.ipeps_strict_symmetry),
+                    "allow_dense_fallback": bool(args.ipeps_allow_dense_fallback),
+                    "unit_cell_kind": str(args.ipeps_unit_cell_kind),
+                    "use_translation_symmetry": bool(args.ipeps_use_translation_symmetry),
+                    "translation_symmetry": {
+                        "enabled": bool(args.ipeps_use_translation_symmetry),
+                        "implemented_as": "periodic repeated PEPS unit cell",
+                    },
+                    "contraction_method": str(args.ipeps_contraction_method),
+                    "ctmrg_enabled": str(args.ipeps_contraction_method) == "ctmrg",
+                    "unit_cell_candidates": list(IPEPS_UNIT_CELL_CANDIDATES),
+                    "note": (
+                        "iPEPS controls are independent of iDMRG chi/iterations. "
+                        "Internal tensor symmetry is separate from the variational unit-cell ansatz."
+                    ),
                 },
             },
             "bond_terms": {
                 "yao_lee": (
-                    "For each gamma bond: J[(1+beta) S_i.S_j + "
-                    "(1-beta) T_gamma_i T_gamma_j + alpha (S_i.S_j)(T_gamma_i T_gamma_j)]. "
-                    "The spin part is expanded as Sp/Sm/Sz terms for total-Sz U(1)."
+                    "For each gamma bond: -J[alpha S_i.S_j - 2 S_i_gamma S_j_gamma - beta]"
+                    "[T_i.T_j - beta], with tilde-T currently treated as standard T."
                 ),
                 "ising_like": (
                     "For each bond, the chosen ising_axis replaces gamma in the same "
                     "S/T/ST channels."
                 ),
                 "orbital_rep_0": (
-                    "The orbital Hilbert space is removed; yao_lee falls back to "
-                    "spin-only Ising-like S_axis_i S_axis_j terms."
+                    "The orbital Hilbert space is removed for spin-only benchmark families."
                 ),
             },
             "external_field": external_field_summary,
@@ -4227,7 +8058,7 @@ def main() -> None:
                         "when transverse Sx/Sy couplings are paired equally."
                     ),
                     "invalid_when": (
-                        "Full bond-dependent Yao-Lee x/y channels contain single-axis flip terms "
+                        "The yao_lee Eq. 7 x/y gamma channels contain single-axis flip terms "
                         "and cannot be represented as strict U1 without changing the Hamiltonian."
                     ),
                     "fallback_policy": (
@@ -4242,8 +8073,7 @@ def main() -> None:
                 "quspin": {
                     "settings": quspin_ed_settings,
                     "auto_policy": (
-                        "Use QuSpin basis blocks from the same shared symmetry reductions, "
-                        "only when the precheck verifies the generated Hamiltonian and target sector."
+                        "Use the ED-first symmetry plan, then apply only the currently supported QuSpin subset."
                     ),
                 },
             },
@@ -4262,7 +8092,7 @@ def main() -> None:
             "physical_dim": model_spec.physical_dim,
             "orbital_is_trivial": is_trivial_orbital(model_spec),
             "effective_interaction": (
-                "spin_only_ising_like_fallback"
+                "yao_lee_eq7_trivial_orbital_limit"
                 if (model_spec.model_family == "yao_lee" and is_trivial_orbital(model_spec))
                 else model_spec.model_family
             ),
@@ -4284,15 +8114,26 @@ def main() -> None:
             "energy_per_site": dmrg_energy / geometry.number_of_sites,
             "info": dmrg_info,
             "phase_observables": dmrg_info.get("phase_observables"),
-            "entanglement": entropy_profiles.get("DMRG"),
+            "entanglement": entropy_profiles.get(finite_method_label) or dmrg_info.get("entanglement"),
+            "bond_energies": dmrg_bond_rows,
             "structure_factors": dmrg_structure_factor_rows,
             "real_space_patterns": dmrg_real_space_patterns,
             "uniform_observables": dmrg_uniform_observables,
         },
         "stages": {
-            "dmrg": "completed",
+            "dmrg": "not_requested" if primary_is_ipeps else "completed",
+            "peps": "completed" if finite_is_peps else "not_requested",
             "dmrg_plots": "running",
-            "idmrg": "pending" if args.run_idmrg else "not_requested",
+            "idmrg": (
+                "not_requested"
+                if (finite_is_peps or primary_is_ipeps)
+                else ("pending" if args.run_idmrg else "not_requested")
+            ),
+            "ipeps": (
+                "completed"
+                if primary_is_ipeps
+                else ("pending" if finite_is_peps and args.run_idmrg else "not_requested")
+            ),
             "ed": "pending" if args.run_ed else "not_requested",
             "dmrg_excited_state_search": "pending" if args.run_ed else "not_requested",
             "finite_temperature": "pending" if args.run_finite_temperature else "not_requested",
@@ -4303,6 +8144,36 @@ def main() -> None:
             "monitor_data_json": run_summary_filename,
         },
     }
+    if finite_is_peps:
+        summary["peps"] = dict(summary["dmrg"])
+        summary["peps"]["backend"] = "quimb_peps"
+        summary["peps_symmetry_report"] = dmrg_info.get("peps_symmetry_report") or dmrg_info.get("symmetry")
+        if summary["peps_symmetry_report"] is not None:
+            summary["peps"]["peps_symmetry_report"] = summary["peps_symmetry_report"]
+        summary["outputs"]["peps"] = {
+            "status": str(dmrg_info.get("status", "completed")),
+            "energy_per_site": summary["dmrg"]["energy_per_site"],
+            "ground_state_energy_per_site": summary["dmrg"]["energy_per_site"],
+            "plaquette_flux": dmrg_info.get("plaquette_flux")
+            or (dmrg_info.get("phase_observables") or {}).get("plaquette_flux"),
+            "phase_label": dmrg_info.get("phase_label"),
+            "peps_symmetry_report": summary.get("peps_symmetry_report"),
+        }
+    if primary_is_ipeps:
+        summary["ipeps"] = dict(summary["dmrg"])
+        summary["ipeps"]["backend"] = "quimb_ipeps"
+        summary["ipeps_symmetry_report"] = dmrg_info.get("ipeps_symmetry_report") or dmrg_info.get("symmetry")
+        if summary["ipeps_symmetry_report"] is not None:
+            summary["ipeps"]["ipeps_symmetry_report"] = summary["ipeps_symmetry_report"]
+        summary["outputs"]["ipeps"] = {
+            "status": str(dmrg_info.get("status", "completed")),
+            "energy_per_site": summary["dmrg"]["energy_per_site"],
+            "ground_state_energy_per_site": summary["dmrg"]["energy_per_site"],
+            "plaquette_flux": dmrg_info.get("plaquette_flux")
+            or (dmrg_info.get("observables") or {}).get("plaquette_flux"),
+            "phase_label": dmrg_info.get("phase_label"),
+            "ipeps_symmetry_report": summary.get("ipeps_symmetry_report"),
+        }
     if backend_warning:
         summary["backend_warning"] = backend_warning
     if entanglement_warning:
@@ -4310,9 +8181,12 @@ def main() -> None:
     dmrg_all_plaquette_fluxes = _record_all_plaquette_fluxes(summary, "dmrg", dmrg_info)
     if dmrg_all_plaquette_fluxes:
         summary["dmrg"]["all_plaquette_fluxes"] = dmrg_all_plaquette_fluxes
+        if finite_is_peps:
+            summary["peps"]["all_plaquette_fluxes"] = dmrg_all_plaquette_fluxes
+            _record_all_plaquette_fluxes(summary, "peps", dmrg_info)
     _save_summary_checkpoint(args.output_folder, summary)
 
-    # Save DMRG plots immediately, one by one.
+    # Save finite variational-method plots immediately, one by one.
     _record_output_status(
         summary,
         "geometry_diagram_png",
@@ -4321,13 +8195,56 @@ def main() -> None:
         geometry_plot_error,
     )
     _save_summary_checkpoint(args.output_folder, summary)
-    if bool(args.plot_bond_energies) and calculate_bond_energies and len(dmrg_bond_rows) > 0:
+    dmrg_pattern_correlations = (
+        dmrg_real_space_patterns.get("correlations")
+        if isinstance(dmrg_real_space_patterns, dict)
+        else None
+    )
+    dmrg_reference_site_idx = (
+        dmrg_real_space_patterns.get("reference_site_idx")
+        if isinstance(dmrg_real_space_patterns, dict)
+        else None
+    )
+    has_spin_pattern_overlay = (
+        isinstance(dmrg_pattern_correlations, dict)
+        and "S" in dmrg_pattern_correlations
+        and dmrg_reference_site_idx is not None
+    )
+
+    def save_finite_bond_energy_plot(path: str) -> None:
+        if has_spin_pattern_overlay:
+            save_phase_representative_pattern(
+                geometry,
+                dmrg_pattern_correlations["S"],
+                int(dmrg_reference_site_idx),
+                dmrg_bond_rows,
+                path,
+                plot_title(f"{finite_method_label} Spin Pattern + Resolved Bond Energy"),
+                external_field_vector=resolved_field_vector,
+            )
+            print(
+                "[plot] spin-vector overlay: "
+                f"{path} uses arrows above bonds "
+                "(spin zorder=50, bond zorder=3, white halo enabled)."
+            )
+            return
+        save_bond_energy_diagram(
+            geometry,
+            dmrg_bond_rows,
+            path,
+            plot_title(f"{finite_method_label} Bond-Energy Diagram"),
+        )
+
+    should_save_finite_bond_plot = bool(args.plot_bond_energies or args.plot_real_space_patterns) and (
+        len(dmrg_bond_rows) > 0 or has_spin_pattern_overlay
+    )
+    if should_save_finite_bond_plot:
         _save_plot_step(
             summary,
             args.output_folder,
             "dmrg_bond_energy_diagram_png",
             output_filename("dmrg_bond_energy_diagram.png"),
-            lambda path: save_bond_energy_diagram(geometry, dmrg_bond_rows, path, plot_title("DMRG Bond-Energy Diagram")),
+            save_finite_bond_energy_plot,
             overwrite_existing,
             continue_on_plot_error,
         )
@@ -4337,7 +8254,7 @@ def main() -> None:
             args.output_folder,
             "dmrg_bond_energy_diagram_png",
             output_filename("dmrg_bond_energy_diagram.png"),
-            "plot_bond_energies or calculate_bond_energies is false, or no DMRG bond rows were computed",
+            "plot_bond_energies/plot_real_space_patterns is false, or no DMRG bond rows/spin pattern were computed",
         )
     if bool(args.plot_structure_factors) and calculate_structure_factors and len(dmrg_structure_factor_rows) > 0:
         _save_plot_step(
@@ -4345,7 +8262,7 @@ def main() -> None:
             args.output_folder,
             "dmrg_structure_factors_png",
             output_filename("dmrg_structure_factors.png"),
-            lambda path: save_structure_factor_plot(dmrg_structure_factor_rows, path, plot_title("DMRG Structure Factors")),
+            lambda path: save_structure_factor_plot(dmrg_structure_factor_rows, path, plot_title(f"{finite_method_label} Structure Factors")),
             overwrite_existing,
             continue_on_plot_error,
         )
@@ -4363,7 +8280,7 @@ def main() -> None:
             args.output_folder,
             "dmrg_scalar_correlation_heatmaps_png",
             output_filename("dmrg_scalar_correlation_heatmaps.png"),
-            lambda path: save_scalar_correlation_heatmaps(dmrg_scalar_correlations, path, f"DMRG | {run_plot_title_label}"),
+            lambda path: save_scalar_correlation_heatmaps(dmrg_scalar_correlations, path, f"{finite_method_label} | {run_plot_title_label}"),
             overwrite_existing,
             continue_on_plot_error,
         )
@@ -4375,92 +8292,27 @@ def main() -> None:
             output_filename("dmrg_scalar_correlation_heatmaps.png"),
             "plot_correlation_heatmaps or calculate_correlations is false, or no DMRG scalar correlations were computed",
         )
-    dmrg_pattern_correlations = (
-        dmrg_real_space_patterns.get("correlations")
-        if isinstance(dmrg_real_space_patterns, dict)
-        else None
+    overlay_status = _plot_step_status(summary, "dmrg_bond_energy_diagram_png")
+    overlay_reason = (
+        "spin-vector pattern is drawn in dmrg_bond_energy_diagram.png above resolved bonds "
+        "(spin zorder=50, bond zorder=3, white halo enabled)"
     )
-    dmrg_reference_site_idx = (
-        dmrg_real_space_patterns.get("reference_site_idx")
-        if isinstance(dmrg_real_space_patterns, dict)
-        else None
-    )
-    if (
-        bool(args.plot_real_space_patterns)
-        and calculate_real_space_patterns
-        and isinstance(dmrg_pattern_correlations, dict)
-        and dmrg_reference_site_idx is not None
-    ):
-        _save_plot_step(
+    if has_spin_pattern_overlay and overlay_status in ("saved", "skipped_exists"):
+        overlay_diagnostics = summary.setdefault("plot_overlay_diagnostics", {})
+        if isinstance(overlay_diagnostics, dict):
+            overlay_diagnostics["dmrg"] = {
+                "combined_plot": output_filename("dmrg_bond_energy_diagram.png"),
+                "spin_vectors_on_top": True,
+                "spin_vector_zorder": 50,
+                "resolved_bond_zorder": 3,
+                "white_halo": True,
+            }
+        _record_combined_plot_alias(
             summary,
             args.output_folder,
             "dmrg_spin_real_space_pattern_png",
-            output_filename("dmrg_spin_real_space_pattern.png"),
-            lambda path: save_real_space_pattern_diagram(
-                geometry,
-                dmrg_pattern_correlations["S"],
-                int(dmrg_reference_site_idx),
-                path,
-                plot_title("DMRG Reference-Site Spin Pattern"),
-                "C_S[j] = <S_ref . S_j>",
-            ),
-            overwrite_existing,
-            continue_on_plot_error,
-        )
-        _save_plot_step(
-            summary,
-            args.output_folder,
-            "dmrg_orbital_real_space_pattern_png",
-            output_filename("dmrg_orbital_real_space_pattern.png"),
-            lambda path: save_real_space_pattern_diagram(
-                geometry,
-                dmrg_pattern_correlations["T"],
-                int(dmrg_reference_site_idx),
-                path,
-                plot_title("DMRG Reference-Site Orbital Pattern"),
-                "C_T[j] = <T_ref . T_j>",
-            ),
-            overwrite_existing,
-            continue_on_plot_error,
-        )
-        if "ST" in dmrg_pattern_correlations:
-            _save_plot_step(
-                summary,
-                args.output_folder,
-                "dmrg_mixed_spin_orbital_real_space_pattern_png",
-                output_filename("dmrg_mixed_spin_orbital_real_space_pattern.png"),
-                lambda path: save_real_space_pattern_diagram(
-                    geometry,
-                    dmrg_pattern_correlations["ST"],
-                    int(dmrg_reference_site_idx),
-                    path,
-                    plot_title("DMRG Reference-Site Mixed Spin-Orbital Pattern"),
-                    "C_ST[j] mixed spin-orbital scalar",
-                ),
-                overwrite_existing,
-                continue_on_plot_error,
-            )
-    else:
-        _skip_plot_step(
-            summary,
-            args.output_folder,
-            "dmrg_spin_real_space_pattern_png",
-            output_filename("dmrg_spin_real_space_pattern.png"),
-            "plot_real_space_patterns or calculate_real_space_patterns is false, or no DMRG pattern correlations were computed",
-        )
-        _skip_plot_step(
-            summary,
-            args.output_folder,
-            "dmrg_orbital_real_space_pattern_png",
-            output_filename("dmrg_orbital_real_space_pattern.png"),
-            "plot_real_space_patterns or calculate_real_space_patterns is false, or no DMRG pattern correlations were computed",
-        )
-        _skip_plot_step(
-            summary,
-            args.output_folder,
-            "dmrg_mixed_spin_orbital_real_space_pattern_png",
-            output_filename("dmrg_mixed_spin_orbital_real_space_pattern.png"),
-            "plot_real_space_patterns or calculate_real_space_patterns is false, or no DMRG mixed pattern correlations were computed",
+            output_filename("dmrg_bond_energy_diagram.png"),
+            overlay_reason,
         )
     save_flux_crystal_output(
         summary,
@@ -4468,46 +8320,164 @@ def main() -> None:
         dmrg_info,
         "flux_crystal_pattern_png",
         "flux_crystal_pattern.png",
-        "DMRG Plaquette Flux Crystal Pattern",
+        f"{finite_method_label} Plaquette Flux Crystal Pattern",
     )
     summary["stages"]["dmrg_plots"] = "completed"
     _save_summary_checkpoint(args.output_folder, summary)
 
     # Optional iDMRG workflow (runs after finite DMRG outputs are saved).
-    if args.run_idmrg:
-        summary["stages"]["idmrg"] = "running"
-        _save_summary_checkpoint(args.output_folder, summary)
-        if backend_used == "tenax" and tenax_mpo is None:
-            summary["idmrg"] = {
-                "status": "failed",
-                "error": "Tenax MPO object unavailable after DMRG.",
-            }
-            summary["stages"]["idmrg"] = "failed"
+    if args.run_idmrg and not primary_is_ipeps:
+        if finite_is_peps:
+            summary["stages"]["ipeps"] = "running"
+            _save_summary_checkpoint(args.output_folder, summary)
+            try:
+                import peps_backend as quimb_ipeps_backend
+
+                ipeps_info = quimb_ipeps_backend.run_quimb_ipeps_scan(
+                    geometry=geometry,
+                    model_spec=model_spec,
+                    lattice_name=lattice_name,
+                    alpha=float(args.alpha),
+                    beta=float(args.beta),
+                    alpha_values=[float(args.alpha)],
+                    beta_values=[float(args.beta)],
+                    coupling_j=float(args.coupling_j),
+                    jx=float(args.jx),
+                    jy=float(args.jy),
+                    jz=float(args.jz),
+                    external_field_terms=hamiltonian_external_field_terms,
+                    max_unit_cell_sites=int(args.max_ipeps_unit_cell_sites),
+                    max_bond_dimension=int(args.ipeps_max_bond_dimension),
+                    max_iterations=int(args.ipeps_max_iterations),
+                    truncation_cutoff=float(args.truncation_cutoff),
+                    random_seed=int(args.seed),
+                    initial_state_style=str(args.initial_state),
+                    tau=float(args.ipeps_tau),
+                    ctm_chi=int(args.ipeps_ctm_chi),
+                    symmetry_reductions=symmetry_reduction_settings,
+                    args=args,
+                    use_sz_conserved=bool(args.use_sz_conserved),
+                    symmetric=False,
+                    ipeps_symmetry_mode=args.ipeps_symmetry_mode,
+                    ipeps_strict_symmetry=bool(args.ipeps_strict_symmetry),
+                    ipeps_allow_dense_fallback=bool(args.ipeps_allow_dense_fallback),
+                    unit_cell_kind=args.ipeps_unit_cell_kind,
+                    use_translation_symmetry=bool(args.ipeps_use_translation_symmetry),
+                    contraction_method=args.ipeps_contraction_method,
+                    classifier_thresholds=phase_classifier_thresholds_from_args(args),
+                    show_progress=show_progress,
+                )
+                ipeps_info = _normalize_ipeps_result_schema(ipeps_info)
+                ipeps_info["requested_backend"] = "quimb"
+                summary["ipeps"] = ipeps_info
+                summary["ipeps_symmetry_report"] = ipeps_info.get("ipeps_symmetry_report") or ipeps_info.get("symmetry")
+                ipeps_all_plaquette_fluxes = _record_all_plaquette_fluxes(summary, "ipeps", ipeps_info)
+                if ipeps_all_plaquette_fluxes:
+                    summary["ipeps"]["all_plaquette_fluxes"] = ipeps_all_plaquette_fluxes
+                save_flux_crystal_output(
+                    summary,
+                    geometry,
+                    ipeps_info,
+                    "ipeps_flux_crystal_pattern_png",
+                    "ipeps_flux_crystal_pattern.png",
+                    "quimb iPEPS Plaquette Flux Crystal Pattern",
+                )
+                summary["stages"]["ipeps"] = (
+                    "completed"
+                    if str(ipeps_info.get("status", "completed")) == "completed"
+                    else str(ipeps_info.get("status", "completed_with_warnings"))
+                )
+            except Exception as exc:
+                optional_dependency_missing = isinstance(exc, (ImportError, ModuleNotFoundError))
+                if show_progress and optional_dependency_missing:
+                    print(f"[backend] skip quimb iPEPS: optional package unavailable :: {exc}")
+                summary["ipeps"] = {
+                    "status": "skipped" if optional_dependency_missing else "failed",
+                    "backend": "quimb_ipeps",
+                    "requested_backend": "quimb",
+                    "error": str(exc) or exc.__class__.__name__,
+                    "energy_per_site": None,
+                    "ground_state_energy_per_site": None,
+                    "plaquette_flux": {
+                        "available": False,
+                        "value": None,
+                        "W_p": None,
+                        "reason": str(exc) or exc.__class__.__name__,
+                    },
+                }
+                summary["stages"]["ipeps"] = "skipped" if optional_dependency_missing else "failed"
+                if not continue_on_plot_error and not optional_dependency_missing:
+                    raise
             _save_summary_checkpoint(args.output_folder, summary)
         else:
-            try:
-                if backend_used == "tenax":
-                    idmrg_info = run_tenax_idmrg_x_from_finite_mpo(
-                        mpo=tenax_mpo,
-                        model_spec=model_spec,
-                        max_bond_dimension=args.idmrg_max_bond_dimension,
-                        max_iterations=args.idmrg_max_iterations,
-                        bulk_kind=args.idmrg_bulk_kind,
-                        max_local_dim=args.idmrg_max_local_dim,
-                        compute_entanglement=calculate_entanglement,
-                        show_progress=show_progress,
-                    )
-                    tenax_idmrg_energy = _finite_float_from_mapping(
-                        idmrg_info,
-                        "energy_per_original_site",
-                        "ground_state_energy_per_site",
-                        "energy_per_site",
-                    )
-                    if _idmrg_energy_is_suspicious(
-                        tenax_idmrg_energy,
-                        float(summary["dmrg"]["energy_per_site"]),
-                    ):
-                        tenax_idmrg_attempt = dict(idmrg_info)
+            summary["stages"]["idmrg"] = "running"
+            _save_summary_checkpoint(args.output_folder, summary)
+            if not bool(args.idmrg_use_translation_symmetry):
+                summary["idmrg"] = {
+                    "status": "skipped",
+                    "reason": "iDMRG translation symmetry was disabled by --no-idmrg-use-translation-symmetry.",
+                    "translation_symmetry": {"enabled": False},
+                }
+                summary["stages"]["idmrg"] = "skipped"
+                _save_summary_checkpoint(args.output_folder, summary)
+            elif str(backend_used).startswith("tenax") and tenax_mpo is None:
+                summary["idmrg"] = {
+                    "status": "failed",
+                    "error": "Tenax MPO object unavailable after DMRG.",
+                }
+                summary["stages"]["idmrg"] = "failed"
+                _save_summary_checkpoint(args.output_folder, summary)
+            else:
+                try:
+                    if str(backend_used).startswith("tenax"):
+                        idmrg_info = run_tenax_idmrg_x_from_finite_mpo(
+                            mpo=tenax_mpo,
+                            model_spec=model_spec,
+                            max_bond_dimension=args.idmrg_max_bond_dimension,
+                            max_iterations=args.idmrg_max_iterations,
+                            bulk_kind=args.idmrg_bulk_kind,
+                            max_local_dim=args.idmrg_max_local_dim,
+                            truncation_cutoff=args.truncation_cutoff,
+                            svd_min=args.idmrg_svd_min,
+                            compute_entanglement=calculate_entanglement,
+                            show_progress=show_progress,
+                        )
+                        tenax_idmrg_energy = _finite_float_from_mapping(
+                            idmrg_info,
+                            "energy_per_original_site",
+                            "ground_state_energy_per_site",
+                            "energy_per_site",
+                        )
+                        if _idmrg_energy_is_suspicious(
+                            tenax_idmrg_energy,
+                            float(summary["dmrg"]["energy_per_site"]),
+                        ):
+                            tenax_idmrg_attempt = dict(idmrg_info)
+                            yl_idmrg = _load_tenpy_backend_module()
+                            idmrg_info = yl_idmrg.run_cylindrical_idmrg(
+                                geometry=geometry,
+                                alpha=args.alpha,
+                                beta=args.beta,
+                                coupling_j=args.coupling_j,
+                                max_bond_dimension=args.idmrg_max_bond_dimension,
+                                max_iterations=args.idmrg_max_iterations,
+                                truncation_cutoff=args.truncation_cutoff,
+                                svd_min=args.idmrg_svd_min,
+                                random_seed=args.seed,
+                                product_state_style=args.initial_state,
+                                compute_entanglement=calculate_entanglement,
+                                external_field_terms=hamiltonian_external_field_terms,
+                                symmetry_reductions=symmetry_reduction_settings,
+                                show_progress=show_progress,
+                            )
+                            idmrg_info["backend"] = "tenpy_fallback_after_tenax_idmrg_sanity_check"
+                            idmrg_info["tenax_idmrg_attempt"] = tenax_idmrg_attempt
+                            idmrg_info["tenax_idmrg_fallback_reason"] = (
+                                "Tenax finite-MPO bulk extraction returned an iDMRG energy density "
+                                "far outside the finite-DMRG reference scale, so the comparison plot "
+                                "uses the TeNPy infinite-MPS path for a sane ground-state benchmark."
+                            )
+                    else:
                         yl_idmrg = _load_tenpy_backend_module()
                         idmrg_info = yl_idmrg.run_cylindrical_idmrg(
                             geometry=geometry,
@@ -4517,66 +8487,90 @@ def main() -> None:
                             max_bond_dimension=args.idmrg_max_bond_dimension,
                             max_iterations=args.idmrg_max_iterations,
                             truncation_cutoff=args.truncation_cutoff,
+                            svd_min=args.idmrg_svd_min,
                             random_seed=args.seed,
                             product_state_style=args.initial_state,
                             compute_entanglement=calculate_entanglement,
                             external_field_terms=hamiltonian_external_field_terms,
+                            symmetry_reductions=symmetry_reduction_settings,
                             show_progress=show_progress,
                         )
-                        idmrg_info["backend"] = "tenpy_fallback_after_tenax_idmrg_sanity_check"
-                        idmrg_info["tenax_idmrg_attempt"] = tenax_idmrg_attempt
-                        idmrg_info["tenax_idmrg_fallback_reason"] = (
-                            "Tenax finite-MPO bulk extraction returned an iDMRG energy density "
-                            "far outside the finite-DMRG reference scale, so the comparison plot "
-                            "uses the TeNPy infinite-MPS path for a sane ground-state benchmark."
-                        )
-                else:
-                    yl_idmrg = _load_tenpy_backend_module()
-                    idmrg_info = yl_idmrg.run_cylindrical_idmrg(
-                        geometry=geometry,
-                        alpha=args.alpha,
-                        beta=args.beta,
-                        coupling_j=args.coupling_j,
-                        max_bond_dimension=args.idmrg_max_bond_dimension,
-                        max_iterations=args.idmrg_max_iterations,
-                        truncation_cutoff=args.truncation_cutoff,
-                        random_seed=args.seed,
-                        product_state_style=args.initial_state,
-                        compute_entanglement=calculate_entanglement,
-                        external_field_terms=hamiltonian_external_field_terms,
-                        show_progress=show_progress,
+                    summary["idmrg"] = idmrg_info
+                    summary["idmrg"]["translation_symmetry"] = {
+                        "enabled": bool(args.idmrg_use_translation_symmetry),
+                        "implemented_as": "infinite repeated MPS unit cell along x",
+                    }
+                    idmrg_all_plaquette_fluxes = _record_all_plaquette_fluxes(summary, "idmrg", idmrg_info)
+                    if idmrg_all_plaquette_fluxes:
+                        summary["idmrg"]["all_plaquette_fluxes"] = idmrg_all_plaquette_fluxes
+                    save_flux_crystal_output(
+                        summary,
+                        geometry,
+                        idmrg_info,
+                        "idmrg_flux_crystal_pattern_png",
+                        "idmrg_flux_crystal_pattern.png",
+                        "iDMRG-x Plaquette Flux Crystal Pattern",
                     )
-                summary["idmrg"] = idmrg_info
-                idmrg_all_plaquette_fluxes = _record_all_plaquette_fluxes(summary, "idmrg", idmrg_info)
-                if idmrg_all_plaquette_fluxes:
-                    summary["idmrg"]["all_plaquette_fluxes"] = idmrg_all_plaquette_fluxes
-                save_flux_crystal_output(
-                    summary,
-                    geometry,
-                    idmrg_info,
-                    "idmrg_flux_crystal_pattern_png",
-                    "idmrg_flux_crystal_pattern.png",
-                    "iDMRG-x Plaquette Flux Crystal Pattern",
-                )
-                if calculate_entanglement and isinstance(idmrg_info.get("entanglement"), dict):
-                    entropy_profiles["iDMRG-x"] = idmrg_info["entanglement"]
-                summary["stages"]["idmrg"] = "completed"
-                _save_summary_checkpoint(args.output_folder, summary)
-            except Exception as exc:
-                summary["idmrg"] = {"status": "failed", "error": str(exc)}
-                summary["stages"]["idmrg"] = "failed"
-                if not continue_on_plot_error:
-                    raise
-                _save_summary_checkpoint(args.output_folder, summary)
+                    if calculate_entanglement and isinstance(idmrg_info.get("entanglement"), dict):
+                        entropy_profiles["iDMRG-x"] = idmrg_info["entanglement"]
+                    summary["stages"]["idmrg"] = "completed"
+                    _save_summary_checkpoint(args.output_folder, summary)
+                except Exception as exc:
+                    summary["idmrg"] = {"status": "failed", "error": str(exc)}
+                    summary["stages"]["idmrg"] = "failed"
+                    if not continue_on_plot_error:
+                        raise
+                    _save_summary_checkpoint(args.output_folder, summary)
 
     # Optional ED workflow (runs after all DMRG outputs are already saved).
     local_dim = int(model_spec.physical_dim)
     full_hilbert_dim = int(local_dim ** geometry.number_of_sites)
-    ed_backend_name = str(args.ed_backend)
+    requested_ed_backend_name = str(args.ed_backend)
+    ed_backend_name = requested_ed_backend_name
+    ed_symmetry_plan = (
+        getattr(args, "ed_symmetry_plan", {})
+        if isinstance(getattr(args, "ed_symmetry_plan", None), dict)
+        else {}
+    )
+    requested_sz_block = bool(ed_symmetry_plan.get("use_sz_block", symmetry_reduction_settings.get("use_sz_block", False)))
+    requested_tau_z_block = bool(
+        ed_symmetry_plan.get("use_tau_z_block", symmetry_reduction_settings.get("use_tau_z_block", False))
+    )
+    requested_z2_block = bool(ed_symmetry_plan.get("use_z2_block", symmetry_reduction_settings.get("use_z2_block", False)))
+    requested_z2_generator = ed_symmetry_plan.get("z2_generator", symmetry_reduction_settings.get("z2_generator"))
+    requested_z2_kind = ed_symmetry_plan.get("z2_kind", requested_z2_generator)
+    requested_translation_x_block = bool(ed_symmetry_plan.get("use_translation_x_block", args.use_translation_x_block))
+    requested_translation_y_block = bool(ed_symmetry_plan.get("use_translation_y_block", args.use_translation_y_block))
+    ed_plan_use_c3_block = bool(ed_symmetry_plan.get("use_c3_block", False))
+    ed_actual_field_class = str(ed_symmetry_plan.get("actual_hamiltonian_field_class", "none"))
+    effective_ed_engine = str(ed_symmetry_plan.get("effective_engine", ed_symmetry_plan.get("engine", args.ed_symmetry_engine)))
+    plan_backend_override_reason = ed_symmetry_plan.get("backend_override_reason")
+    ed_backend_override_reason = None
+    if effective_ed_engine == "standard_projector" and ed_backend_name == "quspin":
+        ed_backend_name = "standard"
+        ed_backend_override_reason = (
+            str(plan_backend_override_reason)
+            if plan_backend_override_reason
+            else (
+                "ED symmetry engine selected standard_projector; not replacing the in-repo "
+                "projector/U1 route "
+                "with an incomplete QuSpin site-permutation block."
+            )
+        )
+    elif effective_ed_engine.startswith("quspin") and ed_backend_name != "quspin":
+        ed_backend_name = "quspin"
+        ed_backend_override_reason = (
+            f"ED symmetry engine selected {effective_ed_engine}; using the separate native QuSpin path "
+            "for its supported subset."
+        )
     quspin_ed_requested = ed_backend_name == "quspin"
-    requested_sz_block = bool(symmetry_reduction_settings.get("use_sz_block", False))
-    requested_tau_z_block = bool(symmetry_reduction_settings.get("use_tau_z_block", False))
-    requested_z2_block = bool(symmetry_reduction_settings.get("use_z2_block", False))
+    model_requested_reductions = set()
+    if isinstance(getattr(args, "model_symmetry_selection", None), dict):
+        model_requested_reductions = {
+            str(item).strip().lower()
+            for item in args.model_symmetry_selection.get("requested_reductions", [])
+        }
+    quspin_requested_z2_block = bool(requested_z2_block)
     requested_target_sz2 = int(symmetry_reduction_settings.get("target_sz2", args.u1_target_sz2))
     requested_target_tz2 = int(symmetry_reduction_settings.get("target_tz2", args.u1_target_tz2))
     hamiltonian_field_ops = {
@@ -4586,6 +8580,11 @@ def main() -> None:
     }
     quspin_use_sz_block = bool(requested_sz_block)
     quspin_sz_reason = None
+    if quspin_use_sz_block and model_spec.model_family == "yao_lee":
+        quspin_use_sz_block = False
+        quspin_sz_reason = (
+            "QuSpin full spin basis used because the yao_lee Eq. 7 Hamiltonian breaks total Sz."
+        )
     if quspin_use_sz_block and bool(hamiltonian_field_ops.intersection({"Sx", "Sy"})):
         quspin_use_sz_block = False
         quspin_sz_reason = (
@@ -4598,55 +8597,98 @@ def main() -> None:
     quspin_translation_x_reason = None
     quspin_translation_y_reason = None
     quspin_translation_reason = {"x": None, "y": None}
-    requested_translation_block = bool(args.use_translation_x_block or args.use_translation_y_block)
+    quspin_translation_support_report = None
+    requested_translation_block = bool(requested_translation_x_block or requested_translation_y_block)
     if quspin_ed_requested and requested_translation_block:
         if not quspin_package_available:
             reason = "QuSpin package is not installed, so translation blocks cannot be checked."
-            quspin_translation_x_reason = reason if bool(args.use_translation_x_block) else None
-            quspin_translation_y_reason = reason if bool(args.use_translation_y_block) else None
+            quspin_translation_x_reason = reason if requested_translation_x_block else None
+            quspin_translation_y_reason = reason if requested_translation_y_block else None
         else:
             try:
                 import quspin_backend as quspin_validation_backend
 
                 translation_support = quspin_validation_backend.quspin_translation_block_support(geometry)
+                quspin_translation_support_report = translation_support
                 x_support = translation_support.get("x", {})
                 y_support = translation_support.get("y", {})
                 quspin_use_translation_x_block = bool(
-                    args.use_translation_x_block and x_support.get("supported", False)
+                    requested_translation_x_block and x_support.get("supported", False)
                 )
                 quspin_use_translation_y_block = bool(
-                    args.use_translation_y_block and y_support.get("supported", False)
+                    requested_translation_y_block and y_support.get("supported", False)
                 )
-                quspin_translation_x_reason = x_support.get("reason") if bool(args.use_translation_x_block) else None
-                quspin_translation_y_reason = y_support.get("reason") if bool(args.use_translation_y_block) else None
+                quspin_translation_x_reason = x_support.get("reason") if requested_translation_x_block else None
+                quspin_translation_y_reason = y_support.get("reason") if requested_translation_y_block else None
             except Exception as exc:
                 reason = str(exc)
-                quspin_translation_x_reason = reason if bool(args.use_translation_x_block) else None
-                quspin_translation_y_reason = reason if bool(args.use_translation_y_block) else None
+                quspin_translation_x_reason = reason if requested_translation_x_block else None
+                quspin_translation_y_reason = reason if requested_translation_y_block else None
     quspin_use_translation_block = bool(quspin_use_translation_x_block or quspin_use_translation_y_block)
+    if requested_tau_z_block and quspin_use_translation_block:
+        if quspin_use_translation_x_block:
+            quspin_translation_x_reason = (
+                "Dropped for QuSpin native ED: translations must act on spin and orbital together as "
+                "one fused physical-site operation; the current tensor-basis path keeps Tz instead."
+            )
+        if quspin_use_translation_y_block:
+            quspin_translation_y_reason = (
+                "Dropped for QuSpin native ED: translations must act on spin and orbital together as "
+                "one fused physical-site operation; the current tensor-basis path keeps Tz instead."
+            )
+        quspin_use_translation_x_block = False
+        quspin_use_translation_y_block = False
+        quspin_use_translation_block = False
     quspin_translation_reason = {
         "x": quspin_translation_x_reason,
         "y": quspin_translation_y_reason,
     }
     quspin_use_reflection_block = False
     quspin_reflection_reason = None
-    if quspin_ed_requested and (bool(args.use_reflection_block) or int(args.reflection_block) != 0):
+    if quspin_ed_requested and ed_plan_use_c3_block:
+        quspin_reflection_reason = (
+            "ED symmetry plan accepts combined spin-lattice C3, but QuSpin-native does not use a pure "
+            "site-permutation C3 map because the physical Yao-Lee C3 also requires a local spin rotation."
+        )
+    elif quspin_ed_requested and (bool(args.use_reflection_block) or int(args.reflection_block) != 0):
         quspin_reflection_reason = (
             "QuSpin reflection/C3 blocks are not applied for the bond-directional Yao-Lee Hamiltonian; "
             "they can permute x/y/z bond types unless a gauge map is implemented."
         )
-    quspin_use_z2_block = bool(
-        requested_z2_block
-        and quspin_use_sz_block
-        and requested_target_sz2 == 0
-        and not bool(hamiltonian_field_ops.intersection({"Sx", "Sy", "Sz"}))
-    )
+    quspin_use_z2_block = False
     quspin_z2_reason = None
-    if quspin_ed_requested and requested_z2_block and not quspin_use_z2_block:
-        if hamiltonian_field_ops.intersection({"Sx", "Sy", "Sz"}):
-            quspin_z2_reason = "External spin-field Hamiltonian terms break the QuSpin spin-flip Z2 block."
+    quspin_z2_kind = None
+    quspin_z2_generator = None
+    quspin_zero_field_spin_flip_z2 = bool(
+        model_spec.model_family == "yao_lee"
+        and model_spec.orbital_rep == "1/2"
+        and ed_actual_field_class == "none"
+        and requested_z2_kind == "spin_flip"
+        and not hamiltonian_field_ops
+    )
+    if quspin_ed_requested and quspin_requested_z2_block:
+        if quspin_zero_field_spin_flip_z2:
+            quspin_use_z2_block = True
+            quspin_z2_kind = "spin_flip"
+            quspin_z2_generator = "spin_flip"
+            quspin_z2_reason = (
+                "Using QuSpin spin_basis_1d spin-flip zblock on the full spin basis; "
+                "this does not require total Sz conservation."
+            )
+        elif requested_z2_kind == "spin_pi_z":
+            quspin_z2_reason = (
+                "ED symmetry plan selected spin_pi_z parity, but the current QuSpin tensor-basis "
+                "path does not implement the spin_pi_z projector yet; keeping the ED run in the Tz sector."
+            )
+        elif requested_z2_generator not in ("spin_flip", None):
+            quspin_z2_reason = (
+                f"QuSpin Z2 reduction is disabled because generator {requested_z2_generator!r} "
+                "is not the supported spin_flip zblock generator for the current field setting."
+            )
         else:
-            quspin_z2_reason = "QuSpin spin-flip Z2 requires the total Sz=0 spin block."
+            quspin_z2_reason = (
+                "QuSpin spin-flip Z2 is enabled only for zero-field Yao-Lee Hamiltonians in this path."
+            )
     spin_orbital_block_dim = _spin_orbital_symmetry_reduced_dimension(
         int(geometry.number_of_sites),
         quspin_use_sz_block,
@@ -4654,6 +8696,8 @@ def main() -> None:
         requested_tau_z_block,
         requested_target_tz2,
     )
+    if quspin_use_z2_block:
+        spin_orbital_block_dim = max(1, int(spin_orbital_block_dim) // 2)
     quspin_structurally_available = (
         quspin_ed_requested
         and quspin_package_available
@@ -4662,7 +8706,6 @@ def main() -> None:
         and model_spec.model_family == "yao_lee"
         and model_spec.ising_axis == "z"
         and int(spin_orbital_block_dim) > 0
-        and not (requested_tau_z_block and (quspin_use_z2_block or quspin_use_translation_block))
     )
     quspin_actual_hilbert_dim: int | None = None
     quspin_basis_build_reason = None
@@ -4678,6 +8721,7 @@ def main() -> None:
                 use_tau_z_block=requested_tau_z_block,
                 target_tz2=requested_target_tz2,
                 use_z2_block=quspin_use_z2_block,
+                z2_generator=quspin_z2_generator,
                 z2_target_parity=int(args.z2_target_parity),
                 use_translation_block=quspin_use_translation_block,
                 use_translation_x_block=quspin_use_translation_x_block,
@@ -4710,8 +8754,8 @@ def main() -> None:
         quspin_ed_reason = "QuSpin ED currently supports ising_axis=z only."
     elif quspin_ed_requested and int(spin_orbital_block_dim) <= 0:
         quspin_ed_reason = "The requested shared U1 target sector is unreachable for this site count."
-    elif quspin_ed_requested and requested_tau_z_block and (quspin_use_z2_block or quspin_use_translation_block):
-        quspin_ed_reason = "QuSpin does not combine tau_z with Z2 or 2D translation blocks for this model."
+    elif quspin_ed_requested and requested_tau_z_block and quspin_use_translation_block:
+        quspin_ed_reason = "QuSpin kept tau_z and dropped unsupported translation combinations."
     elif quspin_ed_requested and quspin_basis_build_reason is not None:
         quspin_ed_reason = quspin_basis_build_reason
     sz_conserved_requested = bool(requested_sz_block)
@@ -4719,12 +8763,15 @@ def main() -> None:
         not quspin_ed_requested
         and
         sz_conserved_requested
+        and model_spec.model_family != "yao_lee"
         and model_spec.spin_rep == "1/2"
         and model_spec.orbital_rep == "1/2"
         and _sector_dimension_for_spin_half(int(geometry.number_of_sites), requested_target_sz2) > 0
     )
     sz_conserved_reason = None
-    if sz_conserved_requested and model_spec.orbital_rep == "0":
+    if sz_conserved_requested and model_spec.model_family == "yao_lee":
+        sz_conserved_reason = "yao_lee now uses the Eq. 7 Hamiltonian, whose Sx/Sy gamma terms do not conserve total Sz."
+    elif sz_conserved_requested and model_spec.orbital_rep == "0":
         sz_conserved_reason = "orbital_rep=0 is spin-only; using the legacy full spin ED path."
     elif sz_conserved_requested and model_spec.spin_rep != "1/2":
         sz_conserved_reason = "Sz-conserved bitwise ED currently supports spin_rep=1/2 only."
@@ -4732,6 +8779,60 @@ def main() -> None:
         sz_conserved_reason = "Sz-conserved bitwise ED currently supports orbital_rep=1/2 only."
     elif sz_conserved_requested and _sector_dimension_for_spin_half(int(geometry.number_of_sites), requested_target_sz2) <= 0:
         sz_conserved_reason = "The requested total Sz sector is unreachable for this number of spin-1/2 sites."
+    standard_u1_requested = bool(
+        (not quspin_ed_requested)
+        and requested_tau_z_block
+    )
+    standard_u1_dim = (
+        estimate_spin_orbital_u1_dimension(
+            int(geometry.number_of_sites),
+            use_sz_block=False,
+            target_sz2=requested_target_sz2,
+            use_tau_z_block=True,
+            target_tz2=requested_target_tz2,
+        )
+        if standard_u1_requested and model_spec.spin_rep == "1/2" and model_spec.orbital_rep == "1/2"
+        else 0
+    )
+    standard_u1_available = bool(
+        standard_u1_requested
+        and model_spec.spin_rep == "1/2"
+        and model_spec.orbital_rep == "1/2"
+        and int(standard_u1_dim) > 0
+    )
+    standard_u1_reason = None
+    if standard_u1_requested and model_spec.spin_rep != "1/2":
+        standard_u1_reason = "Standard Tz-reduced sparse ED currently supports spin_rep=1/2 only."
+    elif standard_u1_requested and model_spec.orbital_rep != "1/2":
+        standard_u1_reason = "Standard Tz-reduced sparse ED currently supports orbital_rep=1/2 only."
+    elif standard_u1_requested and int(standard_u1_dim) <= 0:
+        standard_u1_reason = "The requested total Tz sector is unreachable for this number of orbital-1/2 sites."
+    standard_projector_z2_requested = bool(
+        standard_u1_available
+        and requested_z2_block
+        and str(requested_z2_kind) == "spin_pi_z"
+    )
+    standard_projector_translation_x_requested = bool(standard_u1_available and requested_translation_x_block)
+    standard_projector_translation_y_requested = bool(standard_u1_available and requested_translation_y_block)
+    standard_projector_c3_requested = bool(standard_u1_available and ed_plan_use_c3_block)
+    standard_projector_requested = bool(
+        standard_projector_z2_requested
+        or standard_projector_translation_x_requested
+        or standard_projector_translation_y_requested
+        or standard_projector_c3_requested
+    )
+    standard_projector_reduction_factor = 1
+    if standard_projector_z2_requested:
+        standard_projector_reduction_factor *= 2
+    if standard_projector_translation_x_requested:
+        standard_projector_reduction_factor *= max(1, int(getattr(geometry, "length_x", args.length_x) or 1))
+    if standard_projector_translation_y_requested:
+        standard_projector_reduction_factor *= max(1, int(getattr(geometry, "length_y", args.length_y) or 1))
+    if standard_projector_c3_requested:
+        standard_projector_reduction_factor *= 3
+    standard_projector_dim_estimate = int(
+        max(1, int(standard_u1_dim) // max(1, int(standard_projector_reduction_factor)))
+    ) if standard_projector_requested else int(standard_u1_dim)
     if quspin_ed_requested:
         hilbert_dim = int(
             quspin_actual_hilbert_dim
@@ -4739,13 +8840,28 @@ def main() -> None:
             else spin_orbital_block_dim
         )
         ed_basis_type = (
-            "quspin_tensor_"
-            f"spin_{'u1_block' if quspin_use_sz_block else 'full'}_"
-            f"orbital_{'u1_block' if requested_tau_z_block else 'full'}"
+            "quspin_tensor_spin_z2_orbital_tz"
+            if quspin_use_z2_block and requested_tau_z_block
+            else (
+                "quspin_tensor_spin_z2_orbital_full"
+                if quspin_use_z2_block
+                else (
+                    "quspin_tensor_"
+                    f"spin_{'u1_block' if quspin_use_sz_block else 'full'}_"
+                    f"orbital_{'u1_block' if requested_tau_z_block else 'full'}"
+                )
+            )
         )
     elif sz_conserved_available:
         hilbert_dim = int(estimate_sz_conserved_dimension(int(geometry.number_of_sites), target_sz2=requested_target_sz2))
         ed_basis_type = "bitwise_spin_orbital_total_sz_block"
+    elif standard_u1_available:
+        hilbert_dim = int(standard_projector_dim_estimate if standard_projector_requested else standard_u1_dim)
+        ed_basis_type = (
+            "bitwise_spin_orbital_tz_projector_block"
+            if standard_projector_requested
+            else "bitwise_spin_orbital_total_tz_block"
+        )
     else:
         hilbert_dim = full_hilbert_dim
         ed_basis_type = "legacy_full_tensor_product"
@@ -4763,20 +8879,60 @@ def main() -> None:
             ed_applied_reductions.append("translation_y")
     elif sz_conserved_available:
         ed_applied_reductions.append("sz")
+    elif standard_u1_available:
+        ed_applied_reductions.append("tz")
+        if standard_projector_z2_requested:
+            ed_applied_reductions.append("z2")
+        if standard_projector_translation_x_requested:
+            ed_applied_reductions.append("translation_x")
+        if standard_projector_translation_y_requested:
+            ed_applied_reductions.append("translation_y")
+        if standard_projector_c3_requested:
+            ed_applied_reductions.append("combined_c3")
+    planned_ed_reduction_names = []
+    for item in list(ed_symmetry_plan.get("accepted_symmetries", [])):
+        item_text = str(item)
+        if item_text.startswith("z2:"):
+            planned_ed_reduction_names.append("z2")
+        elif item_text == "combined_c3":
+            planned_ed_reduction_names.append("combined_c3")
+        else:
+            planned_ed_reduction_names.append(item_text)
     ed_unsupported_reductions = [
         reduction
-        for reduction in ("sz", "tz", "z2")
-        if reduction in set(args.symmetry_reductions) and reduction not in ed_applied_reductions
+        for reduction in sorted(set(list(args.symmetry_reductions) + planned_ed_reduction_names))
+        if reduction not in ed_applied_reductions and reduction not in ("none", "auto")
     ]
     ed_eligibility: Dict[str, Any] = {
         "requested": bool(args.run_ed),
         "ed_backend": ed_backend_name,
+        "requested_backend": requested_ed_backend_name,
+        "actual_backend": ed_backend_name,
+        "symmetry_engine": effective_ed_engine,
+        "requested_symmetry_engine": str(ed_symmetry_plan.get("requested_engine", args.ed_symmetry_engine)),
+        "requested_symmetries": list(ed_symmetry_plan.get("requested_symmetries", [])),
+        "accepted_symmetries": list(ed_symmetry_plan.get("accepted_symmetries", [])),
+        "dropped_symmetries": list(ed_symmetry_plan.get("dropped_symmetries", [])),
+        "symmetry_reasons": dict(ed_symmetry_plan.get("reasons", {})),
+        "z2_generator_used": ed_symmetry_plan.get("z2_generator_used"),
+        "z2_selection_reason": ed_symmetry_plan.get("z2_selection_reason"),
+        "quspin_z2_selection_reason": ed_symmetry_plan.get("quspin_z2_selection_reason"),
+        "requested_ed_backend": requested_ed_backend_name,
+        "effective_ed_backend": ed_backend_name,
+        "ed_backend_override_reason": ed_backend_override_reason,
+        "backend_override_reason": ed_backend_override_reason,
         "allowed": False,
         "forbidden": True,
         "number_of_sites": int(geometry.number_of_sites),
         "local_dimension": int(local_dim),
         "hilbert_dimension": int(hilbert_dim),
         "effective_hilbert_dimension": int(hilbert_dim),
+        "standard_u1_parent_hilbert_dimension": int(standard_u1_dim) if standard_u1_available else None,
+        "standard_projector_requested": bool(standard_projector_requested),
+        "standard_projector_reduction_factor_estimate": int(standard_projector_reduction_factor),
+        "standard_projector_hilbert_dimension_estimate": (
+            int(standard_projector_dim_estimate) if standard_projector_requested else None
+        ),
         "pre_quspin_hilbert_dimension_estimate": int(spin_orbital_block_dim) if quspin_ed_requested else None,
         "actual_quspin_hilbert_dimension": (
             int(quspin_actual_hilbert_dim) if quspin_actual_hilbert_dim is not None else None
@@ -4784,6 +8940,7 @@ def main() -> None:
         "full_hilbert_dimension": int(full_hilbert_dim),
         "basis_type": ed_basis_type,
         "symmetry_reductions": symmetry_reduction_settings,
+        "ed_symmetry_plan": ed_symmetry_plan,
         "applied_reductions": ed_applied_reductions,
         "unsupported_or_unapplied_reductions": ed_unsupported_reductions,
         "use_sz_conserved_requested": bool(sz_conserved_requested),
@@ -4791,6 +8948,8 @@ def main() -> None:
         "use_tau_z_conserved": "tz" in ed_applied_reductions,
         "use_z2_conserved": "z2" in ed_applied_reductions,
         "standard_sz_conserved": bool(sz_conserved_available),
+        "standard_u1_conserved": bool(standard_u1_available),
+        "standard_u1_reason": standard_u1_reason,
         "quspin_available": bool(quspin_ed_available),
         "quspin_package_available": bool(quspin_package_available),
         "quspin_reason": quspin_ed_reason,
@@ -4798,8 +8957,8 @@ def main() -> None:
         "quspin_use_sz_block": bool(quspin_use_sz_block),
         "quspin_sz_reason": quspin_sz_reason,
         "quspin_requested_translation_block": bool(requested_translation_block),
-        "quspin_requested_translation_x_block": bool(args.use_translation_x_block),
-        "quspin_requested_translation_y_block": bool(args.use_translation_y_block),
+        "quspin_requested_translation_x_block": bool(requested_translation_x_block),
+        "quspin_requested_translation_y_block": bool(requested_translation_y_block),
         "quspin_use_translation_block": bool(quspin_use_translation_block),
         "quspin_use_translation_x_block": bool(quspin_use_translation_x_block),
         "quspin_use_translation_y_block": bool(quspin_use_translation_y_block),
@@ -4808,10 +8967,15 @@ def main() -> None:
         "quspin_translation_reason": quspin_translation_reason,
         "quspin_translation_x_reason": quspin_translation_x_reason,
         "quspin_translation_y_reason": quspin_translation_y_reason,
-        "quspin_requested_reflection_block": bool(args.use_reflection_block),
+        "quspin_translation_support": quspin_translation_support_report,
+        "quspin_requested_reflection_block": bool(ed_plan_use_c3_block or args.use_reflection_block),
         "quspin_use_reflection_block": bool(quspin_use_reflection_block),
         "quspin_reflection_reason": quspin_reflection_reason,
+        "quspin_requested_z2_block": bool(quspin_requested_z2_block),
+        "quspin_requested_z2_kind": requested_z2_kind,
         "quspin_use_z2_block": bool(quspin_use_z2_block),
+        "quspin_z2_kind": quspin_z2_kind,
+        "quspin_z2_generator": quspin_z2_generator,
         "quspin_z2_reason": quspin_z2_reason,
         "sz_conserved_reason": sz_conserved_reason,
         "max_sites": int(args.max_ed_sites),
@@ -4820,14 +8984,18 @@ def main() -> None:
         "solver": (
             "quspin_eigsh"
             if quspin_ed_requested
-            else ("sz_conserved_sparse" if sz_conserved_available else str(args.ed_solver))
+            else (
+                ("spin_orbital_tz_projector_sparse" if standard_projector_requested else "spin_orbital_u1_sparse")
+                if standard_u1_available
+                else ("sz_conserved_sparse" if sz_conserved_available else str(args.ed_solver))
+            )
         ),
         "max_eigenstates": (
             int(args.ed_max_eigenstates)
             if quspin_ed_requested
             else (
                 int(SZ_CONSERVED_ED_EIGENSTATES)
-                if sz_conserved_available
+                if (sz_conserved_available or standard_u1_available)
                 else int(args.ed_max_eigenstates)
             )
         ),
@@ -4840,6 +9008,7 @@ def main() -> None:
         not quspin_ed_requested
         and sz_conserved_requested
         and not sz_conserved_available
+        and not standard_u1_available
         and model_spec.orbital_rep != "0"
     ):
         ed_eligibility["reason"] = str(sz_conserved_reason or "Sz-conserved ED is not available for this model.")
@@ -4861,6 +9030,7 @@ def main() -> None:
             f"allowed={bool(ed_eligibility['allowed'])}, "
             f"forbidden={bool(ed_eligibility['forbidden'])}, "
             f"backend={ed_backend_name}, "
+            f"requested_backend={requested_ed_backend_name}, "
             f"N={int(geometry.number_of_sites)}, "
             f"local_dim={local_dim}, "
             f"basis={ed_basis_type}, "
@@ -4937,6 +9107,7 @@ def main() -> None:
                         use_tau_z_block=requested_tau_z_block,
                         target_tz2=requested_target_tz2,
                         use_z2_block=quspin_use_z2_block,
+                        z2_generator=quspin_z2_generator,
                         z2_target_parity=int(args.z2_target_parity),
                         use_translation_block=quspin_use_translation_block,
                         use_translation_x_block=quspin_use_translation_x_block,
@@ -4962,6 +9133,7 @@ def main() -> None:
                         use_tau_z_block=requested_tau_z_block,
                         target_tz2=requested_target_tz2,
                         use_z2_block=quspin_basis_use_z2_block,
+                        z2_generator=quspin_z2_generator,
                         z2_target_parity=int(args.z2_target_parity),
                         use_translation_block=quspin_use_translation_block,
                         use_translation_x_block=quspin_use_translation_x_block,
@@ -5004,6 +9176,105 @@ def main() -> None:
                             ed_structure_factor_rows = quspin_ed_backend.all_high_symmetry_structure_factors(
                                 ed_scalar_correlations,
                                 geometry,
+                            )
+                elif standard_u1_available:
+                    if standard_projector_requested:
+                        ed_spectrum, ed_vectors, ed_basis_list, ed_basis_map = run_spin_orbital_projected_exact_spectrum(
+                            geometry=geometry,
+                            model_spec=model_spec,
+                            alpha=args.alpha,
+                            beta=args.beta,
+                            coupling_j=args.coupling_j,
+                            eigenstate_count=int(SZ_CONSERVED_ED_EIGENSTATES),
+                            check_ground_state_degeneracy=bool(args.check_ground_state_degeneracy),
+                            jx=args.jx,
+                            jy=args.jy,
+                            jz=args.jz,
+                            external_field_terms=hamiltonian_external_field_terms,
+                            show_progress=show_progress,
+                            ground_manifold_abs_tol=float(args.ed_ground_manifold_abs_tol),
+                            ground_manifold_rel_tol=float(args.ed_ground_manifold_rel_tol),
+                            sparse_tol=float(args.ed_sparse_tol),
+                            sparse_maxiter=(
+                                int(args.ed_sparse_maxiter)
+                                if int(args.ed_sparse_maxiter) > 0
+                                else None
+                            ),
+                            target_tz2=requested_target_tz2,
+                            use_spin_pi_z=standard_projector_z2_requested,
+                            z2_target_parity=int(ed_symmetry_plan.get("z2_target_parity", args.z2_target_parity)),
+                            use_translation_x=standard_projector_translation_x_requested,
+                            use_translation_y=standard_projector_translation_y_requested,
+                            momentum_x=int(ed_symmetry_plan.get("momentum_x_block", args.momentum_x_block)),
+                            momentum_y=int(ed_symmetry_plan.get("momentum_y_block", args.momentum_y_block)),
+                            use_combined_c3=standard_projector_c3_requested,
+                            c3_q_blocks=str(ed_symmetry_plan.get("c3_q_blocks", args.ed_c3_q_blocks)),
+                        )
+                    else:
+                        ed_spectrum, ed_vectors, ed_basis_list, ed_basis_map = run_spin_orbital_u1_exact_spectrum(
+                            geometry=geometry,
+                            model_spec=model_spec,
+                            alpha=args.alpha,
+                            beta=args.beta,
+                            coupling_j=args.coupling_j,
+                            eigenstate_count=int(SZ_CONSERVED_ED_EIGENSTATES),
+                            check_ground_state_degeneracy=bool(args.check_ground_state_degeneracy),
+                            jx=args.jx,
+                            jy=args.jy,
+                            jz=args.jz,
+                            external_field_terms=hamiltonian_external_field_terms,
+                            show_progress=show_progress,
+                            ground_manifold_abs_tol=float(args.ed_ground_manifold_abs_tol),
+                            ground_manifold_rel_tol=float(args.ed_ground_manifold_rel_tol),
+                            sparse_tol=float(args.ed_sparse_tol),
+                            sparse_maxiter=(
+                                int(args.ed_sparse_maxiter)
+                                if int(args.ed_sparse_maxiter) > 0
+                                else None
+                            ),
+                            use_sz_block=False,
+                            target_sz2=requested_target_sz2,
+                            use_tau_z_block=True,
+                            target_tz2=requested_target_tz2,
+                        )
+                    ed_energy = float(ed_spectrum["ground_state_energy"])
+                    ed_state = ed_vectors[:, 0]
+                    try:
+                        ed_plaquette_flux = plaquette_flux_from_spin_orbital_u1_ed_state(
+                            geometry,
+                            ed_state,
+                            ed_basis_list,
+                            ed_basis_map,
+                            plaquette_center_idx=None,
+                        )
+                    except Exception as exc:
+                        ed_plaquette_flux = {"available": False, "warning": str(exc)}
+                    if calculate_correlations:
+                        ed_correlations = collect_correlation_matrices_from_spin_orbital_u1_ed(
+                            geometry,
+                            ed_state,
+                            ed_basis_list,
+                            ed_basis_map,
+                            show_progress=show_progress,
+                        )
+                        ed_scalar_correlations = build_spin_orbital_u1_scalar_correlations(ed_correlations)
+                        if calculate_bond_energies:
+                            ed_bond_rows = all_bond_energies_sz_conserved(
+                                geometry,
+                                ed_correlations,
+                                args.alpha,
+                                args.beta,
+                                args.coupling_j,
+                                show_progress=show_progress,
+                                progress_desc="Tz-ED bond energies",
+                            )
+                        if calculate_structure_factors:
+                            ed_structure_factor_rows = all_high_symmetry_structure_factors(
+                                ed_scalar_correlations,
+                                geometry,
+                                lattice=lattice_name,
+                                show_progress=show_progress,
+                                progress_desc="Tz-ED structure factors",
                             )
                 elif sz_conserved_available:
                     ed_spectrum, ed_vectors, ed_basis_list, ed_basis_map = run_sz_conserved_exact_spectrum(
@@ -5169,28 +9440,82 @@ def main() -> None:
                 except Exception as exc:
                     ed_entropy_warning = f"Failed to compute ED entanglement profile: {exc}"
 
+                actual_ed_applied_reductions = _ed_actual_applied_reductions_from_spectrum(
+                    ed_applied_reductions,
+                    ed_spectrum,
+                )
+                ed_runtime_symmetry_status = (
+                    _ed_symmetry_status_text(ed_symmetry_plan, spectrum=ed_spectrum)
+                    if isinstance(ed_spectrum, dict)
+                    else _ed_symmetry_status_text(ed_symmetry_plan)
+                )
+                if show_progress and isinstance(ed_spectrum, dict):
+                    final_dimension = ed_spectrum.get(
+                        "projector_reduced_dimension",
+                        ed_spectrum.get("hilbert_dimension", ed_spectrum.get("hilbert_dim")),
+                    )
+                    final_dimension_text = (
+                        f", final_dim={int(final_dimension):,}" if final_dimension is not None else ""
+                    )
+                    print(
+                        "[ed-symmetry] applied: "
+                        f"backend={effective_ed_engine}, "
+                        f"status={ed_runtime_symmetry_status}"
+                        f"{final_dimension_text}"
+                    )
+
                 ed_all_plaquette_fluxes = _all_plaquette_fluxes_from_payload(ed_plaquette_flux or {})
                 summary["ed"] = {
                     "status": "completed",
                     "ed_backend": ed_backend_name,
+                    "requested_backend": requested_ed_backend_name,
+                    "actual_backend": ed_backend_name,
+                    "symmetry_engine": effective_ed_engine,
+                    "requested_symmetries": list(ed_symmetry_plan.get("requested_symmetries", [])),
+                    "accepted_symmetries": list(ed_symmetry_plan.get("accepted_symmetries", [])),
+                    "dropped_symmetries": list(ed_symmetry_plan.get("dropped_symmetries", [])),
+                    "z2_generator_used": ed_symmetry_plan.get("z2_generator_used"),
+                    "z2_selection_reason": ed_symmetry_plan.get("z2_selection_reason"),
+                    "quspin_z2_selection_reason": ed_symmetry_plan.get("quspin_z2_selection_reason"),
+                    "requested_ed_backend": requested_ed_backend_name,
+                    "ed_backend_override_reason": ed_backend_override_reason,
+                    "backend_override_reason": ed_backend_override_reason,
                     "eligibility": ed_eligibility,
                     "basis_type": ed_basis_type,
                     "symmetry_reductions": symmetry_reduction_settings,
-                    "applied_reductions": ed_applied_reductions,
+                    "ed_symmetry_plan": ed_symmetry_plan,
+                    "ed_symmetry_status": ed_runtime_symmetry_status,
+                    "applied_reductions": actual_ed_applied_reductions,
                     "unsupported_or_unapplied_reductions": ed_unsupported_reductions,
-                    "use_sz_conserved": "sz" in ed_applied_reductions,
-                    "use_tau_z_conserved": "tz" in ed_applied_reductions,
-                    "use_z2_conserved": "z2" in ed_applied_reductions,
-                    "use_translation_x_conserved": "translation_x" in ed_applied_reductions,
-                    "use_translation_y_conserved": "translation_y" in ed_applied_reductions,
+                    "use_sz_conserved": "sz" in actual_ed_applied_reductions,
+                    "use_tau_z_conserved": "tz" in actual_ed_applied_reductions,
+                    "use_z2_conserved": "z2" in actual_ed_applied_reductions,
+                    "z2_kind": (
+                        ed_spectrum.get("z2_kind", quspin_z2_kind)
+                        if "z2" in actual_ed_applied_reductions and isinstance(ed_spectrum, dict)
+                        else (quspin_z2_kind if "z2" in actual_ed_applied_reductions else None)
+                    ),
+                    "use_translation_x_conserved": "translation_x" in actual_ed_applied_reductions,
+                    "use_translation_y_conserved": "translation_y" in actual_ed_applied_reductions,
+                    "use_c3_conserved": "combined_c3" in actual_ed_applied_reductions,
                     "hamiltonian_formula": (
                         ed_spectrum.get("formula")
                         if isinstance(ed_spectrum, dict) and ed_spectrum.get("formula") is not None
                         else "legacy full tensor-product ED formula from models.model_terms_for_bond"
                     ),
+                    "selected_sector_energy": ed_energy if "tz" in actual_ed_applied_reductions else None,
+                    "selected_target_tz2": requested_target_tz2 if "tz" in actual_ed_applied_reductions else None,
+                    "min_over_tz_sectors": {
+                        "computed": False,
+                        "reason": (
+                            "Full Tz-sector scan is reserved for small-cluster validation; "
+                            "production ED reports the selected target sector separately."
+                        ),
+                    } if "tz" in actual_ed_applied_reductions else None,
                     "ground_state_energy": ed_energy,
                     "energy_per_site": ed_energy / geometry.number_of_sites,
                     "absolute_energy_difference_dmrg_minus_ed": abs(dmrg_energy - ed_energy),
+                    "bond_energies": ed_bond_rows,
                     "structure_factors": ed_structure_factor_rows,
                     "real_space_patterns": ed_real_space_patterns,
                     "plaquette_flux": ed_plaquette_flux,
@@ -5200,13 +9525,25 @@ def main() -> None:
                     _record_all_plaquette_fluxes(summary, "ed", ed_plaquette_flux or {})
                 if ed_spectrum is not None:
                     summary["ed"]["spectrum"] = ed_spectrum
-                    if ed_spectrum.get("hilbert_dimension") is not None:
-                        actual_dim = int(ed_spectrum["hilbert_dimension"])
+                    for projector_key in ("projector_strategy", "memory_estimate_MB", "drop_reasons"):
+                        if ed_spectrum.get(projector_key) is not None:
+                            summary["ed"][projector_key] = ed_spectrum.get(projector_key)
+                    if ed_spectrum.get("dropped_symmetries") is not None:
+                        runtime_drops = list(ed_spectrum.get("dropped_symmetries", []))
+                        planned_drops = list(ed_symmetry_plan.get("dropped_symmetries", []))
+                        summary["ed"]["dropped_symmetries"] = planned_drops + runtime_drops
+                    dimension_value = ed_spectrum.get("hilbert_dimension", ed_spectrum.get("hilbert_dim"))
+                    if dimension_value is not None:
+                        actual_dim = int(dimension_value)
                         summary["ed"]["hilbert_dimension"] = actual_dim
                         summary["ed"]["effective_hilbert_dimension"] = actual_dim
                         if isinstance(summary["ed"].get("eligibility"), dict):
                             summary["ed"]["eligibility"]["actual_hilbert_dimension"] = actual_dim
                             summary["ed"]["eligibility"]["effective_hilbert_dimension_after_quspin"] = actual_dim
+                            if ed_spectrum.get("u1_basis_dimension") is not None:
+                                summary["ed"]["eligibility"]["standard_u1_parent_hilbert_dimension"] = int(
+                                    ed_spectrum["u1_basis_dimension"]
+                                )
                     summary["ed"]["ground_state_degeneracy_check_enabled"] = bool(
                         ed_spectrum.get("ground_state_degeneracy_check_enabled", False)
                     )
@@ -5246,13 +9583,56 @@ def main() -> None:
                     summary["ed"]["entanglement_warning"] = ed_entropy_warning
                 _save_summary_checkpoint(args.output_folder, summary)
 
-                if bool(args.plot_bond_energies) and calculate_bond_energies and len(ed_bond_rows) > 0:
+                ed_pattern_correlations = (
+                    ed_real_space_patterns.get("correlations")
+                    if isinstance(ed_real_space_patterns, dict)
+                    else None
+                )
+                ed_reference_site_idx = (
+                    ed_real_space_patterns.get("reference_site_idx")
+                    if isinstance(ed_real_space_patterns, dict)
+                    else None
+                )
+                has_ed_spin_pattern_overlay = (
+                    isinstance(ed_pattern_correlations, dict)
+                    and "S" in ed_pattern_correlations
+                    and ed_reference_site_idx is not None
+                )
+
+                def save_ed_bond_energy_plot(path: str) -> None:
+                    if has_ed_spin_pattern_overlay:
+                        save_phase_representative_pattern(
+                            geometry,
+                            ed_pattern_correlations["S"],
+                            int(ed_reference_site_idx),
+                            ed_bond_rows,
+                            path,
+                            plot_title("ED Spin Pattern + Resolved Bond Energy"),
+                            external_field_vector=resolved_field_vector,
+                        )
+                        print(
+                            "[plot] spin-vector overlay: "
+                            f"{path} uses arrows above bonds "
+                            "(spin zorder=50, bond zorder=3, white halo enabled)."
+                        )
+                        return
+                    save_bond_energy_diagram(
+                        geometry,
+                        ed_bond_rows,
+                        path,
+                        plot_title("ED Bond-Energy Diagram"),
+                    )
+
+                should_save_ed_bond_plot = bool(args.plot_bond_energies or args.plot_real_space_patterns) and (
+                    len(ed_bond_rows) > 0 or has_ed_spin_pattern_overlay
+                )
+                if should_save_ed_bond_plot:
                     _save_plot_step(
                         summary,
                         args.output_folder,
                         "ed_bond_energy_diagram_png",
                         output_filename("ed_bond_energy_diagram.png"),
-                        lambda path: save_bond_energy_diagram(geometry, ed_bond_rows, path, plot_title("ED Bond-Energy Diagram")),
+                        save_ed_bond_energy_plot,
                         overwrite_existing,
                         continue_on_plot_error,
                     )
@@ -5262,7 +9642,7 @@ def main() -> None:
                         args.output_folder,
                         "ed_bond_energy_diagram_png",
                         output_filename("ed_bond_energy_diagram.png"),
-                        "plot_bond_energies or calculate_bond_energies is false, or no ED bond rows were computed",
+                        "plot_bond_energies/plot_real_space_patterns is false, or no ED bond rows/spin pattern were computed",
                     )
                 if bool(args.plot_structure_factors) and calculate_structure_factors and len(ed_structure_factor_rows) > 0:
                     _save_plot_step(
@@ -5300,92 +9680,27 @@ def main() -> None:
                         output_filename("ed_scalar_correlation_heatmaps.png"),
                         "plot_correlation_heatmaps or calculate_correlations is false, or no ED scalar correlations were computed",
                     )
-                ed_pattern_correlations = (
-                    ed_real_space_patterns.get("correlations")
-                    if isinstance(ed_real_space_patterns, dict)
-                    else None
+                ed_overlay_status = _plot_step_status(summary, "ed_bond_energy_diagram_png")
+                ed_overlay_reason = (
+                    "spin-vector pattern is drawn in ed_bond_energy_diagram.png above resolved bonds "
+                    "(spin zorder=50, bond zorder=3, white halo enabled)"
                 )
-                ed_reference_site_idx = (
-                    ed_real_space_patterns.get("reference_site_idx")
-                    if isinstance(ed_real_space_patterns, dict)
-                    else None
-                )
-                if (
-                    bool(args.plot_real_space_patterns)
-                    and calculate_real_space_patterns
-                    and isinstance(ed_pattern_correlations, dict)
-                    and ed_reference_site_idx is not None
-                ):
-                    _save_plot_step(
+                if has_ed_spin_pattern_overlay and ed_overlay_status in ("saved", "skipped_exists"):
+                    overlay_diagnostics = summary.setdefault("plot_overlay_diagnostics", {})
+                    if isinstance(overlay_diagnostics, dict):
+                        overlay_diagnostics["ed"] = {
+                            "combined_plot": output_filename("ed_bond_energy_diagram.png"),
+                            "spin_vectors_on_top": True,
+                            "spin_vector_zorder": 50,
+                            "resolved_bond_zorder": 3,
+                            "white_halo": True,
+                        }
+                    _record_combined_plot_alias(
                         summary,
                         args.output_folder,
                         "ed_spin_real_space_pattern_png",
-                        output_filename("ed_spin_real_space_pattern.png"),
-                        lambda path: save_real_space_pattern_diagram(
-                            geometry,
-                            ed_pattern_correlations["S"],
-                            int(ed_reference_site_idx),
-                            path,
-                            plot_title("ED Reference-Site Spin Pattern"),
-                            "C_S[j] = <S_ref . S_j>",
-                        ),
-                        overwrite_existing,
-                        continue_on_plot_error,
-                    )
-                    _save_plot_step(
-                        summary,
-                        args.output_folder,
-                        "ed_orbital_real_space_pattern_png",
-                        output_filename("ed_orbital_real_space_pattern.png"),
-                        lambda path: save_real_space_pattern_diagram(
-                            geometry,
-                            ed_pattern_correlations["T"],
-                            int(ed_reference_site_idx),
-                            path,
-                            plot_title("ED Reference-Site Orbital Pattern"),
-                            "C_T[j] = <T_ref . T_j>",
-                        ),
-                        overwrite_existing,
-                        continue_on_plot_error,
-                    )
-                    if "ST" in ed_pattern_correlations:
-                        _save_plot_step(
-                            summary,
-                            args.output_folder,
-                            "ed_mixed_spin_orbital_real_space_pattern_png",
-                            output_filename("ed_mixed_spin_orbital_real_space_pattern.png"),
-                            lambda path: save_real_space_pattern_diagram(
-                                geometry,
-                                ed_pattern_correlations["ST"],
-                                int(ed_reference_site_idx),
-                                path,
-                                plot_title("ED Reference-Site Mixed Spin-Orbital Pattern"),
-                                "C_ST[j] mixed spin-orbital scalar",
-                            ),
-                            overwrite_existing,
-                            continue_on_plot_error,
-                        )
-                else:
-                    _skip_plot_step(
-                        summary,
-                        args.output_folder,
-                        "ed_spin_real_space_pattern_png",
-                        output_filename("ed_spin_real_space_pattern.png"),
-                        "plot_real_space_patterns or calculate_real_space_patterns is false, or no ED pattern correlations were computed",
-                    )
-                    _skip_plot_step(
-                        summary,
-                        args.output_folder,
-                        "ed_orbital_real_space_pattern_png",
-                        output_filename("ed_orbital_real_space_pattern.png"),
-                        "plot_real_space_patterns or calculate_real_space_patterns is false, or no ED pattern correlations were computed",
-                    )
-                    _skip_plot_step(
-                        summary,
-                        args.output_folder,
-                        "ed_mixed_spin_orbital_real_space_pattern_png",
-                        output_filename("ed_mixed_spin_orbital_real_space_pattern.png"),
-                        "plot_real_space_patterns or calculate_real_space_patterns is false, or no ED mixed pattern correlations were computed",
+                        output_filename("ed_bond_energy_diagram.png"),
+                        ed_overlay_reason,
                     )
                 save_flux_crystal_output(
                     summary,
@@ -5396,7 +9711,7 @@ def main() -> None:
                     "ED Plaquette Flux Crystal Pattern",
                 )
                 method_structure_comparison = {
-                    "DMRG": dmrg_structure_factor_rows,
+                    finite_method_label: dmrg_structure_factor_rows,
                     "ED": ed_structure_factor_rows,
                 }
                 idmrg_structure_rows = (
@@ -5406,7 +9721,7 @@ def main() -> None:
                 )
                 if isinstance(idmrg_structure_rows, list) and len(idmrg_structure_rows) > 0:
                     method_structure_comparison["iDMRG-x"] = idmrg_structure_rows
-                if bool(args.plot_structure_factors) and all(len(rows) > 0 for rows in method_structure_comparison.values()):
+                if bool(args.plot_structure_factors) and any(len(rows) > 0 for rows in method_structure_comparison.values()):
                     _save_plot_step(
                         summary,
                         args.output_folder,
@@ -5426,7 +9741,7 @@ def main() -> None:
                         args.output_folder,
                         "dmrg_vs_ed_vs_idmrg_structure_factors_png",
                         output_filename("dmrg_vs_ed_vs_idmrg_structure_factors.png"),
-                        "plot_structure_factors is false or one compared method has no structure rows",
+                        "plot_structure_factors is false or no available method has structure rows",
                     )
             except Exception as exc:
                 summary["ed"] = {
@@ -5440,6 +9755,57 @@ def main() -> None:
             if summary["stages"]["ed"] not in ("failed", "skipped"):
                 summary["stages"]["ed"] = "completed"
         _save_summary_checkpoint(args.output_folder, summary)
+
+    structure_comparison_status = _plot_step_status(summary, "dmrg_vs_ed_vs_idmrg_structure_factors_png")
+    if structure_comparison_status not in ("saved", "skipped_exists") and bool(args.plot_structure_factors):
+        available_structure_comparison: Dict[str, List[Dict[str, Any]]] = {}
+        if isinstance(dmrg_structure_factor_rows, list) and len(dmrg_structure_factor_rows) > 0:
+            available_structure_comparison[finite_method_label] = dmrg_structure_factor_rows
+        ed_structure_rows_from_summary = (
+            summary["ed"].get("structure_factors")
+            if isinstance(summary.get("ed"), dict)
+            else None
+        )
+        if isinstance(ed_structure_rows_from_summary, list) and len(ed_structure_rows_from_summary) > 0:
+            available_structure_comparison["ED"] = ed_structure_rows_from_summary
+        idmrg_structure_rows_from_summary = (
+            summary["idmrg"].get("structure_factors")
+            if isinstance(summary.get("idmrg"), dict)
+            else None
+        )
+        if isinstance(idmrg_structure_rows_from_summary, list) and len(idmrg_structure_rows_from_summary) > 0:
+            available_structure_comparison["iDMRG-x"] = idmrg_structure_rows_from_summary
+        if any(len(rows) > 0 for rows in available_structure_comparison.values()):
+            _save_plot_step(
+                summary,
+                args.output_folder,
+                "dmrg_vs_ed_vs_idmrg_structure_factors_png",
+                output_filename("dmrg_vs_ed_vs_idmrg_structure_factors.png"),
+                lambda path: save_multi_method_structure_comparison(
+                    method_to_rows=available_structure_comparison,
+                    filepath=path,
+                    title_label=run_plot_title_label,
+                    title="Available Method Structure Factors",
+                ),
+                overwrite_existing,
+                continue_on_plot_error,
+            )
+        else:
+            _skip_plot_step(
+                summary,
+                args.output_folder,
+                "dmrg_vs_ed_vs_idmrg_structure_factors_png",
+                output_filename("dmrg_vs_ed_vs_idmrg_structure_factors.png"),
+                "plot_structure_factors is true, but no completed method produced structure rows",
+            )
+    elif structure_comparison_status is None and not bool(args.plot_structure_factors):
+        _skip_plot_step(
+            summary,
+            args.output_folder,
+            "dmrg_vs_ed_vs_idmrg_structure_factors_png",
+            output_filename("dmrg_vs_ed_vs_idmrg_structure_factors.png"),
+            "plot_structure_factors is false",
+        )
 
     def _missing_dmrg_excited_search(reason: str) -> Dict[str, Any]:
         return {
@@ -5473,10 +9839,10 @@ def main() -> None:
             dmrg_excited_search = _missing_dmrg_excited_search(
                 "Sz-conserved bitwise ED is not used as the finite-DMRG excited-state guide."
             )
-        elif backend_used != "tenax":
+        elif not str(backend_used).startswith("tenax"):
             summary["stages"]["dmrg_excited_state_search"] = "skipped"
             dmrg_excited_search = _missing_dmrg_excited_search(
-                "finite-DMRG penalty excited-state search requires the Tenax MPS/MPO backend"
+                f"{finite_method_label} penalty excited-state search requires the Tenax MPS/MPO backend"
             )
         elif dmrg_state_obj is None or tenax_mpo is None:
             summary["stages"]["dmrg_excited_state_search"] = "skipped"
@@ -5527,7 +9893,7 @@ def main() -> None:
             _save_summary_checkpoint(args.output_folder, summary)
 
     method_energy_comparison = {
-        "DMRG": float(summary["dmrg"]["energy_per_site"]),
+        finite_method_label: float(summary["dmrg"]["energy_per_site"]),
     }
     if (
         isinstance(summary.get("ed"), dict)
@@ -5547,6 +9913,17 @@ def main() -> None:
         and idmrg_energy_per_site is not None
     ):
         method_energy_comparison["iDMRG-x"] = idmrg_energy_per_site
+    ipeps_energy_per_site = _finite_float_from_mapping(
+        summary.get("ipeps"),
+        "ground_state_energy_per_site",
+        "energy_per_site",
+    )
+    if (
+        isinstance(summary.get("ipeps"), dict)
+        and summary["ipeps"].get("status") == "completed"
+        and ipeps_energy_per_site is not None
+    ):
+        method_energy_comparison["iPEPS"] = ipeps_energy_per_site
     if bool(args.plot_energy_comparison):
         _save_plot_step(
             summary,
@@ -5556,7 +9933,7 @@ def main() -> None:
             lambda path: save_multi_method_energy_comparison(
                 method_to_energy=method_energy_comparison,
                 filepath=path,
-                title="Finite DMRG vs ED vs iDMRG-x Energy Per Site",
+                title="Available Method Energy Per Site",
                 title_label=run_plot_title_label,
             ),
             overwrite_existing or "iDMRG-x" in method_energy_comparison,
@@ -5569,6 +9946,56 @@ def main() -> None:
             "dmrg_vs_ed_vs_idmrg_energy_png",
             output_filename("dmrg_vs_ed_vs_idmrg_energy.png"),
             "plot_energy_comparison is false",
+        )
+
+    quimb_comparison_key = "ipeps" if primary_is_ipeps else ("peps" if finite_is_peps else None)
+    if (
+        quimb_comparison_key is not None
+        and isinstance(summary.get(quimb_comparison_key), dict)
+    ):
+        peps_plot_payload = dict(summary[quimb_comparison_key])
+        peps_plot_payload.setdefault("alpha", float(args.alpha))
+        peps_plot_payload.setdefault("beta", float(args.beta))
+        if isinstance(summary.get("dmrg"), dict):
+            peps_plot_payload.setdefault("energy_per_site", summary["dmrg"].get("energy_per_site"))
+        ed_plot_payload = (
+            dict(summary["ed"])
+            if isinstance(summary.get("ed"), dict) and summary["ed"].get("status") == "completed"
+            else {}
+        )
+        if ed_plot_payload:
+            ed_plot_payload.setdefault("alpha", float(args.alpha))
+            ed_plot_payload.setdefault("beta", float(args.beta))
+        comparison_title = (
+            "iPEPS Benchmark With Available ED Reference"
+            if primary_is_ipeps
+            else "Finite PEPS Benchmark With Available ED Reference"
+        )
+        comparison_filename = "ipeps_vs_ed_comparison.png" if primary_is_ipeps else "peps_vs_ed_comparison.png"
+        _save_plot_step(
+            summary,
+            args.output_folder,
+            f"{quimb_comparison_key}_vs_ed_comparison_png",
+            output_filename(comparison_filename),
+            lambda path, peps_payload=peps_plot_payload, ed_payload=ed_plot_payload, label=finite_method_label, title=comparison_title: plot_peps_vs_ed_comparison(
+                peps_results=peps_payload,
+                ed_results=ed_payload,
+                filepath=path,
+                title=title,
+                title_label=run_plot_title_label,
+                peps_label=label,
+                ed_label="ED",
+            ),
+            True,
+            continue_on_plot_error,
+        )
+    elif quimb_comparison_key is not None:
+        _skip_plot_step(
+            summary,
+            args.output_folder,
+            f"{quimb_comparison_key}_vs_ed_comparison_png",
+            output_filename("ipeps_vs_ed_comparison.png" if primary_is_ipeps else "peps_vs_ed_comparison.png"),
+            "PEPS/iPEPS result was not available, so no comparison plot could be written.",
         )
 
     dmrg_excited_result = (
@@ -5605,7 +10032,7 @@ def main() -> None:
         else ("ed_guided" if dmrg_ed_degeneracy is not None else "not_resolved")
     )
     method_spectrum_comparison: Dict[str, Dict[str, Any]] = {
-        "DMRG": {
+        finite_method_label: {
             "status": (
                 "completed"
                 if isinstance(dmrg_excited_result, dict)
@@ -5645,7 +10072,7 @@ def main() -> None:
             "spectral_gap": dmrg_gap,
             "excited_state_search": dmrg_excited_result,
             "note": (
-                "Finite-DMRG first-excited energy and gap are reported only when "
+                f"{finite_method_label} first-excited energy and gap are reported only when "
                 "the penalty-state search finds a distinct low-variance state "
                 "orthogonal to the ED-guided ground manifold."
             ),
@@ -5796,6 +10223,12 @@ def main() -> None:
                     ground_manifold_abs_tol=float(args.ed_ground_manifold_abs_tol),
                     ground_manifold_rel_tol=float(args.ed_ground_manifold_rel_tol),
                 )
+                thermal_results["symmetry_reductions"] = symmetry_reduction_settings
+                thermal_results["symmetry_note"] = (
+                    "Finite-temperature ED uses the full Hilbert trace unless a future implementation "
+                    "explicitly sums over all conserved sectors; a single Tz sector would not represent "
+                    "the thermal ensemble."
+                )
                 zero_temperature_references = thermal_results.setdefault("zero_temperature_references", {})
                 if not isinstance(zero_temperature_references, dict):
                     zero_temperature_references = {}
@@ -5920,10 +10353,15 @@ def main() -> None:
         summary["stages"]["phase_scan"] = "running"
         _save_summary_checkpoint(args.output_folder, summary)
         try:
-            phase_scan_data = run_requested_phase_scan_for_geometry(geometry)
+            phase_scan_data = run_requested_phase_scan_for_geometry(
+                geometry,
+                incremental_summary_obj=summary,
+            )
             summary["phase_scan"] = phase_scan_data
             summary["stages"]["phase_scan"] = "completed"
             save_phase_scan_outputs(summary, phase_scan_data, geometry)
+            if _attach_plot_output_warnings(summary, "phase_scan"):
+                summary["stages"]["phase_scan"] = "completed_with_warnings"
         except Exception as exc:
             error_text = str(exc) or exc.__class__.__name__
             summary["phase_scan"] = {"status": "failed", "error": error_text}
@@ -5932,13 +10370,9 @@ def main() -> None:
                 raise
         _save_summary_checkpoint(args.output_folder, summary)
 
-    failed_outputs = [
-        key
-        for key, item in summary.get("output_status", {}).items()
-        if isinstance(item, dict) and item.get("status") == "failed"
-    ]
+    output_warning_keys = _attach_plot_output_warnings(summary, "phase_scan")
     if (
-        failed_outputs
+        output_warning_keys
         or (isinstance(summary.get("ed"), dict) and summary["ed"].get("status") == "failed")
         or (isinstance(summary.get("idmrg"), dict) and summary["idmrg"].get("status") == "failed")
         or (
@@ -5953,6 +10387,7 @@ def main() -> None:
         summary["run_status"] = "completed_with_warnings"
     else:
         summary["run_status"] = "completed"
+    finalize_summary_with_profiling(summary)
     _save_summary_checkpoint(args.output_folder, summary)
     print(
         "[run] finished: "

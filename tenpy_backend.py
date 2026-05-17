@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""TeNPy U(1)-symmetric site/model template for the spin-orbital Yao-Lee model.
+"""TeNPy site/model template for the spin-orbital Yao-Lee model.
 
 The physical local basis is fixed to
 
-    0: Sdown_Odown
-    1: Sdown_Oup
-    2: Sup_Odown
-    3: Sup_Oup
+    0: Sup_Oup
+    1: Sup_Odown
+    2: Sdown_Oup
+    3: Sdown_Odown
 
-The conserved TeNPy charge is ``2*Sz`` with local charges ``[-1, -1, +1, +1]``.
-Orbital operators are neutral and may freely mix ``Odown``/``Oup``.
+For the Yao-Lee model the safe conserved TeNPy charge is ``2*Tz`` with local
+charges ``[+1, -1, +1, -1]``. Spin operators are neutral under this orbital
+U(1), including Hamiltonian Zeeman terms that act only on spin.
 """
 
 from __future__ import annotations
@@ -39,9 +40,13 @@ from tenpy.networks.site import Site
 try:
     from models import (
         GeometryData,
+        _normalize_symmetry_mode,
+        _u1_phys_charges_for_model,
+        _validate_symmetry_conserving_terms,
         all_high_symmetry_structure_factors as _models_all_high_symmetry_structure_factors,
         build_honeycomb_cylinder_geometry,
         build_model_spec,
+        build_site_ops,
         honeycomb_plaquette_flux_operators,
         plaquette_flux_close_to_target,
         select_honeycomb_plaquette_flux_operator,
@@ -54,9 +59,13 @@ try:
 except Exception:  # pragma: no cover - useful if this file is imported as a package module.
     from .models import (  # type: ignore
         GeometryData,
+        _normalize_symmetry_mode,
+        _u1_phys_charges_for_model,
+        _validate_symmetry_conserving_terms,
         all_high_symmetry_structure_factors as _models_all_high_symmetry_structure_factors,
         build_honeycomb_cylinder_geometry,
         build_model_spec,
+        build_site_ops,
         honeycomb_plaquette_flux_operators,
         plaquette_flux_close_to_target,
         select_honeycomb_plaquette_flux_operator,
@@ -73,6 +82,12 @@ ENTROPY_ORDERS = (1, 2, 3, 4)
 _TENPY_PROGRESS_LOGGING_CONFIGURED = False
 _TENPY_SWEEP_PROGRESS_BAR: Any | None = None
 _TENPY_SWEEP_PROGRESS_LAST = 0
+TENPY_STABLE_MIN_SWEEPS = 60
+# For TwoSiteDMRGEngine, TeNPy maps mixer=True to DensityMatrixMixer, so name
+# SubspaceExpansion explicitly to get the requested subspace-expansion mixer.
+TENPY_STABLE_MIXER = "SubspaceExpansion"
+TENPY_STABLE_MIXER_PARAMS = {"amplitude": 1.0e-4, "decay": 1.2, "disable_after": 40}
+TENPY_STABLE_TRUNC_CUT = 1.0e-8
 
 
 class _SuppressTenpyParameterReadFilter(logging.Filter):
@@ -129,6 +144,7 @@ class _ConciseTenpyProgressFilter(logging.Filter):
                         postfix["Smax"] = entropy_match.group(1).strip()
                     if postfix:
                         _TENPY_SWEEP_PROGRESS_BAR.set_postfix(postfix, refresh=True)
+                    return False
                 record.name = "tenpy-dmrg"
                 record.msg = "checkpoint: " + ", ".join(pieces)
                 record.args = ()
@@ -221,7 +237,7 @@ def _start_tenpy_sweep_progress(enabled: bool, total_sweeps: int, desc: str) -> 
         total=max(1, int(total_sweeps)),
         desc=desc,
         unit="sweep",
-        leave=False,
+        leave=True,
     )
     return _TENPY_SWEEP_PROGRESS_BAR
 
@@ -230,10 +246,70 @@ def _finish_tenpy_sweep_progress(progress_bar: Any | None) -> None:
     """Close the active TeNPy sweep progress bar."""
     global _TENPY_SWEEP_PROGRESS_BAR, _TENPY_SWEEP_PROGRESS_LAST
     if progress_bar is not None:
+        try:
+            if progress_bar.total is not None and int(progress_bar.n) < int(progress_bar.total):
+                progress_bar.total = max(1, int(progress_bar.n))
+            progress_bar.refresh()
+        except Exception:
+            pass
         progress_bar.close()
     if progress_bar is _TENPY_SWEEP_PROGRESS_BAR:
         _TENPY_SWEEP_PROGRESS_BAR = None
         _TENPY_SWEEP_PROGRESS_LAST = 0
+
+
+def _stable_chi_list(max_bond_dimension: int) -> dict[int, int]:
+    """Return a conservative TeNPy chi ramp capped by the requested chi_max."""
+    chi_max = max(1, int(max_bond_dimension))
+    ramp_targets = [32, 64, 96]
+    chi_list: dict[int, int] = {}
+    for sweep, target in zip((0, 10, 20), ramp_targets):
+        chi = min(chi_max, int(target))
+        if len(chi_list) == 0 or chi > max(chi_list.values()):
+            chi_list[int(sweep)] = int(chi)
+    if max(chi_list.values()) < chi_max:
+        chi_list[30] = int(chi_max)
+    return chi_list
+
+
+def _stable_tenpy_dmrg_params(
+    max_bond_dimension: int,
+    requested_sweeps: int,
+    truncation_cutoff: float,
+    svd_min: float | None = None,
+) -> dict[str, Any]:
+    """Build DMRG/iDMRG options with the cylinder-stability settings enabled."""
+    chi_max = max(1, int(max_bond_dimension))
+    max_sweeps = max(TENPY_STABLE_MIN_SWEEPS, int(requested_sweeps))
+    svd_min_value = float(truncation_cutoff) if svd_min is None else float(svd_min)
+    if not np.isfinite(svd_min_value) or svd_min_value < 0.0:
+        raise ValueError(f"svd_min must be a nonnegative finite value; got {svd_min!r}.")
+    trunc_cut = max(float(truncation_cutoff), TENPY_STABLE_TRUNC_CUT)
+    return {
+        "mixer": TENPY_STABLE_MIXER,
+        "mixer_params": dict(TENPY_STABLE_MIXER_PARAMS),
+        "diag_method": "lanczos",
+        "lanczos_params": {"N_min": 2, "N_max": 40},
+        "max_trunc_err": None,
+        "norm_tol": None,
+        "max_sweeps": int(max_sweeps),
+        "N_sweeps_check": 1,
+        "chi_list": _stable_chi_list(chi_max),
+        "trunc_params": {
+            "chi_max": int(chi_max),
+            "svd_min": float(svd_min_value),
+            "trunc_cut": float(trunc_cut),
+        },
+    }
+
+
+def _canonicalize_after_dmrg(psi: MPS) -> str | None:
+    """Force the optimized MPS back into canonical form after TeNPy returns."""
+    try:
+        psi.canonical_form()
+    except Exception as exc:
+        return str(exc)
+    return None
 
 
 def _run_dmrg_with_sweep_progress(
@@ -248,68 +324,195 @@ def _run_dmrg_with_sweep_progress(
     """Run TeNPy DMRG with a tqdm sweep bar driven by checkpoint logs."""
     progress_bar = _start_tenpy_sweep_progress(show_progress, expected_sweeps, desc)
     try:
-        return dmrg.run(psi, model, options)
+        info = dmrg.run(psi, model, options)
+        canonicalization_warning = _canonicalize_after_dmrg(psi)
+        if canonicalization_warning is not None:
+            info["post_run_canonical_form_warning"] = canonicalization_warning
+        return info
     finally:
         _finish_tenpy_sweep_progress(progress_bar)
 
 
+def _tenpy_conserve_from_symmetry_reductions(symmetry_reductions: Any | None = None) -> str | None:
+    """Map the shared symmetry report onto the local TeNPy site charge."""
+    if isinstance(symmetry_reductions, dict):
+        if bool(symmetry_reductions.get("use_tau_z_block", False)):
+            return "Tz"
+        if bool(symmetry_reductions.get("use_sz_block", False)):
+            return "Sz"
+        return None
+    if isinstance(symmetry_reductions, (list, tuple, set)):
+        reductions = {str(item).strip().lower() for item in symmetry_reductions}
+        if reductions.intersection({"tz", "u1_tz", "tau_z"}):
+            return "Tz"
+        if reductions.intersection({"sz", "u1_sz", "spin_z"}):
+            return "Sz"
+    return None
+
+
+def _tenpy_symmetry_mode_from_conserve(conserve: str | None) -> str:
+    if conserve == "Tz":
+        return "u1_tz"
+    if conserve == "Sz":
+        return "u1_sz"
+    return "none"
+
+
+def _yao_lee_auto_terms_for_tenpy_symmetry_check(
+    geometry: GeometryData,
+    alpha: float,
+    beta: float,
+    coupling_j: float,
+    *,
+    infinite_x: bool,
+    external_field_terms: list[tuple[float, str]],
+) -> list[tuple[Any, ...]]:
+    """Build the same Yao-Lee terms used by TeNPy, for shared charge validation."""
+    terms: list[tuple[Any, ...]] = []
+
+    def append_bond_terms(i_site: int, j_site: int, gamma: str) -> None:
+        for coefficient, op_i, op_j in yao_lee_u1_two_site_terms_for_bond(
+            str(gamma),
+            alpha=float(alpha),
+            beta=float(beta),
+            coupling_j=float(coupling_j),
+        ):
+            if abs(complex(coefficient)) <= 1.0e-14:
+                continue
+            if int(i_site) <= int(j_site):
+                terms.append((coefficient, str(op_i), int(i_site), str(op_j), int(j_site)))
+            else:
+                terms.append((coefficient, str(op_j), int(j_site), str(op_i), int(i_site)))
+
+    for bond in geometry.bond_list:
+        append_bond_terms(int(bond.i), int(bond.j), str(bond.gamma))
+    if bool(infinite_x):
+        for i_site, j_site, gamma in infinite_x_boundary_bonds(geometry):
+            append_bond_terms(int(i_site), int(j_site), str(gamma))
+
+    for site in range(int(geometry.number_of_sites)):
+        for coefficient, op_name in external_field_terms:
+            if abs(float(coefficient)) > 1.0e-14:
+                terms.append((float(coefficient), str(op_name), int(site)))
+    return terms
+
+
+def _validated_tenpy_yao_lee_conserve(
+    requested_conserve: str | None,
+    geometry: GeometryData,
+    alpha: float,
+    beta: float,
+    coupling_j: float,
+    *,
+    infinite_x: bool,
+    external_field_terms: list[tuple[float, str]],
+) -> tuple[str | None, list[str]]:
+    """Apply the shared term-level validator to TeNPy's local Yao-Lee charge."""
+    mode = _normalize_symmetry_mode(_tenpy_symmetry_mode_from_conserve(requested_conserve))
+    if mode == "none":
+        return None, []
+    if mode == "u1_sz":
+        return None, [
+            "Requested TeNPy U1_Sz symmetry was dropped: total S^z is not conserved by the Yao-Lee Hamiltonian."
+        ]
+    terms = _yao_lee_auto_terms_for_tenpy_symmetry_check(
+        geometry,
+        alpha,
+        beta,
+        coupling_j,
+        infinite_x=bool(infinite_x),
+        external_field_terms=external_field_terms,
+    )
+    try:
+        _validate_symmetry_conserving_terms(
+            terms,
+            build_site_ops(DEFAULT_MODEL_SPEC),
+            _u1_phys_charges_for_model(DEFAULT_MODEL_SPEC, mode),
+            mode,
+        )
+    except Exception as exc:
+        return None, [
+            f"Requested TeNPy {mode} symmetry is not conserved by the Yao-Lee Hamiltonian; "
+            f"using dense/no-symmetry tensors instead. Validator detail: {exc}"
+        ]
+    return requested_conserve, []
+
+
 class YaoLeeSite(Site):
-    """One d=4 spin-1/2 tensor orbital-1/2 site conserving total spin Sz."""
+    """One d=4 spin-1/2 tensor orbital-1/2 site."""
 
-    state_labels = ["Sdown_Odown", "Sdown_Oup", "Sup_Odown", "Sup_Oup"]
+    state_labels = ["Sup_Oup", "Sup_Odown", "Sdown_Oup", "Sdown_Odown"]
 
-    def __init__(self, conserve: str | None = "Sz", sort_charge: bool = False) -> None:
-        conserve_text = "Sz" if conserve in ("Sz", "sz", "U1", "u1", True) else "None"
-        if conserve_text == "Sz":
+    def __init__(self, conserve: str | None = "Tz", sort_charge: bool = False) -> None:
+        if conserve in ("Tz", "tz", "tau_z", "tau", "U1_Tz", "u1_tz"):
+            conserve_text = "Tz"
+        elif conserve in ("Sz", "sz", "U1", "u1", "U1_Sz", "u1_sz", True):
+            conserve_text = "Sz"
+        else:
+            conserve_text = "None"
+        if conserve_text == "Tz":
+            chinfo = npc.ChargeInfo([1], ["2*Tz"])
+            leg = npc.LegCharge.from_qflat(chinfo, [1, -1, 1, -1])
+        elif conserve_text == "Sz":
             chinfo = npc.ChargeInfo([1], ["2*Sz"])
-            leg = npc.LegCharge.from_qflat(chinfo, [-1, -1, 1, 1])
+            leg = npc.LegCharge.from_qflat(chinfo, [1, 1, -1, -1])
         else:
             leg = npc.LegCharge.from_trivial(4)
 
-        spin_down_up = {
-            "Sp": np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.complex128),
-            "Sm": np.array([[0.0, 1.0], [0.0, 0.0]], dtype=np.complex128),
-            "Sz": np.array([[-0.5, 0.0], [0.0, 0.5]], dtype=np.complex128),
+        spin_up_down = {
+            "Sp": np.array([[0.0, 1.0], [0.0, 0.0]], dtype=np.complex128),
+            "Sm": np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.complex128),
+            "Sz": np.array([[0.5, 0.0], [0.0, -0.5]], dtype=np.complex128),
             "Sx": np.array([[0.0, 0.5], [0.5, 0.0]], dtype=np.complex128),
-            "Sy": np.array([[0.0, 0.5j], [-0.5j, 0.0]], dtype=np.complex128),
+            "Sy": np.array([[0.0, -0.5j], [0.5j, 0.0]], dtype=np.complex128),
         }
-        orbital_down_up = {
-            "tau_p": np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.complex128),
-            "tau_m": np.array([[0.0, 1.0], [0.0, 0.0]], dtype=np.complex128),
-            "tau_z": np.array([[-0.5, 0.0], [0.0, 0.5]], dtype=np.complex128),
+        orbital_up_down = {
+            "tau_p": np.array([[0.0, 1.0], [0.0, 0.0]], dtype=np.complex128),
+            "tau_m": np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.complex128),
+            "tau_z": np.array([[0.5, 0.0], [0.0, -0.5]], dtype=np.complex128),
             "tau_x": np.array([[0.0, 0.5], [0.5, 0.0]], dtype=np.complex128),
-            "tau_y": np.array([[0.0, 0.5j], [-0.5j, 0.0]], dtype=np.complex128),
+            "tau_y": np.array([[0.0, -0.5j], [0.5j, 0.0]], dtype=np.complex128),
         }
         spin_id = np.eye(2, dtype=np.complex128)
         orbital_id = np.eye(2, dtype=np.complex128)
 
         ops: dict[str, np.ndarray] = {
-            "Sp": np.kron(spin_down_up["Sp"], orbital_id),
-            "Sm": np.kron(spin_down_up["Sm"], orbital_id),
-            "Sz": np.kron(spin_down_up["Sz"], orbital_id),
-            "tau_p": np.kron(spin_id, orbital_down_up["tau_p"]),
-            "tau_m": np.kron(spin_id, orbital_down_up["tau_m"]),
-            "tau_z": np.kron(spin_id, orbital_down_up["tau_z"]),
-            "tau_x": np.kron(spin_id, orbital_down_up["tau_x"]),
-            "tau_y": np.kron(spin_id, orbital_down_up["tau_y"]),
+            "Sp": np.kron(spin_up_down["Sp"], orbital_id),
+            "Sm": np.kron(spin_up_down["Sm"], orbital_id),
+            "Sz": np.kron(spin_up_down["Sz"], orbital_id),
+            "tau_p": np.kron(spin_id, orbital_up_down["tau_p"]),
+            "tau_m": np.kron(spin_id, orbital_up_down["tau_m"]),
+            "tau_z": np.kron(spin_id, orbital_up_down["tau_z"]),
         }
+        if conserve_text != "Tz":
+            ops["tau_x"] = np.kron(spin_id, orbital_up_down["tau_x"])
+            ops["tau_y"] = np.kron(spin_id, orbital_up_down["tau_y"])
         if conserve_text != "Sz":
-            ops["Sx"] = np.kron(spin_down_up["Sx"], orbital_id)
-            ops["Sy"] = np.kron(spin_down_up["Sy"], orbital_id)
+            ops["Sx"] = np.kron(spin_up_down["Sx"], orbital_id)
+            ops["Sy"] = np.kron(spin_up_down["Sy"], orbital_id)
         alias_pairs = {
             "Tp": "tau_p",
             "Tm": "tau_m",
             "Tz": "tau_z",
-            "Tx": "tau_x",
-            "Ty": "tau_y",
         }
+        if conserve_text != "Tz":
+            alias_pairs.update(
+                {
+                    "Tx": "tau_x",
+                    "Ty": "tau_y",
+                }
+            )
         for alias, source in alias_pairs.items():
             ops[alias] = ops[source]
 
-        for spin_name in ("Sp", "Sm", "Sz"):
-            for orbital_alias in ("Tx", "Ty", "Tz", "Tp", "Tm"):
+        for spin_name in ("Sp", "Sm", "Sz", "Sx", "Sy"):
+            if spin_name not in ops:
+                continue
+            orbital_aliases = ("Tz", "Tp", "Tm") if conserve_text == "Tz" else ("Tx", "Ty", "Tz", "Tp", "Tm")
+            for orbital_alias in orbital_aliases:
                 ops[f"{spin_name}{orbital_alias}"] = ops[spin_name] @ ops[orbital_alias]
-            for orbital_name in ("tau_x", "tau_y", "tau_z", "tau_p", "tau_m"):
+            orbital_names = ("tau_z", "tau_p", "tau_m") if conserve_text == "Tz" else ("tau_x", "tau_y", "tau_z", "tau_p", "tau_m")
+            for orbital_name in orbital_names:
                 ops[f"{spin_name}_{orbital_name}"] = ops[spin_name] @ ops[orbital_name]
 
         self.conserve = conserve_text
@@ -321,7 +524,7 @@ class YaoLeeSite(Site):
 
 
 class YaoLeeModel(CouplingModel):
-    """Minimal TeNPy CouplingModel, using dense sites when transverse fields require them."""
+    """Minimal TeNPy CouplingModel with dense or total-Tz-conserving Yao-Lee sites."""
 
     def __init__(
         self,
@@ -334,14 +537,32 @@ class YaoLeeModel(CouplingModel):
         sort_charge: bool = False,
         infinite_x: bool = False,
         external_field_terms: list[tuple[float, str]] | None = None,
+        symmetry_reductions: dict[str, Any] | None = None,
     ) -> None:
         field_terms = [
             (float(coefficient), str(op_name))
             for coefficient, op_name in list(external_field_terms or [])
             if abs(float(coefficient)) > 1e-14
         ]
-        field_breaks_spin_u1 = any(op_name in ("Sx", "Sy") for _coefficient, op_name in field_terms)
-        site = YaoLeeSite(conserve=None if field_breaks_spin_u1 else "Sz", sort_charge=sort_charge)
+        requested_conserve = _tenpy_conserve_from_symmetry_reductions(symmetry_reductions)
+        originally_requested_conserve = requested_conserve
+        requested_conserve, symmetry_validation_warnings = _validated_tenpy_yao_lee_conserve(
+            requested_conserve,
+            geometry,
+            alpha,
+            beta,
+            coupling_j,
+            infinite_x=bool(infinite_x),
+            external_field_terms=field_terms,
+        )
+        if originally_requested_conserve is not None and requested_conserve is None and not bool(
+            (symmetry_reductions or {}).get("allow_dense_fallback", True)
+        ):
+            raise NotImplementedError(
+                "TeNPy could not build the requested Yao-Lee symmetry sector and dense fallback is disabled: "
+                + "; ".join(symmetry_validation_warnings or ["unknown symmetry validation failure"])
+            )
+        site = YaoLeeSite(conserve=requested_conserve, sort_charge=sort_charge)
         self.geometry = geometry
         self.alpha = float(alpha)
         self.beta = float(beta)
@@ -361,9 +582,28 @@ class YaoLeeModel(CouplingModel):
                 self._add_yao_lee_bond(i, j, gamma, category=f"YL_{gamma}_xwrap")
 
         self.external_field_terms = field_terms
-        self.spin_u1_conserved = not bool(field_breaks_spin_u1)
-        for coefficient, op_name in self.external_field_terms:
-            self.add_onsite_term(coefficient, 0, op_name, category=f"field_{op_name}")
+        self.spin_u1_conserved = bool(requested_conserve == "Sz")
+        self.tau_z_u1_conserved = bool(requested_conserve == "Tz")
+        self.symmetry_mode = _tenpy_symmetry_mode_from_conserve(requested_conserve)
+        self.symmetry_validation_warnings = list(symmetry_validation_warnings)
+        self.symmetry_reductions = dict(symmetry_reductions or {})
+        self.target_tz2 = int(self.symmetry_reductions.get("target_tz2", 0))
+        self.target_sz2 = int(self.symmetry_reductions.get("target_sz2", 0))
+        if self.tau_z_u1_conserved:
+            adjusted_tz2 = _nearest_reachable_spin_half_total_m2(
+                int(geometry.number_of_sites),
+                self.target_tz2,
+            )
+            if adjusted_tz2 != self.target_tz2:
+                self.symmetry_validation_warnings.append(
+                    f"Requested total 2*Tz={self.target_tz2} is unreachable for "
+                    f"{int(geometry.number_of_sites)} orbital-1/2 sites; using 2*Tz={adjusted_tz2}."
+                )
+                self.target_tz2 = int(adjusted_tz2)
+                self.symmetry_reductions["target_tz2_effective"] = int(adjusted_tz2)
+        for site_index in range(int(self.lat.N_sites)):
+            for coefficient, op_name in self.external_field_terms:
+                self.add_onsite_term(coefficient, site_index, op_name, category=f"field_{op_name}")
 
         self.H_MPO = self.calc_H_MPO()
 
@@ -454,9 +694,83 @@ def sz_zero_product_state_labels(length: int, orbital_label: str = "Odown") -> L
     ]
 
 
+def _spin_labels_for_target_sz2(length: int, target_sz2: int) -> List[str]:
+    n_sites = int(length)
+    if int(target_sz2) == 0 and n_sites % 2 == 0:
+        return ["Sdown" if site % 2 == 0 else "Sup" for site in range(n_sites)]
+    numerator = n_sites + int(target_sz2)
+    if numerator % 2 != 0:
+        raise ValueError(f"Total 2*Sz={int(target_sz2)} is unreachable for {n_sites} spin-1/2 sites.")
+    n_up = numerator // 2
+    if n_up < 0 or n_up > n_sites:
+        raise ValueError(f"Total 2*Sz={int(target_sz2)} is unreachable for {n_sites} spin-1/2 sites.")
+    return ["Sup" if site < n_up else "Sdown" for site in range(n_sites)]
+
+
+def _spin_half_total_m2_is_reachable(length: int, target_m2: int) -> bool:
+    n_sites = int(length)
+    numerator = n_sites + int(target_m2)
+    if numerator % 2 != 0:
+        return False
+    n_up = numerator // 2
+    return 0 <= n_up <= n_sites
+
+
+def _nearest_reachable_spin_half_total_m2(length: int, target_m2: int) -> int:
+    n_sites = int(length)
+    target = int(target_m2)
+    if _spin_half_total_m2_is_reachable(n_sites, target):
+        return target
+    candidates = list(range(-n_sites, n_sites + 1, 2))
+    if not candidates:
+        raise ValueError("No reachable spin-1/2 total charge sectors exist for an empty unit cell.")
+    return min(candidates, key=lambda value: (abs(value - target), abs(value), value))
+
+
+def _orbital_labels_for_target_tz2(length: int, target_tz2: int) -> List[str]:
+    n_sites = int(length)
+    numerator = n_sites + int(target_tz2)
+    if numerator % 2 != 0:
+        raise ValueError(f"Total 2*Tz={int(target_tz2)} is unreachable for {n_sites} orbital-1/2 sites.")
+    n_up = numerator // 2
+    if n_up < 0 or n_up > n_sites:
+        raise ValueError(f"Total 2*Tz={int(target_tz2)} is unreachable for {n_sites} orbital-1/2 sites.")
+    labels: List[str] = []
+    for site in range(n_sites):
+        labels.append("Oup" if site < n_up else "Odown")
+    return labels
+
+
+def charge_target_product_state_labels(model: YaoLeeModel) -> List[str]:
+    """Return a product state in the active TeNPy U(1) charge sector."""
+    n_sites = int(model.lat.N_sites)
+    if str(getattr(model, "symmetry_mode", "none")) == "u1_tz":
+        orbital_labels = _orbital_labels_for_target_tz2(n_sites, int(getattr(model, "target_tz2", 0)))
+        return [
+            f"{'Sdown' if site % 2 == 0 else 'Sup'}_{orbital_labels[site]}"
+            for site in range(n_sites)
+        ]
+    if str(getattr(model, "symmetry_mode", "none")) == "u1_sz":
+        spin_labels = _spin_labels_for_target_sz2(n_sites, int(getattr(model, "target_sz2", 0)))
+        return [f"{spin_labels[site]}_Odown" for site in range(n_sites)]
+    return sz_zero_product_state_labels(n_sites)
+
+
+def _tenpy_u1_target_sector_info(model: YaoLeeModel) -> dict[str, Any] | None:
+    mode = str(getattr(model, "symmetry_mode", "none"))
+    if mode == "u1_tz":
+        target_tz2 = int(getattr(model, "target_tz2", 0))
+        return {"mode": "u1_tz", "total_Tz_times_2": target_tz2, "target_charge": target_tz2}
+    if mode == "u1_sz":
+        target_sz2 = int(getattr(model, "target_sz2", 0))
+        return {"mode": "u1_sz", "total_Sz_times_2": target_sz2, "target_charge": target_sz2}
+    return None
+
+
 def initialize_sz_zero_mps(model: YaoLeeModel, orbital_label: str = "Odown") -> MPS:
-    """Initialize a TeNPy MPS exactly in the total ``Sz=0`` charge sector."""
-    product_state = sz_zero_product_state_labels(model.lat.N_sites, orbital_label=orbital_label)
+    """Initialize a TeNPy MPS in the active charge sector."""
+    del orbital_label
+    product_state = charge_target_product_state_labels(model)
     return MPS.from_product_state(
         model.lat.mps_sites(),
         product_state,
@@ -704,6 +1018,7 @@ def tenpy_backend_template(
     coupling_j: float = 1.0,
     dmrg_options: dict[str, Any] | None = None,
     external_field_terms: list[tuple[float, str]] | None = None,
+    symmetry_reductions: dict[str, Any] | None = None,
 ) -> tuple[YaoLeeModel, MPS, dict[str, Any]]:
     """Small runnable TeNPy template returning ``(model, psi, dmrg_options)``."""
     model = YaoLeeModel(
@@ -712,16 +1027,14 @@ def tenpy_backend_template(
         beta=beta,
         coupling_j=coupling_j,
         external_field_terms=external_field_terms,
+        symmetry_reductions=symmetry_reductions,
     )
     psi = initialize_sz_zero_mps(model)
-    options = {
-        "mixer": None,
-        "diag_method": "lanczos",
-        "trunc_params": {"chi_max": 128, "svd_min": 1.0e-10},
-        "max_trunc_err": None,
-        "norm_tol": None,
-        "max_sweeps": 20,
-    }
+    options = _stable_tenpy_dmrg_params(
+        max_bond_dimension=128,
+        requested_sweeps=TENPY_STABLE_MIN_SWEEPS,
+        truncation_cutoff=TENPY_STABLE_TRUNC_CUT,
+    )
     if dmrg_options:
         options.update(dmrg_options)
     return model, psi, options
@@ -735,11 +1048,13 @@ def run_cylindrical_dmrg(
     max_bond_dimension: int,
     max_sweeps: int,
     truncation_cutoff: float = 1.0e-10,
+    svd_min: float | None = None,
     random_seed: int = 0,
     product_state_style: str = "alternating",
     initial_state: MPS | None = None,
     compute_phase_observables: bool = True,
     external_field_terms: list[tuple[float, str]] | None = None,
+    symmetry_reductions: dict[str, Any] | None = None,
     show_progress: bool = True,
 ) -> tuple[MPS, Any, dict[str, Any]]:
     """Compatibility hook for ``ylmodel_main.py --backend tenpy``."""
@@ -747,10 +1062,25 @@ def run_cylindrical_dmrg(
     stage_start = _start_stage("TeNPy finite DMRG", show_progress)
     _configure_tenpy_progress_logging(show_progress)
     if show_progress:
+        effective_options = _stable_tenpy_dmrg_params(
+            max_bond_dimension=max_bond_dimension,
+            requested_sweeps=max_sweeps,
+            truncation_cutoff=truncation_cutoff,
+            svd_min=svd_min,
+        )
         print(
             "[tenpy-dmrg] setup: "
             f"N={int(geometry.number_of_sites)}, alpha={float(alpha):.8g}, beta={float(beta):.8g}, "
-            f"chi_max={int(max_bond_dimension)}, sweeps={int(max_sweeps)}"
+            f"chi_max={int(max_bond_dimension)}, sweeps={int(effective_options['max_sweeps'])}, "
+            f"svd_min={float(effective_options['trunc_params']['svd_min']):.3g}, "
+            f"mixer={effective_options['mixer']}"
+        )
+    else:
+        effective_options = _stable_tenpy_dmrg_params(
+            max_bond_dimension=max_bond_dimension,
+            requested_sweeps=max_sweeps,
+            truncation_cutoff=truncation_cutoff,
+            svd_min=svd_min,
         )
     model = YaoLeeModel(
         geometry,
@@ -758,25 +1088,10 @@ def run_cylindrical_dmrg(
         beta=beta,
         coupling_j=coupling_j,
         external_field_terms=external_field_terms,
+        symmetry_reductions=symmetry_reductions,
     )
     psi = _copy_initial_state_for_model(model, initial_state)
-    options = {
-        # The TeNPy density-matrix mixer can make rho_L/rho_R ill-conditioned
-        # for this charge-constrained product initialization.  Two-site DMRG
-        # can grow the bond dimension without a mixer, so keep this off unless
-        # a future caller deliberately opts into a custom TeNPy workflow.
-        "mixer": None,
-        "diag_method": "lanczos",
-        "lanczos_params": {"N_min": 2, "N_max": 40},
-        "max_trunc_err": None,
-        "norm_tol": None,
-        "max_sweeps": int(max_sweeps),
-        "N_sweeps_check": 1,
-        "trunc_params": {
-            "chi_max": int(max_bond_dimension),
-            "svd_min": float(truncation_cutoff),
-        },
-    }
+    options = effective_options
     try:
         info = _run_dmrg_with_sweep_progress(
             psi,
@@ -784,7 +1099,7 @@ def run_cylindrical_dmrg(
             options,
             show_progress=show_progress,
             desc="tenpy dmrg sweeps",
-            expected_sweeps=max(1, 2 * int(max_sweeps)),
+            expected_sweeps=max(1, int(options["max_sweeps"])),
         )
     except Exception:
         _end_stage("TeNPy finite DMRG", stage_start, show_progress)
@@ -808,24 +1123,42 @@ def run_cylindrical_dmrg(
     dmrg_info = {
         "E": energy,
         "converged": bool(info.get("shelve", False)) if "converged" not in info else bool(info["converged"]),
-        "symmetry_mode": "u1_sz" if bool(getattr(model, "spin_u1_conserved", True)) else "none",
-        "symmetry_enabled": bool(getattr(model, "spin_u1_conserved", True)),
-        "u1_target_sector": (
-            {"mode": "u1_sz", "total_Sz_times_2": 0, "target_charge": 0}
-            if bool(getattr(model, "spin_u1_conserved", True))
-            else None
+        "symmetry_mode": str(getattr(model, "symmetry_mode", "none")),
+        "symmetry_enabled": bool(
+            getattr(model, "tau_z_u1_conserved", False) or getattr(model, "spin_u1_conserved", False)
         ),
+        "symmetry_backend_status": {
+            "backend": "tenpy",
+            "real_u1_tz": bool(getattr(model, "tau_z_u1_conserved", False)),
+            "real_u1_sz": bool(getattr(model, "spin_u1_conserved", False)),
+            "dense_fallback_used": bool(
+                symmetry_reductions
+                and (
+                    bool(symmetry_reductions.get("use_tau_z_block", False))
+                    or bool(symmetry_reductions.get("use_sz_block", False))
+                )
+                and str(getattr(model, "symmetry_mode", "none")) == "none"
+            ),
+            "z2_block": False,
+        },
+        "symmetry_validation_warnings": list(getattr(model, "symmetry_validation_warnings", [])),
+        "u1_target_sector": _tenpy_u1_target_sector_info(model),
         "initial_state_style": (
             "adiabatic_previous_mps" if initial_state is not None else "alternating_sz_zero_product"
         ),
         "used_adiabatic_initial_state": bool(initial_state is not None),
-        "mixer": None,
+        "mixer": str(options.get("mixer")),
+        "mixer_params": dict(options.get("mixer_params", {})),
         "diag_method": "lanczos",
+        "chi_list": {int(key): int(value) for key, value in options.get("chi_list", {}).items()},
+        "trunc_params": dict(options.get("trunc_params", {})),
+        "max_sweeps": int(options.get("max_sweeps", max_sweeps)),
         "norm_error_after_canonicalization": norm_error_after_canonicalization,
         "external_field_terms": [
             (float(coefficient), str(op_name))
             for coefficient, op_name in list(external_field_terms or [])
         ],
+        "symmetry_reductions": dict(symmetry_reductions or {}),
     }
     if phase_observables is not None:
         dmrg_info["phase_observables"] = phase_observables
@@ -834,6 +1167,8 @@ def run_cylindrical_dmrg(
         dmrg_info["phase_observables_warning"] = phase_observable_warning
     if canonicalization_warning is not None:
         dmrg_info["canonicalization_warning"] = canonicalization_warning
+    if "post_run_canonical_form_warning" in info:
+        dmrg_info["post_run_canonical_form_warning"] = str(info["post_run_canonical_form_warning"])
     _end_stage("TeNPy finite DMRG", stage_start, show_progress)
     return psi, model.H_MPO, dmrg_info
 
@@ -846,9 +1181,11 @@ def run_alpha_scan_with_adiabatic_state_passing(
     max_bond_dimension: int,
     max_sweeps: int,
     truncation_cutoff: float = 1.0e-10,
+    svd_min: float | None = None,
     initial_state: MPS | None = None,
     classifier_thresholds: dict[str, float] | None = None,
     external_field_terms: list[tuple[float, str]] | None = None,
+    symmetry_reductions: dict[str, Any] | None = None,
     show_progress: bool = True,
     progress_bar: Any | None = None,
 ) -> tuple[list[dict[str, Any]], MPS | None]:
@@ -879,9 +1216,11 @@ def run_alpha_scan_with_adiabatic_state_passing(
             max_bond_dimension=int(max_bond_dimension),
             max_sweeps=int(max_sweeps),
             truncation_cutoff=float(truncation_cutoff),
+            svd_min=svd_min,
             initial_state=previous_psi,
             compute_phase_observables=True,
             external_field_terms=external_field_terms,
+            symmetry_reductions=symmetry_reductions,
             show_progress=show_progress,
         )
         structure_rows: list[dict[str, Any]] = []
@@ -930,6 +1269,13 @@ def run_alpha_scan_with_adiabatic_state_passing(
                 "used_adiabatic_initial_state": bool(used_adiabatic_state),
                 "observables": info.get("phase_observables", {}),
                 "all_plaquette_fluxes": (info.get("phase_observables") or {}).get("all_plaquette_fluxes", {}),
+                "dmrg_options": {
+                    "symmetry_reductions": dict(symmetry_reductions or {}),
+                    "symmetry_mode": str(info.get("symmetry_mode", "none")),
+                    "symmetry_backend_status": dict(info.get("symmetry_backend_status", {})),
+                    "trunc_params": dict(info.get("trunc_params", {})),
+                    "max_sweeps": int(info.get("max_sweeps", max_sweeps)),
+                },
                 "phase_label": phase_label,
                 "diagnostics": diagnostics,
                 "structure_factors": structure_rows,
@@ -951,9 +1297,11 @@ def run_alpha_beta_dmrg_observable_scan(
     max_bond_dimension: int,
     max_sweeps: int,
     truncation_cutoff: float = 1.0e-10,
+    svd_min: float | None = None,
     carry_state_between_betas: bool = False,
     classifier_thresholds: dict[str, float] | None = None,
     external_field_terms: list[tuple[float, str]] | None = None,
+    symmetry_reductions: dict[str, Any] | None = None,
     show_progress: bool = True,
 ) -> dict[str, Any]:
     """Run a TeNPy DMRG observable scan over beta rows and alpha columns."""
@@ -976,9 +1324,11 @@ def run_alpha_beta_dmrg_observable_scan(
             max_bond_dimension=int(max_bond_dimension),
             max_sweeps=int(max_sweeps),
             truncation_cutoff=float(truncation_cutoff),
+            svd_min=svd_min,
             initial_state=beta_initial_state,
             classifier_thresholds=classifier_thresholds,
             external_field_terms=external_field_terms,
+            symmetry_reductions=symmetry_reductions,
             show_progress=False,
             progress_bar=progress_bar,
         )
@@ -1011,9 +1361,11 @@ def run_alpha_scan_idmrg_with_adiabatic_state_passing(
     max_bond_dimension: int,
     max_iterations: int,
     truncation_cutoff: float = 1.0e-10,
+    svd_min: float | None = None,
     initial_state: MPS | None = None,
     classifier_thresholds: dict[str, float] | None = None,
     external_field_terms: list[tuple[float, str]] | None = None,
+    symmetry_reductions: dict[str, Any] | None = None,
     show_progress: bool = True,
     progress_bar: Any | None = None,
 ) -> tuple[list[dict[str, Any]], MPS | None]:
@@ -1036,21 +1388,15 @@ def run_alpha_scan_idmrg_with_adiabatic_state_passing(
             bc_MPS="infinite",
             infinite_x=True,
             external_field_terms=external_field_terms,
+            symmetry_reductions=symmetry_reductions,
         )
         psi = _copy_initial_state_for_model(model, previous_psi)
-        options = {
-            "mixer": None,
-            "diag_method": "lanczos",
-            "lanczos_params": {"N_min": 2, "N_max": 40},
-            "max_trunc_err": None,
-            "norm_tol": None,
-            "max_sweeps": int(max_iterations),
-            "N_sweeps_check": 1,
-            "trunc_params": {
-                "chi_max": int(max_bond_dimension),
-                "svd_min": float(truncation_cutoff),
-            },
-        }
+        options = _stable_tenpy_dmrg_params(
+            max_bond_dimension=max_bond_dimension,
+            requested_sweeps=max_iterations,
+            truncation_cutoff=truncation_cutoff,
+            svd_min=svd_min,
+        )
         try:
             info = _run_dmrg_with_sweep_progress(
                 psi,
@@ -1058,7 +1404,7 @@ def run_alpha_scan_idmrg_with_adiabatic_state_passing(
                 options,
                 show_progress=show_progress,
                 desc="tenpy idmrg scan sweeps",
-                expected_sweeps=max(1, 2 * int(max_iterations)),
+                expected_sweeps=max(1, int(options["max_sweeps"])),
             )
         except Exception:
             _end_stage("TeNPy iDMRG point", point_stage, show_progress)
@@ -1111,6 +1457,29 @@ def run_alpha_scan_idmrg_with_adiabatic_state_passing(
                 "used_adiabatic_initial_state": bool(used_adiabatic_state),
                 "observables": observables,
                 "all_plaquette_fluxes": observables.get("all_plaquette_fluxes", {}),
+                "dmrg_options": {
+                    "symmetry_reductions": dict(symmetry_reductions or {}),
+                    "symmetry_mode": str(getattr(model, "symmetry_mode", "none")),
+                    "symmetry_backend_status": {
+                        "backend": "tenpy",
+                        "real_u1_tz": bool(getattr(model, "tau_z_u1_conserved", False)),
+                        "dense_fallback_used": bool(
+                            symmetry_reductions
+                            and bool(symmetry_reductions.get("use_tau_z_block", False))
+                            and str(getattr(model, "symmetry_mode", "none")) == "none"
+                        ),
+                        "z2_block": False,
+                    },
+                    "mixer": str(options.get("mixer")),
+                    "mixer_params": dict(options.get("mixer_params", {})),
+                    "chi_list": {
+                        int(key): int(value)
+                        for key, value in options.get("chi_list", {}).items()
+                    },
+                    "trunc_params": dict(options.get("trunc_params", {})),
+                    "max_sweeps": int(options.get("max_sweeps", max_iterations)),
+                },
+                "post_run_canonical_form_warning": info.get("post_run_canonical_form_warning"),
                 "phase_label": phase_label,
                 "diagnostics": diagnostics,
                 "structure_factors": structure_rows,
@@ -1131,13 +1500,30 @@ def run_alpha_beta_idmrg_observable_scan(
     coupling_j: float,
     max_bond_dimension: int,
     max_iterations: int,
+    max_unit_cell_sites: int | None = None,
     truncation_cutoff: float = 1.0e-10,
+    svd_min: float | None = None,
     carry_state_between_betas: bool = False,
     classifier_thresholds: dict[str, float] | None = None,
     external_field_terms: list[tuple[float, str]] | None = None,
+    symmetry_reductions: dict[str, Any] | None = None,
     show_progress: bool = True,
 ) -> dict[str, Any]:
     """Run a TeNPy iDMRG observable scan over beta rows and alpha columns."""
+    if max_unit_cell_sites is not None and int(geometry.number_of_sites) > int(max_unit_cell_sites):
+        return {
+            "status": "skipped",
+            "backend": "tenpy",
+            "scan_type": "idmrg_observable_scan",
+            "reason": (
+                f"TeNPy iDMRG unit-cell safety cap is N <= {int(max_unit_cell_sites)}, "
+                f"but geometry has N={int(geometry.number_of_sites)}."
+            ),
+            "rows": [],
+            "completed_points": 0,
+            "failed_points": 0,
+            "skipped_points": int(len(alpha_values) * len(beta_values)),
+        }
     stage_start = _start_stage("TeNPy iDMRG phase scan", show_progress)
     all_rows: list[dict[str, Any]] = []
     beta_initial_state: MPS | None = None
@@ -1157,9 +1543,11 @@ def run_alpha_beta_idmrg_observable_scan(
             max_bond_dimension=int(max_bond_dimension),
             max_iterations=int(max_iterations),
             truncation_cutoff=float(truncation_cutoff),
+            svd_min=svd_min,
             initial_state=beta_initial_state,
             classifier_thresholds=classifier_thresholds,
             external_field_terms=external_field_terms,
+            symmetry_reductions=symmetry_reductions,
             show_progress=False,
             progress_bar=progress_bar,
         )
@@ -1181,6 +1569,10 @@ def run_alpha_beta_idmrg_observable_scan(
         "alpha_values": [float(value) for value in alpha_values],
         "beta_values": [float(value) for value in beta_values],
         "rows": all_rows,
+        "translation_symmetry": {
+            "enabled": True,
+            "implemented_as": "infinite repeated MPS unit cell along x",
+        },
     }
 
 
@@ -1275,23 +1667,33 @@ def run_cylindrical_idmrg(
     max_bond_dimension: int,
     max_iterations: int,
     truncation_cutoff: float = 1.0e-10,
+    svd_min: float | None = None,
     random_seed: int = 0,
     product_state_style: str = "alternating",
     compute_entanglement: bool = True,
     compute_phase_observables: bool = True,
     initial_state: MPS | None = None,
     external_field_terms: list[tuple[float, str]] | None = None,
+    symmetry_reductions: dict[str, Any] | None = None,
     show_progress: bool = True,
 ) -> dict[str, Any]:
     """Run TeNPy infinite-DMRG along x with one finite cylinder as the unit cell."""
     del random_seed, product_state_style
     stage_start = _start_stage("TeNPy iDMRG-x", show_progress)
     _configure_tenpy_progress_logging(show_progress)
+    options = _stable_tenpy_dmrg_params(
+        max_bond_dimension=max_bond_dimension,
+        requested_sweeps=max_iterations,
+        truncation_cutoff=truncation_cutoff,
+        svd_min=svd_min,
+    )
     if show_progress:
         print(
             "[tenpy-idmrg] setup: "
             f"N_unit_cell={int(geometry.number_of_sites)}, alpha={float(alpha):.8g}, beta={float(beta):.8g}, "
-            f"chi_max={int(max_bond_dimension)}, iterations={int(max_iterations)}"
+            f"chi_max={int(max_bond_dimension)}, iterations={int(options['max_sweeps'])}, "
+            f"svd_min={float(options['trunc_params']['svd_min']):.3g}, "
+            f"mixer={options['mixer']}"
         )
     model = YaoLeeModel(
         geometry,
@@ -1301,21 +1703,9 @@ def run_cylindrical_idmrg(
         bc_MPS="infinite",
         infinite_x=True,
         external_field_terms=external_field_terms,
+        symmetry_reductions=symmetry_reductions,
     )
     psi = _copy_initial_state_for_model(model, initial_state)
-    options = {
-        "mixer": None,
-        "diag_method": "lanczos",
-        "lanczos_params": {"N_min": 2, "N_max": 40},
-        "max_trunc_err": None,
-        "norm_tol": None,
-        "max_sweeps": int(max_iterations),
-        "N_sweeps_check": 1,
-        "trunc_params": {
-            "chi_max": int(max_bond_dimension),
-            "svd_min": float(truncation_cutoff),
-        },
-    }
     try:
         info = _run_dmrg_with_sweep_progress(
             psi,
@@ -1323,7 +1713,7 @@ def run_cylindrical_idmrg(
             options,
             show_progress=show_progress,
             desc="tenpy idmrg sweeps",
-            expected_sweeps=max(1, 2 * int(max_iterations)),
+            expected_sweeps=max(1, int(options["max_sweeps"])),
         )
     except Exception:
         _end_stage("TeNPy iDMRG-x", stage_start, show_progress)
@@ -1363,6 +1753,10 @@ def run_cylindrical_idmrg(
         "energy_per_original_site": energy_density,
         "energy_per_unit_cell": energy_density * float(geometry.number_of_sites),
         "unit_cell_sites": int(geometry.number_of_sites),
+        "translation_symmetry": {
+            "enabled": True,
+            "implemented_as": "infinite repeated MPS unit cell along x",
+        },
         "infinite_x_boundary_bonds": [
             {"i": int(i), "j": int(j), "gamma": str(gamma)}
             for i, j, gamma in infinite_x_boundary_bonds(geometry)
@@ -1370,10 +1764,32 @@ def run_cylindrical_idmrg(
         "info": {
             "E": energy_density,
             "shelve": bool(info.get("shelve", False)),
-            "symmetry_mode": "u1_sz",
-            "max_sweeps": int(max_iterations),
+            "symmetry_mode": str(getattr(model, "symmetry_mode", "none")),
+            "symmetry_reductions": dict(symmetry_reductions or {}),
+            "symmetry_backend_status": {
+                "backend": "tenpy",
+                "real_u1_tz": bool(getattr(model, "tau_z_u1_conserved", False)),
+                "real_u1_sz": bool(getattr(model, "spin_u1_conserved", False)),
+                "dense_fallback_used": bool(
+                    symmetry_reductions
+                    and (
+                        bool(symmetry_reductions.get("use_tau_z_block", False))
+                        or bool(symmetry_reductions.get("use_sz_block", False))
+                    )
+                    and str(getattr(model, "symmetry_mode", "none")) == "none"
+                ),
+                "z2_block": False,
+            },
+            "symmetry_validation_warnings": list(getattr(model, "symmetry_validation_warnings", [])),
+            "u1_target_sector": _tenpy_u1_target_sector_info(model),
+            "max_sweeps": int(options.get("max_sweeps", max_iterations)),
             "max_bond_dimension": int(max_bond_dimension),
+            "mixer": str(options.get("mixer")),
+            "mixer_params": dict(options.get("mixer_params", {})),
+            "chi_list": {int(key): int(value) for key, value in options.get("chi_list", {}).items()},
+            "trunc_params": dict(options.get("trunc_params", {})),
             "used_adiabatic_initial_state": bool(initial_state is not None),
+            "post_run_canonical_form_warning": info.get("post_run_canonical_form_warning"),
         },
         "entanglement_status": entanglement_status,
     }
@@ -1393,6 +1809,14 @@ def run_cylindrical_idmrg(
 def _mps_corr(psi: MPS, op_i: str, i: int, op_j: str, j: int) -> complex:
     value = psi.correlation_function(op_i, op_j, sites1=[int(i)], sites2=[int(j)])
     return complex(np.asarray(value).reshape(-1)[0])
+
+
+def _mps_has_operator(psi: MPS, op_name: str) -> bool:
+    try:
+        psi.sites[0].get_op(str(op_name))
+        return True
+    except Exception:
+        return False
 
 
 def collect_correlation_matrices_from_dmrg(psi: MPS, show_progress: bool = False) -> dict[str, np.ndarray]:
@@ -1421,6 +1845,7 @@ def collect_correlation_matrices_from_dmrg(psi: MPS, show_progress: bool = False
         unit="pair",
         leave=False,
     )
+    has_tx_ty = _mps_has_operator(psi, "Tx") and _mps_has_operator(psi, "Ty")
     for i in range(n_sites):
         for j in range(n_sites):
             if i == j:
@@ -1431,18 +1856,43 @@ def collect_correlation_matrices_from_dmrg(psi: MPS, show_progress: bool = False
             correlations["Sx_Sx"][i, j] = transverse_spin
             correlations["Sy_Sy"][i, j] = transverse_spin
             correlations["Sz_Sz"][i, j] = _mps_corr(psi, "Sz", i, "Sz", j)
-            for axis, op in (("x", "Tx"), ("y", "Ty"), ("z", "Tz")):
-                correlations[f"T{axis}_T{axis}"][i, j] = _mps_corr(psi, op, i, op, j)
-                sp_t = f"SpT{axis}"
-                sm_t = f"SmT{axis}"
-                sz_t = f"SzT{axis}"
-                mixed_transverse = 0.25 * (
-                    _mps_corr(psi, sp_t, i, sm_t, j)
-                    + _mps_corr(psi, sm_t, i, sp_t, j)
+            if has_tx_ty:
+                axis_ops = (("x", "Tx"), ("y", "Ty"), ("z", "Tz"))
+                for axis, op in axis_ops:
+                    correlations[f"T{axis}_T{axis}"][i, j] = _mps_corr(psi, op, i, op, j)
+                    sp_t = f"SpT{axis}"
+                    sm_t = f"SmT{axis}"
+                    sz_t = f"SzT{axis}"
+                    mixed_transverse = 0.25 * (
+                        _mps_corr(psi, sp_t, i, sm_t, j)
+                        + _mps_corr(psi, sm_t, i, sp_t, j)
+                    )
+                    correlations[f"SxT{axis}_SxT{axis}"][i, j] = mixed_transverse
+                    correlations[f"SyT{axis}_SyT{axis}"][i, j] = mixed_transverse
+                    correlations[f"SzT{axis}_SzT{axis}"][i, j] = _mps_corr(psi, sz_t, i, sz_t, j)
+            else:
+                orbital_transverse = 0.25 * (
+                    _mps_corr(psi, "Tp", i, "Tm", j)
+                    + _mps_corr(psi, "Tm", i, "Tp", j)
                 )
-                correlations[f"SxT{axis}_SxT{axis}"][i, j] = mixed_transverse
-                correlations[f"SyT{axis}_SyT{axis}"][i, j] = mixed_transverse
-                correlations[f"SzT{axis}_SzT{axis}"][i, j] = _mps_corr(psi, sz_t, i, sz_t, j)
+                correlations["Tx_Tx"][i, j] = orbital_transverse
+                correlations["Ty_Ty"][i, j] = orbital_transverse
+                correlations["Tz_Tz"][i, j] = _mps_corr(psi, "Tz", i, "Tz", j)
+                for orbital_axis in ("x", "y"):
+                    for spin_axis in ("x", "y", "z"):
+                        mixed = 0.25 * (
+                            _mps_corr(psi, f"S{spin_axis}Tp", i, f"S{spin_axis}Tm", j)
+                            + _mps_corr(psi, f"S{spin_axis}Tm", i, f"S{spin_axis}Tp", j)
+                        )
+                        correlations[f"S{spin_axis}T{orbital_axis}_S{spin_axis}T{orbital_axis}"][i, j] = mixed
+                for spin_axis in ("x", "y", "z"):
+                    correlations[f"S{spin_axis}Tz_S{spin_axis}Tz"][i, j] = _mps_corr(
+                        psi,
+                        f"S{spin_axis}Tz",
+                        i,
+                        f"S{spin_axis}Tz",
+                        j,
+                    )
             if progress_bar is not None:
                 progress_bar.update(1)
     if progress_bar is not None:

@@ -60,6 +60,148 @@ U1_TARGET_TOTAL_TZ2 = U1_TARGET_TOTAL_TZ2_DEFAULT
 Z2_TARGET_PARITY = Z2_TARGET_PARITY_DEFAULT
 STRICT_SYMMETRY_SELECTION_RULES = STRICT_SYMMETRY_SELECTION_RULES_DEFAULT
 SYMMETRY_ALLOW_DENSE_FALLBACK = SYMMETRY_ALLOW_DENSE_FALLBACK_DEFAULT
+TENAX_WARMUP_CHI_TARGETS = (32, 64, 96)
+TENAX_WARMUP_STEP_SPACING = 10
+
+
+def _callable_accepts_keyword(callable_obj: Any, keyword: str) -> bool:
+    try:
+        parameters = inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return False
+    return str(keyword) in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+
+def _filter_supported_kwargs(callable_obj: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        parameters = inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return dict(kwargs)
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return dict(kwargs)
+    return {
+        key: value
+        for key, value in kwargs.items()
+        if key in parameters
+    }
+
+
+def _add_supported_truncation_kwargs(
+    config_cls: Any,
+    config_kwargs: Dict[str, Any],
+    *,
+    svd_min: float | None,
+    truncation_cutoff: float | None,
+) -> None:
+    """Pass truncation thresholds only when the installed Tenax config exposes them."""
+    svd_min_value = None if svd_min is None else float(svd_min)
+    truncation_cutoff_value = None if truncation_cutoff is None else float(truncation_cutoff)
+    if svd_min_value is not None and (not np.isfinite(svd_min_value) or svd_min_value < 0.0):
+        raise ValueError(f"svd_min must be a nonnegative finite value; got {svd_min!r}.")
+    if (
+        truncation_cutoff_value is not None
+        and (not np.isfinite(truncation_cutoff_value) or truncation_cutoff_value < 0.0)
+    ):
+        raise ValueError(f"truncation_cutoff must be a nonnegative finite value; got {truncation_cutoff!r}.")
+    if svd_min_value is not None and _callable_accepts_keyword(config_cls, "svd_min"):
+        config_kwargs["svd_min"] = float(svd_min_value)
+    if truncation_cutoff_value is not None:
+        for keyword in ("truncation_cutoff", "trunc_cut", "cutoff"):
+            if _callable_accepts_keyword(config_cls, keyword):
+                config_kwargs[keyword] = float(truncation_cutoff_value)
+
+
+def _tenax_warmup_chi_values(max_bond_dimension: int) -> List[int]:
+    chi_max = max(1, int(max_bond_dimension))
+    values: List[int] = []
+    for target in TENAX_WARMUP_CHI_TARGETS:
+        chi = min(chi_max, int(target))
+        if len(values) == 0 or chi > values[-1]:
+            values.append(int(chi))
+    if len(values) == 0 or values[-1] < chi_max:
+        values.append(int(chi_max))
+    return values
+
+
+def _tenax_warmup_chi_list(
+    max_bond_dimension: int,
+    total_steps: int | None = None,
+) -> Dict[int, int]:
+    """Return a TeNPy-style chi schedule, capped by the requested final chi."""
+    values = _tenax_warmup_chi_values(max_bond_dimension)
+    if total_steps is None:
+        return {
+            int(stage_index * TENAX_WARMUP_STEP_SPACING): int(chi)
+            for stage_index, chi in enumerate(values)
+        }
+
+    total = max(1, int(total_steps))
+    default_last_start = int(TENAX_WARMUP_STEP_SPACING * max(0, len(values) - 1))
+    if total > default_last_start:
+        return {
+            int(stage_index * TENAX_WARMUP_STEP_SPACING): int(chi)
+            for stage_index, chi in enumerate(values)
+        }
+
+    stage_count = min(len(values), total)
+    if stage_count <= 1:
+        return {0: int(values[-1])}
+    if stage_count < len(values):
+        source_indices = np.linspace(0, len(values) - 1, stage_count)
+        values = [values[int(round(index))] for index in source_indices]
+        values[-1] = _tenax_warmup_chi_values(max_bond_dimension)[-1]
+    return {
+        int(stage_index * total // stage_count): int(chi)
+        for stage_index, chi in enumerate(values)
+    }
+
+
+def _tenax_warmup_stages(
+    max_bond_dimension: int,
+    total_steps: int,
+) -> List[Dict[str, int]]:
+    total = max(1, int(total_steps))
+    chi_list = _tenax_warmup_chi_list(max_bond_dimension, total_steps=total)
+    starts = sorted(int(start) for start in chi_list)
+    stages: List[Dict[str, int]] = []
+    for stage_index, start in enumerate(starts):
+        next_start = starts[stage_index + 1] if stage_index + 1 < len(starts) else total
+        steps = max(0, int(next_start) - int(start))
+        if steps <= 0:
+            continue
+        stages.append(
+            {
+                "stage": int(stage_index),
+                "start_step": int(start),
+                "num_steps": int(steps),
+                "max_bond_dim": int(chi_list[start]),
+            }
+        )
+    if len(stages) == 0:
+        stages.append(
+            {
+                "stage": 0,
+                "start_step": 0,
+                "num_steps": total,
+                "max_bond_dim": max(1, int(max_bond_dimension)),
+            }
+        )
+    return stages
+
+
+def _build_tenax_config(config_cls: Any, config_kwargs: Dict[str, Any]) -> Any:
+    return config_cls(**_filter_supported_kwargs(config_cls, config_kwargs))
+
+
+def _tenax_idmrg_initial_state_keyword(idmrg_fn: Any) -> str | None:
+    for keyword in ("initial_mps", "mps", "psi", "initial_state"):
+        if _callable_accepts_keyword(idmrg_fn, keyword):
+            return keyword
+    return None
+
 
 def _required_site_operator_names(terms: List[Tuple[Any, ...]]) -> List[str]:
     required = {"Id"}
@@ -427,6 +569,8 @@ def build_tenax_model_mpo(
                 jx=jx,
                 jy=jy,
                 jz=jz,
+                symmetry_mode=symmetry_mode,
+                strict_charge_conservation=bool(strict_charge_conservation),
             )
         )
         if progress_bar is not None:
@@ -521,11 +665,18 @@ def _extract_dmrg_result(result: Any, initial_mps: Any) -> Tuple[Any, Dict[str, 
 class _TenaxSweepProgressStream(io.TextIOBase):
     _SWEEP_PATTERN = re.compile(r"Sweep\s+(\d+)\s*/\s*(\d+)\s*:\s*E\s*=\s*([-\d.eE+]+)")
 
-    def __init__(self, original_stream: Any, progress_bar: Any):
+    def __init__(
+        self,
+        original_stream: Any,
+        progress_bar: Any,
+        *,
+        respect_reported_total: bool = True,
+    ):
         self._original_stream = original_stream
         self._progress_bar = progress_bar
         self._buffer = ""
         self._last_sweep = 0
+        self._respect_reported_total = bool(respect_reported_total)
 
     def writable(self) -> bool:
         return True
@@ -554,7 +705,7 @@ class _TenaxSweepProgressStream(io.TextIOBase):
         sweep_total = int(match.group(2))
         sweep_energy = match.group(3)
 
-        if self._progress_bar.total != sweep_total:
+        if self._respect_reported_total and self._progress_bar.total != sweep_total:
             self._progress_bar.total = sweep_total
         if sweep_idx > self._last_sweep:
             self._progress_bar.update(sweep_idx - self._last_sweep)
@@ -762,6 +913,8 @@ def run_tenax_cylindrical_dmrg(
     max_bond_dimension: int,
     max_sweeps: int,
     random_seed: int,
+    truncation_cutoff: float | None = None,
+    svd_min: float | None = None,
     jx: float = 1.0,
     jy: float = 1.0,
     jz: float = 1.0,
@@ -779,12 +932,14 @@ def run_tenax_cylindrical_dmrg(
     np.random.seed(random_seed)
     api = get_tenax_api()
     n_sites = geometry.number_of_sites
+    max_bond_dimension = max(1, int(max_bond_dimension))
+    max_sweeps = max(1, int(max_sweeps))
 
     stage_start = _start_stage("Tenax MPO+DMRG", show_progress)
     sweep_bar = _make_progress_bar(
         enabled=show_progress,
         total=max_sweeps,
-        desc="Tenax sweeps",
+        desc="Tenax warmup sweeps",
         unit="sweep",
         leave=False,
     )
@@ -855,24 +1010,67 @@ def run_tenax_cylindrical_dmrg(
                 physical_dim=model_spec.physical_dim,
                 bond_dim=min(16, max_bond_dimension),
             )
-        config_kwargs: Dict[str, Any] = {
-            "max_bond_dim": max_bond_dimension,
-            "num_sweeps": max_sweeps,
-            "verbose": bool(show_progress),
-        }
-        config_signature = inspect.signature(api["DMRGConfig"])
-        if "num_states" in config_signature.parameters:
-            config_kwargs["num_states"] = max(1, int(num_states))
-        if symmetry_enabled and "target_charge" in config_signature.parameters:
-            config_kwargs["target_charge"] = int(symmetry_target_charge)
-        config = api["DMRGConfig"](**config_kwargs)
-        if sweep_bar is not None:
-            sweep_stdout_proxy = _TenaxSweepProgressStream(sys.stdout, sweep_bar)
-            with contextlib.redirect_stdout(sweep_stdout_proxy):
-                result = api["dmrg"](mpo, mps, config)
-            sweep_stdout_proxy.flush()
-        else:
-            result = api["dmrg"](mpo, mps, config)
+        warmup_chi_list = _tenax_warmup_chi_list(max_bond_dimension, total_steps=max_sweeps)
+        warmup_stages = _tenax_warmup_stages(max_bond_dimension, total_steps=max_sweeps)
+        stage_records: List[Dict[str, Any]] = []
+        all_energies: List[float] = []
+        current_mps = mps
+        dmrg_info: Dict[str, Any] = {}
+        for stage in warmup_stages:
+            stage_chi = int(stage["max_bond_dim"])
+            stage_sweeps = int(stage["num_steps"])
+            config_kwargs: Dict[str, Any] = {
+                "max_bond_dim": stage_chi,
+                "num_sweeps": stage_sweeps,
+                "verbose": bool(show_progress),
+            }
+            _add_supported_truncation_kwargs(
+                api["DMRGConfig"],
+                config_kwargs,
+                svd_min=svd_min,
+                truncation_cutoff=truncation_cutoff,
+            )
+            if _callable_accepts_keyword(api["DMRGConfig"], "num_states"):
+                config_kwargs["num_states"] = max(1, int(num_states))
+            if symmetry_enabled and _callable_accepts_keyword(api["DMRGConfig"], "target_charge"):
+                config_kwargs["target_charge"] = int(symmetry_target_charge)
+            config = _build_tenax_config(api["DMRGConfig"], config_kwargs)
+
+            before_progress = int(getattr(sweep_bar, "n", 0) or 0) if sweep_bar is not None else 0
+            if sweep_bar is not None:
+                sweep_bar.set_description(f"Tenax chi={stage_chi}")
+                sweep_stdout_proxy = _TenaxSweepProgressStream(
+                    sys.stdout,
+                    sweep_bar,
+                    respect_reported_total=False,
+                )
+                with contextlib.redirect_stdout(sweep_stdout_proxy):
+                    result = api["dmrg"](mpo, current_mps, config)
+                sweep_stdout_proxy.flush()
+            else:
+                result = api["dmrg"](mpo, current_mps, config)
+            current_mps, stage_info = _extract_dmrg_result(result, current_mps)
+            stage_energies = [
+                float(value)
+                for value in list(stage_info.get("energies_per_sweep", []))
+            ]
+            all_energies.extend(stage_energies)
+            stage_records.append(
+                {
+                    "stage": int(stage["stage"]),
+                    "start_sweep": int(stage["start_step"]),
+                    "num_sweeps": stage_sweeps,
+                    "max_bond_dim": stage_chi,
+                    "energy": stage_info.get("E"),
+                    "converged": stage_info.get("converged"),
+                    "reported_sweeps": int(stage_info.get("sweeps_done", len(stage_energies)) or 0),
+                }
+            )
+            dmrg_info = dict(stage_info)
+            if sweep_bar is not None:
+                target_progress = min(max_sweeps, before_progress + stage_sweeps)
+                if int(sweep_bar.n) < target_progress:
+                    sweep_bar.update(target_progress - int(sweep_bar.n))
     except Exception as exc:
         if sweep_bar is not None:
             sweep_bar.close()
@@ -893,6 +1091,8 @@ def run_tenax_cylindrical_dmrg(
                 coupling_j=coupling_j,
                 max_bond_dimension=max_bond_dimension,
                 max_sweeps=max_sweeps,
+                truncation_cutoff=truncation_cutoff,
+                svd_min=svd_min,
                 random_seed=random_seed,
                 jx=jx,
                 jy=jy,
@@ -935,7 +1135,30 @@ def run_tenax_cylindrical_dmrg(
             return mps_retry, mpo_retry, retry_info
         raise
 
-    mps_out, dmrg_info = _extract_dmrg_result(result, mps)
+    mps_out = current_mps
+    if len(all_energies) > 0:
+        dmrg_info["energies_per_sweep"] = [float(value) for value in all_energies]
+        dmrg_info["sweeps_done"] = int(len(all_energies))
+    else:
+        reported_sweeps = sum(
+            int(record.get("reported_sweeps", 0) or 0)
+            for record in stage_records
+        )
+        dmrg_info["sweeps_done"] = int(reported_sweeps if reported_sweeps > 0 else max_sweeps)
+    dmrg_info["warmup"] = {
+        "enabled": bool(len(stage_records) > 1),
+        "chi_list": {int(key): int(value) for key, value in warmup_chi_list.items()},
+        "stages": stage_records,
+        "final_max_bond_dim": int(max_bond_dimension),
+        "requested_sweeps": int(max_sweeps),
+    }
+    dmrg_info["max_bond_dimension"] = int(max_bond_dimension)
+    dmrg_info["max_sweeps"] = int(max_sweeps)
+    dmrg_info["truncation"] = {
+        "svd_min": None if svd_min is None else float(svd_min),
+        "truncation_cutoff": None if truncation_cutoff is None else float(truncation_cutoff),
+        "note": "Applied only when the installed Tenax config exposes matching truncation keywords.",
+    }
     dmrg_info["symmetry_mode"] = sym_mode
     dmrg_info["symmetry_enabled"] = bool(symmetry_enabled)
     dmrg_info["u1_symmetry_enabled"] = bool(_is_u1_symmetry_mode(sym_mode))
@@ -1387,6 +1610,8 @@ def run_tenax_idmrg_x_from_finite_mpo(
     max_iterations: int,
     bulk_kind: str = "auto",
     max_local_dim: int = 256,
+    truncation_cutoff: float | None = None,
+    svd_min: float | None = None,
     compute_entanglement: bool = True,
     show_progress: bool = True,
 ) -> Dict[str, Any]:
@@ -1395,12 +1620,14 @@ def run_tenax_idmrg_x_from_finite_mpo(
     idmrg_config_cls = api.get("iDMRGConfig", None)
     if not callable(idmrg_fn) or idmrg_config_cls is None:
         raise RuntimeError("Tenax iDMRG API is unavailable in the installed Tenax package.")
+    max_bond_dimension = max(1, int(max_bond_dimension))
+    max_iterations = max(1, int(max_iterations))
 
     stage_start = _start_stage("Tenax iDMRG-x", show_progress)
     sweep_bar = _make_progress_bar(
         enabled=show_progress,
         total=max_iterations,
-        desc="Tenax iDMRG sweeps",
+        desc="Tenax iDMRG warmup",
         unit="iter",
         leave=False,
     )
@@ -1412,31 +1639,148 @@ def run_tenax_idmrg_x_from_finite_mpo(
             max_local_dim=max_local_dim,
             show_progress=show_progress,
         )
-        config = idmrg_config_cls(
-            max_bond_dim=max_bond_dimension,
-            max_iterations=max_iterations,
-            verbose=bool(show_progress),
-        )
-        if sweep_bar is not None:
-            sweep_stdout_proxy = _TenaxIDMRGSweepProgressStream(sys.stdout, sweep_bar)
-            with contextlib.redirect_stdout(sweep_stdout_proxy):
-                result = idmrg_fn(bulk_mpo, config, d=effective_local_dim, dtype=np.complex128)
-            sweep_stdout_proxy.flush()
-            sweep_stdout_proxy.close_progress()
+        warmup_chi_list = _tenax_warmup_chi_list(max_bond_dimension, total_steps=max_iterations)
+        warmup_stages = _tenax_warmup_stages(max_bond_dimension, total_steps=max_iterations)
+        stage_records: List[Dict[str, Any]] = []
+        all_energies_per_step_native: List[float] = []
+        initial_mps_keyword = _tenax_idmrg_initial_state_keyword(idmrg_fn)
+        config_supports_chi_list = _callable_accepts_keyword(idmrg_config_cls, "chi_list")
+        result = None
+
+        def _run_idmrg_once(config: Any, initial_mps: Any | None = None) -> Any:
+            call_kwargs: Dict[str, Any] = {"d": effective_local_dim, "dtype": np.complex128}
+            if initial_mps is not None and initial_mps_keyword is not None:
+                call_kwargs[initial_mps_keyword] = initial_mps
+            if sweep_bar is not None:
+                sweep_stdout_proxy = _TenaxIDMRGSweepProgressStream(sys.stdout, sweep_bar)
+                with contextlib.redirect_stdout(sweep_stdout_proxy):
+                    run_result = idmrg_fn(bulk_mpo, config, **call_kwargs)
+                sweep_stdout_proxy.flush()
+                sweep_stdout_proxy.close_progress()
+                return run_result
+            return idmrg_fn(bulk_mpo, config, **call_kwargs)
+
+        def _idmrg_config_kwargs(max_bond_dim: int, iterations: int, **extra: Any) -> Dict[str, Any]:
+            config_kwargs: Dict[str, Any] = {
+                "max_bond_dim": int(max_bond_dim),
+                "max_iterations": int(iterations),
+                "verbose": bool(show_progress),
+            }
+            config_kwargs.update(extra)
+            _add_supported_truncation_kwargs(
+                idmrg_config_cls,
+                config_kwargs,
+                svd_min=svd_min,
+                truncation_cutoff=truncation_cutoff,
+            )
+            return config_kwargs
+
+        if config_supports_chi_list:
+            config = _build_tenax_config(
+                idmrg_config_cls,
+                _idmrg_config_kwargs(
+                    max_bond_dimension,
+                    max_iterations,
+                    chi_list=dict(warmup_chi_list),
+                ),
+            )
+            result = _run_idmrg_once(config)
+            stage_records.append(
+                {
+                    "stage": 0,
+                    "mode": "native_chi_list",
+                    "num_iterations": int(max_iterations),
+                    "max_bond_dim": int(max_bond_dimension),
+                }
+            )
+            warmup_mode = "native_chi_list"
+            warmup_warning = None
+        elif initial_mps_keyword is not None:
+            previous_mps = None
+            for stage in warmup_stages:
+                stage_chi = int(stage["max_bond_dim"])
+                stage_iterations = int(stage["num_steps"])
+                config = _build_tenax_config(
+                    idmrg_config_cls,
+                    _idmrg_config_kwargs(stage_chi, stage_iterations),
+                )
+                before_progress = int(getattr(sweep_bar, "n", 0) or 0) if sweep_bar is not None else 0
+                if sweep_bar is not None:
+                    sweep_bar.set_description(f"Tenax iDMRG chi={stage_chi}")
+                result = _run_idmrg_once(config, initial_mps=previous_mps)
+                previous_mps = getattr(result, "mps", previous_mps)
+                stage_energies = [
+                    float(value)
+                    for value in list(getattr(result, "energies_per_step", []))
+                ]
+                all_energies_per_step_native.extend(stage_energies)
+                stage_records.append(
+                    {
+                        "stage": int(stage["stage"]),
+                        "start_iteration": int(stage["start_step"]),
+                        "num_iterations": stage_iterations,
+                        "max_bond_dim": stage_chi,
+                        "reported_iterations": int(len(stage_energies)),
+                        "energy_per_idmrg_site": (
+                            float(getattr(result, "energy_per_site"))
+                            if hasattr(result, "energy_per_site")
+                            else None
+                        ),
+                    }
+                )
+                if sweep_bar is not None:
+                    target_progress = min(max_iterations, before_progress + stage_iterations)
+                    if int(sweep_bar.n) < target_progress:
+                        sweep_bar.update(target_progress - int(sweep_bar.n))
+            warmup_mode = "staged_state_passing"
+            warmup_warning = None
         else:
-            result = idmrg_fn(bulk_mpo, config, d=effective_local_dim, dtype=np.complex128)
+            config = _build_tenax_config(
+                idmrg_config_cls,
+                _idmrg_config_kwargs(max_bond_dimension, max_iterations),
+            )
+            result = _run_idmrg_once(config)
+            stage_records.append(
+                {
+                    "stage": 0,
+                    "mode": "single_final_chi",
+                    "num_iterations": int(max_iterations),
+                    "max_bond_dim": int(max_bond_dimension),
+                }
+            )
+            warmup_mode = "single_final_chi"
+            warmup_warning = (
+                "Installed Tenax iDMRG exposes neither iDMRGConfig.chi_list nor an "
+                "initial-MPS keyword, so the run used the final chi directly."
+            )
     except Exception:
         if sweep_bar is not None:
             sweep_bar.close()
         raise
 
-    energies_per_step_native = [float(value) for value in list(getattr(result, "energies_per_step", []))]
+    if result is None:
+        raise RuntimeError("Tenax iDMRG did not return a result.")
+    energies_per_step_native = (
+        [float(value) for value in all_energies_per_step_native]
+        if len(all_energies_per_step_native) > 0
+        else [float(value) for value in list(getattr(result, "energies_per_step", []))]
+    )
     energy_per_idmrg_site = float(getattr(result, "energy_per_site"))
     energy_per_original_site = energy_per_idmrg_site / float(sites_per_idmrg_site)
     energies_per_step_original_site = [
         float(value) / float(sites_per_idmrg_site) for value in energies_per_step_native
     ]
     converged = bool(getattr(result, "converged", False))
+    iterations_done = (
+        len(energies_per_step_native)
+        if len(energies_per_step_native) > 0
+        else sum(
+            int(record.get("reported_iterations", 0) or 0)
+            for record in stage_records
+        )
+    )
+    if iterations_done <= 0:
+        iterations_done = int(max_iterations)
 
     if sweep_bar is not None:
         steps_done = len(energies_per_step_native)
@@ -1469,8 +1813,12 @@ def run_tenax_idmrg_x_from_finite_mpo(
             "iDMRG-x uses a bulk MPO extracted from the finite-MPO snake-path representation "
             "(single-site or two-site coarse-grained mapping)."
         ),
+        "translation_symmetry": {
+            "enabled": True,
+            "implemented_as": "bulk MPO repeated by Tenax iDMRG along x",
+        },
         "converged": converged,
-        "iterations_done": len(energies_per_step_native),
+        "iterations_done": int(iterations_done),
         "energy_per_idmrg_site": energy_per_idmrg_site,
         "energy_per_original_site": energy_per_original_site,
         "energies_per_step_idmrg_site": energies_per_step_native,
@@ -1479,6 +1827,22 @@ def run_tenax_idmrg_x_from_finite_mpo(
         "effective_local_dim": int(effective_local_dim),
         "bulk_construction": diagnostics,
         "entanglement_status": entanglement_status,
+        "max_bond_dimension": int(max_bond_dimension),
+        "max_iterations": int(max_iterations),
+        "truncation": {
+            "svd_min": None if svd_min is None else float(svd_min),
+            "truncation_cutoff": None if truncation_cutoff is None else float(truncation_cutoff),
+            "note": "Applied only when the installed Tenax iDMRG config exposes matching truncation keywords.",
+        },
+        "warmup": {
+            "enabled": bool(warmup_mode in ("native_chi_list", "staged_state_passing")),
+            "mode": str(warmup_mode),
+            "chi_list": {int(key): int(value) for key, value in warmup_chi_list.items()},
+            "stages": stage_records,
+            "final_max_bond_dim": int(max_bond_dimension),
+            "requested_iterations": int(max_iterations),
+            "warning": warmup_warning,
+        },
     }
     if entanglement_profile is not None:
         output["entanglement"] = entanglement_profile
